@@ -177,7 +177,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-statusline-")));
       const home = join(root, "home");
-      const repository = join(root, "repository");
+      const repository = join(home, "repository");
       const workspace = join(repository, "packages", "status-root");
       const headPath = join(repository, ".git", "HEAD");
       const stderrPath = join(root, "stderr.log");
@@ -208,7 +208,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         });
 
         const initial = await session.waitForPane(
-          (pane) => pane.includes("status-root") && pane.includes("initial-branch"),
+          (pane) => pane.includes("~/repository/packages/status-root") && pane.includes("initial-branch"),
           10_000,
         );
         expect(initial).not.toContain("⚡︎");

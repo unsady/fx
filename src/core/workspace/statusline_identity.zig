@@ -86,7 +86,7 @@ pub const Runtime = struct {
         const next_root = try alloc.dupe(u8, workspace_root);
         errdefer alloc.free(next_root);
 
-        const encoded_path = try encodeWorkspacePath(alloc, workspace_root);
+        const encoded_path = try encodeWorkspacePath(alloc, workspace_root, io_mod.homeDir());
         errdefer alloc.free(encoded_path);
 
         const next_head_path = try resolveHeadPath(alloc, workspace_root);
@@ -171,17 +171,36 @@ fn freeOwned(alloc: std.mem.Allocator, bytes: *[]u8) void {
 fn encodeWorkspacePath(
     alloc: std.mem.Allocator,
     workspace_root: []const u8,
+    home_dir: ?[]const u8,
 ) ![]u8 {
+    var shortened: ?[]u8 = null;
+    defer if (shortened) |path| alloc.free(path);
+    if (home_dir) |home| {
+        if (std.Io.Dir.path.isAbsolute(home)) {
+            const trimmed_home = std.mem.trimEnd(u8, home, &.{std.Io.Dir.path.sep});
+            const prefix = if (trimmed_home.len == 0) home[0..1] else trimmed_home;
+            if (std.mem.eql(u8, workspace_root, prefix)) {
+                shortened = try alloc.dupe(u8, "~");
+            } else if (std.mem.startsWith(u8, workspace_root, prefix) and
+                (prefix.len == 1 and prefix[0] == std.Io.Dir.path.sep or
+                    (workspace_root.len > prefix.len and workspace_root[prefix.len] == std.Io.Dir.path.sep)))
+            {
+                const suffix = if (prefix.len == 1 and prefix[0] == std.Io.Dir.path.sep) workspace_root else workspace_root[prefix.len..];
+                shortened = try alloc.print("~{s}", .{suffix});
+            }
+        }
+    }
+    const display_path: []const u8 = if (shortened) |path| path else workspace_root;
     const encoded = text_utils.encodeTerminalSafePathTail(
         alloc,
-        workspace_root,
+        display_path,
         max_encoded_workspace_bytes,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.PathBasenameTooLong => {
             const fallback = try text_utils.encodeTerminalSafe(
                 alloc,
-                workspace_root,
+                display_path,
                 max_encoded_workspace_bytes,
             );
             return fallback.bytes;
@@ -395,6 +414,24 @@ test "workspace statusline identity rejects malformed detached HEAD" {
 
     const snapshot = try runtime.refresh(alloc, root);
     try std.testing.expect(snapshot.git_branch == null);
+}
+
+test "workspace statusline shortens only paths inside home" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { path: []const u8, home: ?[]const u8, expected: []const u8 }{
+        .{ .path = "/Users/example/Code/agent", .home = "/Users/example", .expected = "~/Code/agent" },
+        .{ .path = "/Users/example", .home = "/Users/example/", .expected = "~" },
+        .{ .path = "/Users/example-other/agent", .home = "/Users/example", .expected = "/Users/example-other/agent" },
+        .{ .path = "/Users/example/agent", .home = null, .expected = "/Users/example/agent" },
+        .{ .path = "/Users/example/agent", .home = "relative", .expected = "/Users/example/agent" },
+        .{ .path = "/tmp/work", .home = "/", .expected = "~/tmp/work" },
+        .{ .path = "/Users/example/unsafe-\x1b", .home = "/Users/example", .expected = "~/unsafe-\\x1b" },
+    };
+    for (cases) |case| {
+        const actual = try encodeWorkspacePath(alloc, case.path, case.home);
+        defer alloc.free(actual);
+        try std.testing.expectEqualStrings(case.expected, actual);
+    }
 }
 
 test "workspace statusline identity represents the filesystem root" {
