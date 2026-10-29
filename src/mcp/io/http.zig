@@ -19,6 +19,7 @@ const Read = @import("budget.zig").Read;
 
 pub const Options = struct {
     url: []const u8,
+    prepare_tls: ?*const fn (*std.http.Client) std.http.Client.RequestError!void = null,
     /// Headers the host configured for every request, such as an API key.
     headers: []const std.http.Header = &.{},
     /// The largest JSON body or SSE event.
@@ -491,6 +492,12 @@ pub const Client = struct {
     /// connection it failed on is closed, where `std.http` would keep it for
     /// the next request to fail on too. Null when it couldn't go out.
     fn openSent(c: *Client, method: Method, uri: std.Uri, options: std.http.Client.RequestOptions, body: ?[]u8) Io.Cancelable!?std.http.Client.Request {
+        if (std.http.Client.Protocol.fromUri(uri) == .tls) if (c.options.prepare_tls) |prepare_tls| {
+            prepare_tls(&c.http) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return null,
+            };
+        };
         var fresh = false;
         while (true) {
             var with = options;
@@ -718,6 +725,22 @@ pub fn isJson(media: []const u8) bool {
 }
 
 const testing = std.testing;
+
+test "host TLS preparation failure stops an HTTPS request" {
+    const Host = struct {
+        fn prepare(client: *std.http.Client) std.http.Client.RequestError!void {
+            client.now = .fromNanoseconds(1);
+            return error.CertificateBundleLoadFailure;
+        }
+    };
+    var client: Client = undefined;
+    try client.init(std.testing.io, std.testing.allocator, .{ .url = "https://127.0.0.1:1/mcp", .prepare_tls = Host.prepare });
+    defer client.deinit();
+
+    const request = try client.openSent(.get, try std.Uri.parse("https://127.0.0.1:1/mcp"), .{}, null);
+    try std.testing.expect(request == null);
+    try std.testing.expectEqual(@as(i96, 1), client.http.now.?.nanoseconds);
+}
 
 test "only application/json, with or without parameters, is JSON" {
     for ([_][]const u8{ "application/json", "Application/JSON", "application/json; charset=utf-8", "application/json;charset=UTF-8" }) |m| try testing.expect(isJson(m));

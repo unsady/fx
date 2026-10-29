@@ -2,7 +2,11 @@
 //! the host does it does through the engine's API and events: showing input
 //! forms, opening sign-in URLs, and rendering status.
 
+const std = @import("std");
+
 pub const Host = struct {
+    /// Prepare the host's trust store before an HTTPS connection.
+    prepare_tls: ?*const fn (*std.http.Client) std.http.Client.RequestError!void = null,
     context: *anyopaque,
     /// Whether this exact tool call may run. Asked once per call,
     /// before anything about it is sent or any server starts for it. The

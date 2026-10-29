@@ -1,4 +1,5 @@
 const std = @import("std");
+const http_tls = @import("../core/shared/http_tls.zig");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const builtin = @import("builtin");
 
@@ -906,7 +907,7 @@ const OAuthHttpOperation = struct {
         defer secret.zeroAndFree(self.alloc, response_buffer);
         var response_writer = std.Io.Writer.fixed(response_buffer);
 
-        const result = client.fetch(.{
+        const result = http_tls.fetch(&client, .{
             .location = .{ .url = self.request.url },
             .method = switch (self.request.method) {
                 .get => .GET,

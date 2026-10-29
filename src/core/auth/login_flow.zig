@@ -1,4 +1,5 @@
 const std = @import("std");
+const http_tls = @import("../shared/http_tls.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
@@ -1185,7 +1186,7 @@ fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    const result = try client.fetch(.{
+    const result = try http_tls.fetch(&client, .{
         .location = .{ .url = endpoint },
         .method = .GET,
         .headers = .{

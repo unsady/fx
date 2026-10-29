@@ -6,6 +6,7 @@ const secret = @import("../core/auth/secret.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
+const http_tls = @import("../core/shared/http_tls.zig");
 const io_mod = @import("../core/shared/io.zig");
 const select_watch = @import("../core/shared/select_watch.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
@@ -408,7 +409,7 @@ const UsageGetOperation = struct {
         const auth_header = try self.alloc.print("Bearer {s}", .{self.bearer});
         defer secret.zeroAndFree(self.alloc, auth_header);
         var extra_headers_buf: [4]std.http.Header = undefined;
-        var req = try client.request(.GET, uri, .{
+        var req = try http_tls.request(&client, .GET, uri, .{
             .headers = .{
                 .accept_encoding = .omit,
                 .user_agent = .{ .override = user_agent },
@@ -456,7 +457,7 @@ pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, pat
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    const result = try client.fetch(.{
+    const result = try http_tls.fetch(&client, .{
         .location = .{ .url = url },
         .method = .GET,
         .headers = headers,
@@ -554,7 +555,7 @@ fn fetchGatewayJsonAtUrlCore(
     var extra_headers_buf: [1]std.http.Header = undefined;
     const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
 
-    var req = client.request(.GET, uri, .{
+    var req = http_tls.request(&client, .GET, uri, .{
         .headers = headers,
         .extra_headers = extra_headers,
         .redirect_behavior = .unhandled,
@@ -697,7 +698,7 @@ pub fn postGatewayCompletion(
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        const result = client.fetch(.{
+        const result = http_tls.fetch(&client, .{
             .location = .{ .url = request_url },
             .method = .POST,
             .payload = payload,
@@ -1046,6 +1047,7 @@ const RequestOpenOperation = struct {
             );
         }
         if (self.pool) |pool| return pool.openRequest(.POST, self.uri, self.options);
+        if (std.http.Client.Protocol.fromUri(self.uri) == .tls) try http_tls.prepare(self.client);
         return self.client.request(.POST, self.uri, self.options);
     }
 };
@@ -2219,6 +2221,7 @@ pub const PostOperation = struct {
     extra_headers: []const std.http.Header = &.{},
 
     pub fn run(self: *PostOperation) !OpenedPost {
+        if (std.http.Client.Protocol.fromUri(self.uri) == .tls) try http_tls.prepare(self.client);
         var headers: std.http.Client.Request.Headers = .{
             .content_type = .{ .override = "application/json" },
             .accept_encoding = .omit,

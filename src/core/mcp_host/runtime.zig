@@ -13,6 +13,7 @@ const observation = @import("../agent/runtime/observation.zig");
 const mcp = @import("../../mcp/mcp.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const io_mod = @import("../shared/io.zig");
+const http_tls = @import("../shared/http_tls.zig");
 const host_target = @import("../hosts/target.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -488,7 +489,7 @@ pub const Runtime = struct {
         errdefer gpa.free(r.tools_epochs);
         for (r.tools_epochs) |*e| e.* = .init(0);
         // The engine copies what it keeps, so the rest of the config goes.
-        try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log }, .{
+        try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log, .prepare_tls = http_tls.prepare }, .{
             .client = .{ .info = .{ .name = "fx", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
         }, resolved.engine);
         errdefer r.engine.deinit();

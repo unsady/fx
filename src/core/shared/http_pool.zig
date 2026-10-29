@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("debug_trace.zig");
 const io_mod = @import("io.zig");
+const http_tls = @import("http_tls.zig");
 
 /// Long-lived HTTP client wrapper that keeps std's ConnectionPool alive
 /// across requests to one product origin. std already implements acquire,
@@ -113,6 +114,7 @@ pub const HttpPool = struct {
     /// Mirrors the cert-bundle preamble of std.http.Client.request so direct
     /// Client.connect calls are safe. Concurrent with real requests by lock.
     fn ensureTlsReady(self: *HttpPool) !void {
+        if (comptime builtin.os.tag == .macos) return http_tls.prepare(&self.client);
         const client = &self.client;
         const io = client.io;
         {
@@ -166,6 +168,7 @@ pub const HttpPool = struct {
         uri: std.Uri,
         options: std.http.Client.RequestOptions,
     ) std.http.Client.RequestError!std.http.Client.Request {
+        if (std.http.Client.Protocol.fromUri(uri) == .tls) try http_tls.prepare(&self.client);
         self.refreshTlsClock();
         const io = self.client.io;
         self.setup_lock.lockSharedUncancelable(io);

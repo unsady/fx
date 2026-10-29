@@ -1,4 +1,5 @@
 const std = @import("std");
+const http_tls = @import("../core/shared/http_tls.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const grok_session = @import("../core/auth/grok_session.zig");
@@ -230,7 +231,7 @@ const FetchOperation = struct {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-identifier", .value = "fx" };
             extra_headers_len += 1;
         }
-        const result = client.fetch(.{
+        const result = http_tls.fetch(&client, .{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = headers,

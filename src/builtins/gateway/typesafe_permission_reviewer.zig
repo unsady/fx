@@ -9,6 +9,7 @@
 //! TYPESAFE_API_KEY; TYPESAFE_BASE_URL overrides the endpoint for tests.
 
 const std = @import("std");
+const http_tls = @import("../../core/shared/http_tls.zig");
 const permission_auto_classifier = @import("../../core/permissions/auto_classifier.zig");
 const types = @import("../../core/shared/types.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -361,7 +362,7 @@ fn sendReview(
     defer out.deinit();
 
     debug_trace.logf("permission", "event=auto_review_typesafe_transport_start payload_bytes={d} via_gateway={}", .{ payload.len, config.via_gateway });
-    const result = client.fetch(.{
+    const result = http_tls.fetch(&client, .{
         .location = .{ .url = config.endpoint },
         .method = .POST,
         .payload = payload,

@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { createServer as createTlsServer } from "node:tls";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 
@@ -19,6 +21,44 @@ function rawToolCalls(model: string, calls: Array<{ id: string; name: string; ar
 }
 
 describe("configured providers", () => {
+  test.skipIf(process.platform !== "darwin")("rejects an untrusted TLS server when the system keychain is blocked", async () => {
+    const f = fixture();
+    const key = join(f.home, "server-key.pem");
+    const cert = join(f.home, "server-cert.pem");
+    const generated = spawnSync("/usr/bin/openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=localhost"], { stdio: "ignore" });
+    if (generated.status !== 0) {
+      f.close();
+      throw new Error("openssl could not generate the test certificate");
+    }
+    const server = createTlsServer({ key: readFileSync(key), cert: readFileSync(cert) });
+    let connections = 0;
+    let accepted = 0;
+    server.on("connection", () => connections++);
+    server.on("secureConnection", socket => { accepted++; socket.destroy(); });
+    server.on("tlsClientError", () => {});
+    try {
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("TLS server has no port");
+      f.settings.providers.local.base_url = `https://127.0.0.1:${address.port}/v1`;
+      f.save();
+      const child = Bun.spawn(["/usr/bin/sandbox-exec", "-p", '(version 1) (allow default) (deny file-read-data (literal "/Library/Keychains/System.keychain"))', FX_BIN, "ask", "--json", "--no-save", "hello"], {
+        cwd: f.workspace,
+        env: { ...f.env, PATH: process.env.PATH },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(code).toBe(1);
+      expect(stdout + stderr).toContain("TlsInitializationFailed");
+      expect(connections).toBeGreaterThan(0);
+      expect(accepted).toBe(0);
+    } finally {
+      server.close();
+      f.close();
+    }
+  }, 30000);
+
   test.each(["reasoning", "reasoning_content"])("replays %s through a tool result and saved-session continuation", async field => {
     let calls = 0;
     const f = fixture(body => {

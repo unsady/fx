@@ -1,4 +1,5 @@
 const std = @import("std");
+const http_tls = @import("../core/shared/http_tls.zig");
 const versions = @import("../core/gateway/provider_versions.zig");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
@@ -80,7 +81,7 @@ const LookupOperation = struct {
         const buffer = try self.alloc.alloc(u8, max_response_bytes + 1);
         defer self.alloc.free(buffer);
         var writer = std.Io.Writer.fixed(buffer);
-        const result = try client.fetch(.{
+        const result = try http_tls.fetch(&client, .{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = .{

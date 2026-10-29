@@ -1,5 +1,6 @@
 [
   "cli.test.ts",
+  "configured-providers.test.ts",
   "file-tool-permissions.test.ts",
   "gateway-stream-lifecycle.test.ts",
   "mcp-auth.test.ts",

@@ -1,4 +1,5 @@
 const std = @import("std");
+const http_tls = @import("../core/shared/http_tls.zig");
 const chatgpt_oauth = @import("../core/auth/chatgpt_oauth.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
@@ -206,7 +207,7 @@ const FetchOperation = struct {
         extra_len += 1;
         extra_headers[extra_len] = .{ .name = "accept", .value = "application/json" };
         extra_len += 1;
-        const result = client.fetch(.{
+        const result = http_tls.fetch(&client, .{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = headers,
