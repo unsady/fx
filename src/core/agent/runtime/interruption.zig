@@ -242,6 +242,66 @@ pub fn persistFailedPartialTurnOnce(
         null,
     );
     defer types.freeExecutionMemory(std.heap.c_allocator, full_execution);
+    try persistFailedTurn(
+        hooks,
+        finalization,
+        job,
+        partial_assistant,
+        persisted,
+        trace_ctx,
+        full_execution,
+        terminal_materializing,
+    );
+}
+
+/// Saves a failed turn that already did work, such as a stall-stopped turn,
+/// so the next request still carries its prompt, any partial reply, and every
+/// completed tool step. Returns true only when this call saved and finished
+/// the turn; otherwise the caller still owns finishing it. An error can come
+/// back after the turn is finished, when propagating the saved turn fails.
+pub fn persistFailedTurnWorkOnce(
+    hooks: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    partial_assistant: []const u8,
+    persisted: *bool,
+    trace_ctx: TraceContext,
+    current_turn_messages: []const types.ChatMessage,
+    terminal_materializing: *bool,
+) !bool {
+    if (persisted.*) return false;
+
+    const full_execution = try runtime_execution_memory.buildInterruptedExecutionMemory(
+        std.heap.c_allocator,
+        current_turn_messages,
+        null,
+    );
+    defer types.freeExecutionMemory(std.heap.c_allocator, full_execution);
+    if (full_execution.isEmpty()) return false;
+    try persistFailedTurn(
+        hooks,
+        finalization,
+        job,
+        partial_assistant,
+        persisted,
+        trace_ctx,
+        full_execution,
+        terminal_materializing,
+    );
+    return true;
+}
+
+/// Borrows `full_execution`; the caller keeps ownership.
+fn persistFailedTurn(
+    hooks: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    partial_assistant: []const u8,
+    persisted: *bool,
+    trace_ctx: TraceContext,
+    full_execution: types.ExecutionMemory,
+    terminal_materializing: *bool,
+) !void {
     var projection_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer projection_arena.deinit();
     const execution = try finalization.persistedExecution(projection_arena.allocator(), full_execution);
@@ -249,7 +309,7 @@ pub fn persistFailedPartialTurnOnce(
 
     const turn: HistoryTurn = .{ .interrupted = .{
         .user = .{ .text = job.prompt, .images = job.images },
-        .assistant = @constCast(partial_assistant),
+        .assistant = if (std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0) @constCast(partial_assistant) else null,
         .execution = execution,
         .terminal_reason = .failed,
     } };

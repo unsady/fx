@@ -192,6 +192,23 @@ NESTED_CONSTANT = """@real_io = internal global { ptr, ptr, i8 } zeroinitializer
     for name, offset in (("first", 16), ("second", 8898))
 )
 
+# `low` is in bounds when x < 4; `high` is out of bounds when end > len.
+REVERSED_COMPARE = "@sink = global i64 0\n" + "".join(
+    f"""define i64 @{name}(ptr %app, {parameters}) {{
+  %v = load i64, ptr %app, align 8
+  %c = {compare}
+  %z = zext i1 %c to i64
+  %s = add i64 %v, %z
+  store i64 %s, ptr @sink, align 8
+  ret i64 %s
+}}
+"""
+    for name, parameters, compare in (
+        ("low", "i64 %x", "icmp ult i64 %x, 4"),
+        ("high", "i64 %end, i64 %len", "icmp ugt i64 %end, %len"),
+    )
+)
+
 
 @unittest.skipUnless(AVAILABLE, "pinned LLVM with libLLVM is not installed")
 class OutlinedConstantTests(LlvmCase):
@@ -237,6 +254,55 @@ class OutlinedConstantTests(LlvmCase):
         self.assertEqual(2, ir.count("getelementptr inbounds i8, ptr @real_io, i64 16"))
         self.assertIn("i64 8898", ir)
         self.assertNotIn("@real_io, i64 %", ir)
+
+    def test_outliner_passes_a_greater_than_region_its_operands_unreversed(self) -> None:
+        ir = self.text(self.outline(self.assemble("reversed", REVERSED_COMPARE)))
+
+        self.assertIn("icmp ult i64 %1, %2", ir)
+        self.assertIn("call void @outlined_ir_func_0(ptr %app, i64 %end, i64 %len,", ir)
+
+    def test_swapped_compares_keep_each_region_comparison(self) -> None:
+        result, swapped = self.run_pass("swap-compares", self.assemble("reversed", REVERSED_COMPARE))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"swapped_compares": 1', result.stdout)
+
+        ir = self.text(self.outline(swapped))
+
+        self.assertIn("icmp ult i64 %1, %2", ir)
+        self.assertIn("call void @outlined_ir_func_0(ptr %app, i64 %x, i64 4,", ir)
+        self.assertIn("call void @outlined_ir_func_0(ptr %app, i64 %len, i64 %end,", ir)
+
+    def test_swap_compares_rewrites_every_greater_than_predicate_and_keeps_flags(self) -> None:
+        compares = (
+            ("icmp ugt i64 %a, %b", "icmp ult i64 %b, %a"),
+            ("icmp samesign uge i64 %a, %b", "icmp samesign ule i64 %b, %a"),
+            ("icmp sgt i64 %a, 7", "icmp slt i64 7, %a"),
+            ("icmp sge i64 %a, %b", "icmp sle i64 %b, %a"),
+            ("fcmp nnan ogt double %x, %y", "fcmp nnan olt double %y, %x"),
+            ("fcmp oge double %x, %y", "fcmp ole double %y, %x"),
+            ("fcmp ugt double %x, %y", "fcmp ult double %y, %x"),
+            ("fcmp uge double %x, %y", "fcmp ule double %y, %x"),
+        )
+        kept = ("icmp ult i64 %a, %b", "icmp eq i64 %a, %b", "fcmp olt double %x, %y")
+        body = "".join(f"  %c{i} = {compare}\n  store volatile i1 %c{i}, ptr %out\n" for i, compare in enumerate(
+            [compare for compare, _ in compares] + list(kept)
+        ))
+        source = self.assemble(
+            "compares",
+            f"define void @f(i64 %a, i64 %b, double %x, double %y, ptr %out) {{\n{body}  ret void\n}}\n",
+        )
+
+        result, output = self.run_pass("swap-compares", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn(f'"swapped_compares": {len(compares)}', result.stdout)
+        ir = self.cleaned_ir(output)
+        for i, (_, swapped) in enumerate(compares):
+            self.assertIn(f"%c{i} = {swapped}", ir)
+        for i, compare in enumerate(kept, start=len(compares)):
+            self.assertIn(f"%c{i} = {compare}", ir)
+        for predicate in ("ugt", "uge", "sgt", "sge", "ogt", "oge"):
+            self.assertNotIn(f" {predicate} ", ir)
 
     def test_phi_and_intrinsic_expressions_stay_constant_and_call_arguments_expand(self) -> None:
         source = self.assemble(

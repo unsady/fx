@@ -1633,6 +1633,12 @@ pub const ChatMessage = struct {
     provider_replay: ?ProviderReplay = null,
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
+    /// When a tool result was made: when the turn took it, or the time its
+    /// saved result recorded. Every rebuild of the turn's execution keeps it
+    /// (`execution_memory.buildNormalChatExecutionMemory`), so a rebuilt turn
+    /// encodes the same bytes each time. Null stamps the result when it is
+    /// rebuilt (`tests/tla/session/TurnStream.tla` StampIsBirth).
+    tool_result_created_at_ms: ?i64 = null,
     permission_feedback: bool = false,
     /// Checkpoint steering text has already had its envelope removed.
     restored_steering: bool = false,

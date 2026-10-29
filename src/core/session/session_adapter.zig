@@ -1690,7 +1690,7 @@ pub const Session = struct {
         const all = events.items;
         const encoded = try a.alloc([]u8, all.len);
         for (all, encoded) |piece, *bytes| bytes.* = try self.encodeEvent(a, piece);
-        const start = try self.streamedPrefix(encoded[0..pieces.len]);
+        const start = try self.streamedPrefix(encoded[0..pieces.len], .commit, countResults(pieces));
 
         var tail: std.ArrayList(sm.Event) = .empty;
         switch (end) {
@@ -1850,7 +1850,7 @@ pub const Session = struct {
         };
         const encoded = try a.alloc([]u8, events.items.len);
         for (events.items, encoded) |event, *bytes| bytes.* = try self.encodeEvent(a, event);
-        const start = try self.streamedPrefix(encoded);
+        const start = try self.streamedPrefix(encoded, .stream, countResults(events.items));
         if (!self.turn_open or start < encoded.len) {
             try self.writePieces(a, events.items[start..], encoded[start..], &.{});
             try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
@@ -2034,13 +2034,18 @@ pub const Session = struct {
     /// How many of `encoded` the open turn already holds. A streamed piece
     /// that differs from the final turn is a bug; the stale turn is closed
     /// as superseded and the whole turn is written afresh, never mixed.
-    fn streamedPrefix(self: *Session, encoded: []const []u8) !usize {
-        if (!self.turn_open) return 0;
+    /// `phase` and `results`, the rebuild's tool result count, only name
+    /// the decision in the session trace, which the driver of
+    /// `tests/tla/session/TurnStreamTrace.tla` replays.
+    fn streamedPrefix(self: *Session, encoded: []const []u8, phase: StreamPhase, results: usize) !usize {
         const streamed = self.streamed.items;
-        const same = streamed.len <= encoded.len and (for (streamed, encoded[0..streamed.len]) |x, y| {
-            if (!samePiece(self.alloc, x, y)) break false;
-        } else true);
-        if (same) return streamed.len;
+        const held = if (self.turn_open) streamed.len else 0;
+        const reparsed: ?usize = if (self.turn_open) reparsedPrefix(self.alloc, streamed, encoded) else 0;
+        debug_trace.logf("session", "event=sessions_v2_stream session={s} phase={s} held={d} kept={d} results={d} reparsed={d}", .{
+            self.id(), @tagName(phase), held, if (reparsed != null) held else 0, results, reparsed orelse 0,
+        });
+        if (!self.turn_open) return 0;
+        if (reparsed != null) return streamed.len;
         debug_trace.logf("session", "event=sessions_v2_stream_mismatch session={s} streamed={d} final={d} dropped=stale_turn", .{ self.id(), streamed.len, encoded.len });
         _ = try self.write(&.{
             .{ .item = .{ .type = superseded_type, .data = "{}" } },
@@ -4428,9 +4433,34 @@ fn storedBody(src: Source, alloc: Allocator, handle: []const u8, len: usize) !?[
     return bytes;
 }
 
-/// Whether a streamed piece is the final one. fx stamps a tool result's
-/// `created_at_ms` each time it rebuilds a turn, so that field alone may
-/// differ; the streamed, earlier stamp stands.
+/// Which of the two calls of `Session.streamedPrefix` a decision came from.
+const StreamPhase = enum { stream, commit };
+
+fn countResults(events: []const Event) usize {
+    var count: usize = 0;
+    for (events) |event| count += @intFromBool(event == .tool_result);
+    return count;
+}
+
+/// How many of the open turn's pieces `samePiece` had to parse because the
+/// rebuild changed their bytes, or null when one of them no longer stands.
+/// A rebuild keeps each tool result's stamp, so this is 0 unless some path
+/// lost it (`tests/tla/session/TurnStream.tla` NoReparseOfStamped).
+fn reparsedPrefix(alloc: Allocator, streamed: []const []const u8, encoded: []const []const u8) ?usize {
+    if (streamed.len > encoded.len) return null;
+    var reparsed: usize = 0;
+    for (streamed, encoded[0..streamed.len]) |held, bytes| {
+        if (std.mem.eql(u8, held, bytes)) continue;
+        if (!samePiece(alloc, held, bytes)) return null;
+        reparsed += 1;
+    }
+    return reparsed;
+}
+
+/// Whether a streamed piece is the final one. A rebuild keeps each tool
+/// result's `created_at_ms`, so the bytes match; a result whose message
+/// carries no stamp is stamped again when rebuilt, so that field alone may
+/// differ, and the streamed, earlier stamp stands.
 fn samePiece(alloc: Allocator, streamed: []const u8, final: []const u8) bool {
     if (std.mem.eql(u8, streamed, final)) return true;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -6028,6 +6058,125 @@ test "a tool result's rebuild time alone does not supersede its stream" {
     try testing.expect(samePiece(testing.allocator, a, b));
     try testing.expect(!samePiece(testing.allocator, a, c));
     try testing.expect(!samePiece(testing.allocator, "{\"text\":\"a\"}", "{\"text\":\"b\"}"));
+}
+
+fn resultEvent(call_id: []const u8, preview: []const u8, stamp: i64) Event {
+    return .{ .tool_result = .{
+        .call_id = call_id,
+        .tool_name = "read_file",
+        .status = .success,
+        .artifact_ref = "result-read_file.txt",
+        .stored_bytes = preview.len,
+        .completeness = .complete,
+        .preview = preview,
+        .created_at_ms = stamp,
+    } };
+}
+
+fn encodeAll(a: Allocator, events: []const Event) ![]const []const u8 {
+    const encoded = try a.alloc([]const u8, events.len);
+    for (events, encoded) |event, *bytes| bytes.* = try encodePiece(a, event);
+    return encoded;
+}
+
+test "streamed pieces stand by their bytes, and only a restamped result needs parsing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user: Event = .{ .user = .{ .text = "read them" } };
+    const streamed = try encodeAll(a, &.{ user, resultEvent("call-1", "one", 100), resultEvent("call-2", "two", 101) });
+    // A rebuild that kept every stamp, with one more result.
+    try testing.expectEqual(@as(?usize, 0), reparsedPrefix(testing.allocator, streamed, try encodeAll(a, &.{
+        user, resultEvent("call-1", "one", 100), resultEvent("call-2", "two", 101), resultEvent("call-3", "three", 102),
+    })));
+    // A rebuild that stamped each result again still stands, by parsing.
+    try testing.expectEqual(@as(?usize, 2), reparsedPrefix(testing.allocator, streamed, try encodeAll(a, &.{
+        user, resultEvent("call-1", "one", 200), resultEvent("call-2", "two", 201),
+    })));
+    // Other content, or a missing piece, no longer stands.
+    try testing.expectEqual(@as(?usize, null), reparsedPrefix(testing.allocator, streamed, try encodeAll(a, &.{
+        user, resultEvent("call-1", "uno", 100), resultEvent("call-2", "two", 101),
+    })));
+    try testing.expectEqual(@as(?usize, null), reparsedPrefix(testing.allocator, streamed, try encodeAll(a, &.{
+        user, resultEvent("call-2", "two", 101),
+    })));
+}
+
+fn readResult(call_id: []const u8, output: []const u8, stamp: i64) types.PersistedToolResult {
+    return .{
+        .tool_call_id = @constCast(call_id),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast(output),
+        .output_bytes = output.len,
+        .stored_output_bytes = output.len,
+        .created_at_ms = stamp,
+    };
+}
+
+/// The stamp of the one tool result a session's only turn restores with.
+fn restoredStamp(t: *TestHome, id: []const u8) !i64 {
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    const steps = restored.history[0].assistant.execution.tool_steps;
+    try testing.expectEqual(@as(usize, 1), steps.len);
+    try testing.expectEqual(@as(usize, 1), steps[0].tool_results.len);
+    return steps[0].tool_results[0].created_at_ms;
+}
+
+test "a turn whose result keeps its stamp commits as streamed, with that stamp" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("read it") };
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{readResult("call-1", "contents", 100)};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    try s.appendProgress(user, execution, .{});
+    try s.appendProgress(user, execution, .{});
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
+    try s.prepareTurn(&turn);
+    defer if (results[0].output_handle) |handle| testing.allocator.free(handle);
+    defer if (results[0].preview) |preview| testing.allocator.free(preview);
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, id, superseded_type));
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, "tool_result"));
+    try testing.expectEqual(@as(i64, 100), try restoredStamp(&t, id));
+}
+
+test "a result rebuilt with other content supersedes its stream and is written as rebuilt" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("read it") };
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{readResult("call-1", "contents", 100)};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    try s.appendProgress(user, execution, .{});
+    results[0].status = .failure;
+    results[0].created_at_ms = 200;
+    try s.appendProgress(user, execution, .{});
+    // The turn written afresh holds the rebuild, its stamp included.
+    const written = for (s.streamed.items) |bytes| {
+        if (std.mem.find(u8, bytes, "\"artifact_ref\"") != null) break bytes;
+    } else return error.TestExpectedStreamedResult;
+    try testing.expect(std.mem.find(u8, written, "\"created_at_ms\":200") != null);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, superseded_type));
 }
 
 test "a streamed turn that differs from its commit is superseded, never mixed" {

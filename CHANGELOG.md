@@ -1,8 +1,63 @@
 # fx
 
-## 0.0.15
+## 0.0.16
 
 <!-- release:start -->
+
+**fx uses 41% fewer tokens. The CLI is 2.8% smaller. libfx npm downloads are about 60% smaller. Edit files up to 4× larger, now up to 16 MiB.**
+
+### Improvements
+
+- Long agent turns use less CPU. A paired local benchmark with 1,000 tool steps used 50–59% less CPU than the previous implementation.
+- `fx update` now works as an alias for `fx upgrade`, including `--channel` and `--json`.
+- Tool results keep their original timestamps when a turn is rebuilt or resumed.
+- The macOS arm64 CLI binary is 2.8% smaller (5.97 MiB vs 6.15 MiB), saving 180,576 bytes.
+- Installing libfx downloads about 60% less than 0.0.15, including the matching native platform package. On Apple Silicon, the download drops from 19.08 MB to 7.35 MB, a 61.5% reduction.
+- Across macOS and Linux builds, total libfx npm downloads are 59.8–61.5% smaller. Unpacked package contents shrink from 43.55 MB to roughly 18–19.5 MB.
+- libfx installs the native addon for your platform instead of carrying every platform’s binary. By default, Node.js loads the WebAssembly backend only when native execution is unavailable.
+- Across ten model families, caching scenarios used 41% fewer uncached input tokens than 0.0.15. Requests that broke the cached prompt prefix fell from 80 to 10, an 87.5% reduction.
+- Uncached input tokens fell 79% on Claude Sonnet 5.5, 78% on Claude Haiku 5.5, and 76% on GPT-6.1 in that comparison. Results varied by model, with MiniMax using 3% more.
+- Prompt caching on supported models now reuses shared instructions across workspaces and worktrees.
+- Changing branches or permissions, reading new folder rules, and resuming a conversation keep the earlier conversation available for prompt caching.
+- Named skills send their full instructions with the turn that invokes them instead of adding them to every later request.
+- Browser apps can bundle only the WebAssembly module they use instead of both the agent and terminal modules.
+- The libfx WebAssembly core is 12.8% smaller than in 0.0.15 (2.15 MiB vs 2.47 MiB), and the terminal is 20.2% smaller (3.39 MiB vs 4.24 MiB). These are uncompressed binary sizes.
+- `edit_file` and `write_file` handle files up to 16 MiB, up from 4 MiB.
+- File edits save their diffs instead of full copies of the file before and after every change. The diff remains available in Ctrl+O after resume, with an omitted-row notice if it exceeds the saved-text limit.
+- `/model` finds models from abbreviated or slightly mistyped provider and model names.
+- Saved sessions retain token usage from each model reply, including replies received before an interrupted turn, and continue counting after resume.
+- Subagent token usage is saved in each subagent’s own session and remains separate from its parent’s total.
+- `fx ask --json` includes cached-read and cache-write token counts when the provider reports them.
+- Global `~/.fx/AGENTS.md` can link to an instruction file elsewhere inside your home directory.
+- Slack sign-in requests the permissions needed to search private channels and direct messages you can access.
+
+### Bug Fixes
+
+- When repeated response failures stop a turn, fx keeps its prompt, partial reply, and completed tool calls. The next prompt can continue from that work, including after resuming the session.
+- Retrying a cancelled libfx prompt with the same turn ID returns the ended turn instead of running the prompt and its tools again.
+- Opening an edit in Ctrl+O no longer crashes when the file contains terminal escape sequences.
+- Editing files containing invalid UTF-8 no longer prevents the session from saving or stops the turn. Invalid bytes appear as readable escapes in previews and saved diffs.
+- Fixed `fx balance` startup when reading a saved credential from the system key store.
+- Stopping a terminal also stops commands running in nested shells and separate job-control groups instead of leaving them running.
+- MCP server failures retain their final error output, including when the server exits immediately.
+- `/usage` in the browser terminal fetches usage through the host instead of showing zero because WebAssembly cannot make native network requests.
+- Qwen no longer fails after its first tool call with `System message must be at the beginning`.
+
+### Security
+
+- File diffs display terminal control sequences as text instead of letting them alter the terminal. This also applies when opening older saved conversations.
+- Commands with escaped or separated stderr-redirection descriptors require review instead of being mistaken for routine commands that can skip review.
+- `fx login codex` rejects account identifiers that cannot be used in HTTP headers before saving credentials or reporting success.
+- File, tool, and skill text is escaped so it remains separate from fx’s own context and permission updates.
+
+### Breaking Changes
+
+- libfx now requires Node.js `^20.19.0 || >=22.12.0`, including when loaded with `require()`.
+- libfx 0.0.15 cannot reopen saved turns containing the new context updates. Upgrade every worker sharing their session store before starting new turns.
+
+<!-- release:end -->
+
+## 0.0.15
 
 **fx now uses 70% less memory in long conversations. The model catalog updates without restarting fx. A leaner session store with 18% faster resumes and `/fork` to branch from an earlier prompt.**
 
@@ -124,8 +179,6 @@
 - MCP resources and prompts are no longer supported, and the `resource` and `prompt` commands have been removed.
 - Legacy SSE MCP connections are no longer supported. Use a stdio or Streamable HTTP connection instead.
 - `FX_MCP_ENGINE` has been removed. The `required` and nondefault `restart_limit` settings are ignored and reported in configuration notes.
-
-<!-- release:end -->
 
 ## 0.0.14
 

@@ -312,6 +312,10 @@ const ChatMessageAdapter = struct {
         return value.tool_result_memory;
     }
 
+    fn toolResultCreatedAtMs(value: Message) ?i64 {
+        return value.tool_result_created_at_ms;
+    }
+
     fn content(value: Message) ?[]const u8 {
         return value.content;
     }
@@ -366,6 +370,10 @@ const MessageAdapter = struct {
 
     fn toolResultMemory(value: Message) ?types.ToolResultMemory {
         return value.tool_result_memory;
+    }
+
+    fn toolResultCreatedAtMs(_: Message) ?i64 {
+        return null;
     }
 
     fn content(value: Message) ?[]const u8 {
@@ -436,7 +444,7 @@ fn buildNormalExecutionMemory(
             const status = Adapter.toolResultStatus(result_msg) orelse
                 return error.MissingToolResultStatus;
             const result_memory = Adapter.toolResultMemory(result_msg);
-            const record = try makePersistedToolResult(
+            var record = try makePersistedToolResult(
                 alloc,
                 tool_call_id,
                 Adapter.toolName(result_msg) orelse call.name,
@@ -444,6 +452,11 @@ fn buildNormalExecutionMemory(
                 output,
                 result_memory,
             );
+            // The result keeps the time it was made, so every rebuild of the
+            // turn records it alike.
+            if (Adapter.toolResultCreatedAtMs(result_msg)) |stamp| {
+                if (stamp > 0) record.created_at_ms = stamp;
+            }
             var owns_record = true;
             errdefer if (owns_record) {
                 freeTransientPersistedToolResult(alloc, record);

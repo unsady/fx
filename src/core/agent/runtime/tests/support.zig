@@ -673,6 +673,9 @@ pub const FakeAgentRuntimeDeps = struct {
     recovery_checkpoint_error_at: ?usize = null,
     recovery_checkpoint_calls: usize = 0,
     recovery_checkpoint_clears: usize = 0,
+    /// Records each prompt the runtime hands back to the composer.
+    capture_restored_prompts: bool = false,
+    restored_prompts: std.ArrayList([]u8) = .empty,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     pause_on_auto_retry_status: bool = false,
     pause_on_auto_retry_attempt: ?usize = null,
@@ -698,6 +701,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.texts);
         freeStringList(self.alloc, &self.assistant_sources);
         freeStringList(self.alloc, &self.system_notices);
+        freeStringList(self.alloc, &self.restored_prompts);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
         for (self.full_detail_records.items) |notice| types.freeSemanticNotice(self.alloc, notice);
@@ -796,6 +800,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 .set = setRecoveryCheckpoint,
                 .clear = clearRecoveryCheckpoint,
             } else null,
+            .restore_failed_prompt = if (self.capture_restored_prompts) restoreFailedPrompt else null,
             .confirm_session_writer = confirmSessionWriter,
             .propagate_grant = @This().propagateGrant,
             .push_event = pushEvent,
@@ -836,6 +841,13 @@ pub const FakeAgentRuntimeDeps = struct {
     fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.recovery_checkpoint_clears += 1;
+    }
+
+    fn restoreFailedPrompt(raw: *anyopaque, prompt: []const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const owned = try self.alloc.dupe(u8, prompt);
+        errdefer self.alloc.free(owned);
+        try self.restored_prompts.append(self.alloc, owned);
     }
 
     fn setRecoveryCheckpoint(

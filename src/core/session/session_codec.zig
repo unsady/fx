@@ -2005,9 +2005,10 @@ pub fn executionHashes(alloc: Allocator, checkpoint: RecoveryCheckpoint) !Execut
     errdefer alloc.free(tool_steps);
     for (execution.tool_steps, tool_steps) |step, *hash| {
         out.clearRetainingCapacity();
-        // The turn's execution is rebuilt before each progress, which stamps
-        // every result's creation time again, so the comparison leaves it
-        // out: a progress that extends another keeps the times it recorded.
+        // The turn's execution is rebuilt before each progress, and a result
+        // whose message carries no time is stamped again then, so the
+        // comparison leaves the time out: a progress that extends another
+        // keeps the times it recorded.
         const results = try alloc.dupe(types.PersistedToolResult, step.tool_results);
         defer alloc.free(results);
         for (results) |*result| result.created_at_ms = 0;

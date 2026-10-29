@@ -11,6 +11,7 @@
     {"name": "diff_rows", "module": "fx", "test": "diff rows stay terminal-safe and saveable on fuzzed file text", "iterations": 200000},
     {"name": "session_conversation_frame", "module": "fx", "test": "conversation frame decoder stays bounded under fuzzed bytes", "iterations": 3000000},
     {"name": "session_conversation_piece", "module": "fx", "test": "v2 conversation pieces stay bounded under fuzzed bytes", "iterations": 300000},
+    {"name": "stable_tool_result_stamps", "module": "fx", "test": "rebuilt tool results keep the times their messages carry", "iterations": 50000},
     {"name": "session_log_scan", "module": "session_manager", "test": "scanning never panics on arbitrary bytes", "iterations": 5000000},
     {"name": "session_schema_header", "module": "session_manager", "test": "header parsing never panics on arbitrary bytes", "iterations": 5000000},
     {"name": "display_width", "module": "fx", "test": "fuzz display unit boundaries", "iterations": 620000},

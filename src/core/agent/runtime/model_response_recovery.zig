@@ -447,6 +447,28 @@ test "stalled progress stops instead of restarting forever" {
     try std.testing.expectEqual(RequiredAction.surface_stall, stopped.required_action);
 }
 
+test "status failures without stream progress never surface a stall" {
+    // The HTTP-status path passes no progress, so it relies on this: a 5xx or
+    // 429 keeps retrying or stops for its own reason, never as a stall.
+    for ([_]FailureCause{ .provider_unavailable, .rate_limited }) |cause| {
+        for ([_]usize{ 1, 3, 4, 20 }) |consumed| {
+            for ([_]bool{ false, true }) |partial| {
+                for ([_]bool{ false, true }) |cancelled| {
+                    const decision = decide(.{
+                        .cause = cause,
+                        .delivery = .possibly_sent,
+                        .attempts = .{ .consumed = consumed, .limit = 3 },
+                        .output = if (partial) .partial else .none,
+                        .cancelled = cancelled,
+                        .recovery_elapsed_ns = 10 * std.time.ns_per_min,
+                    });
+                    try std.testing.expect(decision.required_action != .surface_stall);
+                }
+            }
+        }
+    }
+}
+
 test "retry after and cancellation override automatic recovery" {
     const base = Evidence{
         .cause = .rate_limited,

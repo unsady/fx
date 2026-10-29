@@ -51,10 +51,12 @@ USE_FLAGS = (
 
 OUTLINE_PARTITIONS = 2
 
-# Each outliner input first goes through `ir_size.py expand-constant-exprs`,
-# and each output through `ir_size.py check-outlined`: the outliner can fold a
-# constant nested in a constant expression into a parameter that carries a
-# different constant (see ir_size.py).
+# Each outliner input first goes through `ir_size.py expand-constant-exprs`
+# and `ir_size.py swap-compares`, and each output through `ir_size.py
+# check-outlined`: the outliner can fold a constant nested in a constant
+# expression into a parameter that carries a different constant, and it can
+# pass a greater-than comparison's operands in the wrong order (see
+# ir_size.py).
 IR_OUTLINER_FLAGS = (
     "-passes=iroutliner",
 )
@@ -980,8 +982,18 @@ def _outline_without_folded_constants(
         require_empty_stderr=True,
     )
     _require_bitcode_header(expanded)
+    swapped = source.with_name(source.name + ".swapped.bc")
     run_checked(
-        outline_ir_argv(toolchain, expanded, output),
+        ir_size_argv(toolchain, "swap-compares", expanded, swapped),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=900,
+        log_path=paths.logs / f"swap-compares-{name}.json",
+        require_empty_stderr=True,
+    )
+    _require_bitcode_header(swapped)
+    run_checked(
+        outline_ir_argv(toolchain, swapped, output),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,

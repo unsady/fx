@@ -117,6 +117,196 @@ test "restored steering survives execution memory round trips" {
     try std.testing.expectEqualStrings("parent-agent feedback, not new user authority:\n\nreview", retained.steering[0].text);
 }
 
+/// `execution` as a saved turn encodes it.
+fn encodedTurn(alloc: Allocator, execution: types.ExecutionMemory) ![]u8 {
+    const session_codec = @import("../../session/session_codec.zig");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try session_codec.writeHistoryTurn(&out.writer, .{ .assistant = .{
+        .user = .{ .text = @constCast("read them") },
+        .assistant = @constCast(""),
+        .execution = execution,
+    } });
+    return out.toOwnedSlice();
+}
+
+test "a rebuilt turn keeps each tool result's stamp, so it encodes the same bytes" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{ toolCall("call-1", "read_file", "{}"), toolCall("call-2", "read_file", "{}") };
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "read them" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "one", .tool_call_id = "call-1", .tool_name = "read_file", .tool_result_status = .success, .tool_result_created_at_ms = 1_700_000_000_001 },
+        .{ .role = .tool, .content = "two", .tool_call_id = "call-2", .tool_name = "read_file", .tool_result_status = .failure, .tool_result_memory = .{ .output_bytes = 3, .stored_output_bytes = 3 }, .tool_result_created_at_ms = 1_700_000_000_002 },
+    };
+    const first = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, first);
+    io_mod.sleep(2 * std.time.ns_per_ms);
+    const second = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, second);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_001), first.tool_steps[0].tool_results[0].created_at_ms);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_002), first.tool_steps[0].tool_results[1].created_at_ms);
+    const first_bytes = try encodedTurn(alloc, first);
+    defer alloc.free(first_bytes);
+    const second_bytes = try encodedTurn(alloc, second);
+    defer alloc.free(second_bytes);
+    try std.testing.expectEqualStrings(first_bytes, second_bytes);
+}
+
+test "a tool result without a usable stamp is stamped when rebuilt, as before" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{ toolCall("none", "read_file", "{}"), toolCall("zero", "read_file", "{}"), toolCall("negative", "read_file", "{}") };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "a", .tool_call_id = "none", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .tool, .content = "b", .tool_call_id = "zero", .tool_name = "read_file", .tool_result_status = .success, .tool_result_created_at_ms = 0 },
+        .{ .role = .tool, .content = "c", .tool_call_id = "negative", .tool_name = "read_file", .tool_result_status = .success, .tool_result_created_at_ms = -5 },
+    };
+    const before = io_mod.milliTimestamp();
+    const rebuilt = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, rebuilt);
+    for (rebuilt.tool_steps[0].tool_results) |result| try std.testing.expect(result.created_at_ms >= before);
+}
+
+test "a turn resumed from its checkpoint keeps each result's stamp" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    var calls = [_]ToolCall{ toolCall("kept", "read_file", "{}"), toolCall("unstamped", "read_file", "{}") };
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("kept"), .tool_name = @constCast("read_file"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .stored_output_bytes = 2, .created_at_ms = 1_700_000_000_123 },
+        .{ .tool_call_id = @constCast("unstamped"), .tool_name = @constCast("read_file"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .stored_output_bytes = 2 },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+    try session.appendExecutionMemoryChatMessages(alloc, &messages, .{ .tool_steps = &steps });
+    const tool_messages = messages.items[messages.items.len - 2 ..];
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000_123), tool_messages[0].tool_result_created_at_ms);
+    // A result saved without a time gets one when the turn is rebuilt.
+    try std.testing.expectEqual(@as(?i64, null), tool_messages[1].tool_result_created_at_ms);
+    const rebuilt = try buildExecutionMemory(alloc, messages.items);
+    defer types.freeExecutionMemory(alloc, rebuilt);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_123), rebuilt.tool_steps[0].tool_results[0].created_at_ms);
+    try std.testing.expect(rebuilt.tool_steps[0].tool_results[1].created_at_ms > 0);
+}
+
+test "rebuilt tool results keep the times their messages carry" {
+    try std.testing.fuzz({}, fuzzStableStamps, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            // Two steps of three and two calls, each result with a time.
+            "\x02\x02\x05\x00\x00\x00\x00\x00\x00\x10\x01\x01\x05\x05\x00\x00\x00\x00\x00\x00\x20\x02\x02\x09\x01\x01\x04\x00\x00\x00\x00\x00\x00\x30\x03\x03\x05",
+            // One call each with no stamp, a zero, and a negative one.
+            "\x01\x02\x00\x01\x01\x02\x01\x02\x02\x02\x00\x00\x00\x00\x00\x00\x07\x00\x03\x03",
+            "contents",
+            "{\"created_at_ms\":1,\"nested\":{\"created_at_ms\":2}}",
+            "quotes \" and \\ and \x01 and \xff\xfe and caf\xc3\xa9 \xe4\xb8\xad",
+        }) ++ @import("fuzz_corpus").stable_tool_result_stamps.*),
+    });
+}
+
+/// The fuzz input read as a plan, a byte at a time, and as zeros once it
+/// ends, so every seed of `fuzz_seed.slices` describes a whole turn.
+const FuzzPlan = struct {
+    bytes: []const u8,
+    at: usize = 0,
+
+    fn byte(self: *FuzzPlan) u8 {
+        if (self.at >= self.bytes.len) return 0;
+        defer self.at += 1;
+        return self.bytes[self.at];
+    }
+
+    fn below(self: *FuzzPlan, n: u8) u8 {
+        return self.byte() % n;
+    }
+
+    /// A positive time from the next eight bytes.
+    fn time(self: *FuzzPlan) i64 {
+        var value: u64 = 0;
+        for (0..8) |_| value = (value << 8) | self.byte();
+        return @intCast(@max(1, value >> 1));
+    }
+
+    /// A piece of the input itself, as a result's text.
+    fn text(self: *FuzzPlan) []const u8 {
+        const start = self.byte() % (self.bytes.len + 1);
+        const end = start + self.byte() % (self.bytes.len - start + 1);
+        return self.bytes[start..end];
+    }
+};
+
+/// Builds a turn of fuzzed tool steps whose results carry fuzzed stamps,
+/// some missing or not a time, and requires each of two rebuilds, and the
+/// rebuild of the turn resumed from its own execution as a checkpoint
+/// resumes it, to give every result the stamp its message carries. A turn
+/// whose every result carries one encodes the same bytes each time.
+fn fuzzStableStamps(_: void, smith: *std.testing.Smith) !void {
+    const session = @import("../../session/session.zig");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var input: [512]u8 = undefined;
+    var plan: FuzzPlan = .{ .bytes = input[0..smith.slice(&input)] };
+
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    try messages.append(a, .{ .role = .user, .content = "read them" });
+    var expected: std.ArrayList(?i64) = .empty;
+    var all_stamped = true;
+    for (0..plan.below(6)) |step| {
+        const calls = try a.alloc(ToolCall, 1 + plan.below(3));
+        for (calls, 0..) |*call, index| call.* = toolCall(try a.print("call-{d}-{d}", .{ step, index }), "read_file", "{}");
+        try messages.append(a, .{ .role = .assistant, .tool_calls = calls });
+        for (calls) |call| {
+            const stamp: ?i64 = switch (plan.below(6)) {
+                0 => null,
+                1 => 0,
+                2 => -plan.time(),
+                else => plan.time(),
+            };
+            const usable: ?i64 = if (stamp) |value| (if (value > 0) value else null) else null;
+            all_stamped = all_stamped and usable != null;
+            try expected.append(a, usable);
+            const flags = plan.byte();
+            const content = plan.text();
+            try messages.append(a, .{
+                .role = .tool,
+                .content = content,
+                .tool_call_id = call.id,
+                .tool_name = call.name,
+                .tool_result_status = if (flags & 1 == 0) .success else .failure,
+                .tool_result_memory = if (flags & 2 == 0) null else .{ .output_bytes = content.len, .stored_output_bytes = content.len },
+                .tool_result_created_at_ms = stamp,
+            });
+        }
+    }
+
+    const first = try buildExecutionMemory(a, messages.items);
+    const second = try buildExecutionMemory(a, messages.items);
+    var index: usize = 0;
+    for (first.tool_steps, second.tool_steps) |one, two| {
+        for (one.tool_results, two.tool_results) |x, y| {
+            if (expected.items[index]) |stamp| {
+                try std.testing.expectEqual(stamp, x.created_at_ms);
+                try std.testing.expectEqual(stamp, y.created_at_ms);
+            }
+            index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected.items.len, index);
+    if (all_stamped) try std.testing.expectEqualStrings(try encodedTurn(a, first), try encodedTurn(a, second));
+
+    var resumed: std.ArrayList(ChatMessage) = .empty;
+    try resumed.append(a, .{ .role = .user, .content = "read them" });
+    try session.appendExecutionMemoryChatMessages(a, &resumed, first);
+    const third = try buildExecutionMemory(a, resumed.items);
+    try std.testing.expectEqual(first.tool_steps.len, third.tool_steps.len);
+    for (first.tool_steps, third.tool_steps) |one, three| {
+        try std.testing.expectEqual(one.tool_results.len, three.tool_results.len);
+        for (one.tool_results, three.tool_results) |x, z| try std.testing.expectEqual(x.created_at_ms, z.created_at_ms);
+    }
+}
+
 test "empty restored steering keeps its checkpoint boundary" {
     const alloc = std.testing.allocator;
     const session = @import("../../session/session.zig");

@@ -90,6 +90,15 @@ outliner compares every constant. Afterwards, `ir_size.py check-outlined` fails
 the run if an outlined function still holds a constant expression the outliner
 rebuilt from a parameter. Benchmark candidates take the same two steps.
 
+The IR outliner also matches `a > b` with `b < a` by reversing the operands it
+compares, but it passes the reversed region's operands to the outlined function
+in their original order, so that region computes `a < b`. A PGSO build turned a
+skill file read's bounds check around this way and panicked on the first chunk.
+After `expand-constant-exprs` and before each outliner run, `ir_size.py
+swap-compares` rewrites each greater-than comparison as the less-than
+comparison with its operands swapped, so the outliner only matches comparisons
+written the same way.
+
 Two size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
 std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned

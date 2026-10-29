@@ -400,15 +400,18 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
 
         self.assertEqual(paths.profile_use_bitcode, result)
         lines = actions.read_text().splitlines()
-        self.assertEqual(6, len(lines))
+        self.assertEqual(7, len(lines))
         self.assertIn(f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc ", lines[0])
         self.assertTrue(lines[0].endswith(f"-o {paths.profile_use_base_bitcode}"))
-        expanded = paths.profile_use_base_bitcode.with_name(paths.profile_use_base_bitcode.name + ".expanded.bc")
-        self.assertIn(f"expand-constant-exprs {paths.profile_use_base_bitcode} {expanded}", lines[1])
-        self.assertIn(f"-passes=iroutliner {expanded} -o {paths.profile_use_bitcode}", lines[2])
-        self.assertTrue(lines[3].endswith(f"check-outlined {paths.profile_use_bitcode}"))
-        self.assertIn(f"sparse-constants {paths.profile_use_bitcode} ", lines[4])
-        self.assertIn("-passes=globaldce,verify", lines[5])
+        base = paths.profile_use_base_bitcode
+        expanded = base.with_name(base.name + ".expanded.bc")
+        swapped = base.with_name(base.name + ".swapped.bc")
+        self.assertIn(f"expand-constant-exprs {base} {expanded}", lines[1])
+        self.assertIn(f"swap-compares {expanded} {swapped}", lines[2])
+        self.assertIn(f"-passes=iroutliner {swapped} -o {paths.profile_use_bitcode}", lines[3])
+        self.assertTrue(lines[4].endswith(f"check-outlined {paths.profile_use_bitcode}"))
+        self.assertIn(f"sparse-constants {paths.profile_use_bitcode} ", lines[5])
+        self.assertIn("-passes=globaldce,verify", lines[6])
 
     def test_profile_use_stops_when_the_outliner_folds_a_nested_constant(self) -> None:
         actions = self.root / "folded-actions"
@@ -990,26 +993,29 @@ print('_main T ---------------- 0')""",
         self.assertEqual(self.paths.profile_use_bitcode, result)
         self.assertEqual(b"bitcode", result.read_bytes())
         lines = actions.read_text().splitlines()
-        self.assertEqual(14, len(lines))
+        self.assertEqual(16, len(lines))
         self.assertIn("-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc", lines[0])
         self.assertNotIn("iroutliner", lines[0])
         self.assertEqual("nm", lines[1])
         self.assertTrue(lines[2].startswith("split -j 2 -o "))
-        for index, first in ((0, 3), (1, 6)):
+        for index, first in ((0, 3), (1, 7)):
             split = self.paths.outline_split_bitcodes[index]
             outlined = self.paths.outlined_bitcodes[index]
             expanded = split.with_name(split.name + ".expanded.bc")
+            swapped = split.with_name(split.name + ".swapped.bc")
             self.assertIn(f"expand-constant-exprs {split} {expanded}", lines[first])
-            self.assertIn(f"-passes=iroutliner {expanded} -o {outlined}", lines[first + 1])
-            self.assertTrue(lines[first + 2].endswith(f"check-outlined {outlined}"))
+            self.assertIn(f"swap-compares {expanded} {swapped}", lines[first + 1])
+            self.assertIn(f"-passes=iroutliner {swapped} -o {outlined}", lines[first + 2])
+            self.assertTrue(lines[first + 3].endswith(f"check-outlined {outlined}"))
+            self.assertTrue((self.paths.logs / f"swap-compares-profile-use-{index}.json").is_file())
             self.assertTrue((self.paths.logs / f"check-outlined-profile-use-{index}.json").is_file())
-        self.assertTrue(lines[9].startswith("link "))
-        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[10])
-        self.assertTrue(lines[11].startswith("ir_size --libllvm "))
-        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[11])
-        self.assertIn("-passes=globaldce,verify", lines[12])
-        self.assertTrue(lines[12].endswith(f"-o {self.paths.profile_use_bitcode}"))
-        self.assertEqual("nm", lines[13])
+        self.assertTrue(lines[11].startswith("link "))
+        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[12])
+        self.assertTrue(lines[13].startswith("ir_size --libllvm "))
+        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[13])
+        self.assertIn("-passes=globaldce,verify", lines[14])
+        self.assertTrue(lines[14].endswith(f"-o {self.paths.profile_use_bitcode}"))
+        self.assertEqual("nm", lines[15])
         self.assertFalse(
             self.paths.profile_use_bitcode.with_name(
                 self.paths.profile_use_bitcode.name + ".sparse"

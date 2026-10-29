@@ -4,6 +4,7 @@
     ir_size.py --libllvm <libLLVM.dylib> outline-helpers <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> sparse-constants <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> expand-constant-exprs <in.bc> <out.bc>
+    ir_size.py --libllvm <libLLVM.dylib> swap-compares <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> check-outlined <in.bc>
 
 outline-helpers marks small shared std helpers as noinline: the allocator's
@@ -34,6 +35,17 @@ an operand the outliner compares. Run it on each partition right before
 PHI nodes, landing pads, call targets, and intrinsic calls keep their
 expressions: the outliner never moves an intrinsic call or a PHI's incoming
 constant into a region, and a call target must stay a direct callee.
+
+swap-compares rewrites each greater-than comparison, such as `icmp ugt %a,
+%b`, as the less-than comparison with its operands swapped, `icmp ult %b,
+%a`, keeping its flags and debug location. LLVM's IR outliner matches the two
+forms as one region by reversing the operands it compares, but it passes the
+reversed region's operands to the outlined function in their original order,
+so that region computes `a < b` instead of `a > b`. A PGSO build of the
+current source turned a skill file read's bounds check around this way and
+panicked on the first chunk. With no greater-than comparison left, the
+outliner matches only comparisons written the same way. Run it on each
+partition right before `opt -passes=iroutliner`, after expand-constant-exprs.
 
 check-outlined fails when an outlined function holds a constant expression
 that the outliner rebuilt from a parameter: an instruction LLVM named
@@ -78,6 +90,11 @@ FUNCTION_INDEX = 0xFFFFFFFF
 GET_ELEMENT_PTR = 29
 CASTS = {30: "trunc", 39: "ptrtoint", 40: "inttoptr", 41: "bitcast", 60: "addrspacecast", 69: "ptrtoaddr"}
 OUTLINED_PREFIX = "outlined_ir_func"
+
+# LLVMIntPredicate and LLVMRealPredicate values: each greater-than predicate
+# that LLVM's IR similarity analysis reverses, mapped to its swapped form.
+SWAPPED_INT_PREDICATES = {34: 36, 35: 37, 38: 40, 39: 41}  # ugt, uge, sgt, sge
+SWAPPED_REAL_PREDICATES = {2: 4, 3: 5, 10: 12, 11: 13}  # ogt, oge, ugt, uge
 
 
 class PassError(Exception):
@@ -162,6 +179,21 @@ class Llvm:
         self.BuildGEPNoWrap = f("LLVMBuildGEPWithNoWrapFlags", P, P, P, P, C.POINTER(P), C.c_uint, C.c_char_p, C.c_uint)
         self.BuildCast = f("LLVMBuildCast", P, P, C.c_int, P, P, C.c_char_p)
         self.BuildFreeze = f("LLVMBuildFreeze", P, P, P, C.c_char_p)
+        self.IsAInstruction = f("LLVMIsAInstruction", P, P)
+        self.IsAICmpInst = f("LLVMIsAICmpInst", P, P)
+        self.IsAFCmpInst = f("LLVMIsAFCmpInst", P, P)
+        self.ICmpPredicate = f("LLVMGetICmpPredicate", C.c_int, P)
+        self.FCmpPredicate = f("LLVMGetFCmpPredicate", C.c_int, P)
+        self.BuildICmp = f("LLVMBuildICmp", P, P, C.c_int, P, P, C.c_char_p)
+        self.BuildFCmp = f("LLVMBuildFCmp", P, P, C.c_int, P, P, C.c_char_p)
+        self.ICmpSameSign = f("LLVMGetICmpSameSign", C.c_int, P)
+        self.SetICmpSameSign = f("LLVMSetICmpSameSign", None, P, C.c_int)
+        self.FastMathFlags = f("LLVMGetFastMathFlags", C.c_uint, P)
+        self.SetFastMathFlags = f("LLVMSetFastMathFlags", None, P, C.c_uint)
+        self.DebugLoc = f("LLVMInstructionGetDebugLoc", P, P)
+        self.SetDebugLoc = f("LLVMInstructionSetDebugLoc", None, P, P)
+        self.ReplaceAllUses = f("LLVMReplaceAllUsesWith", None, P, P)
+        self.SetValueName2 = f("LLVMSetValueName2", None, P, C.c_char_p, C.c_size_t)
 
     def _fn(self, name, res, *args):
         fn = getattr(self.lib, name)
@@ -410,6 +442,56 @@ def expand_constant_exprs(llvm: Llvm, source: pathlib.Path, output: pathlib.Path
     return summary
 
 
+def _swapped_compare(llvm: Llvm, builder, inst):
+    """The less-than form of `inst` before it, or None when `inst` is not a
+    greater-than comparison."""
+    if llvm.IsAICmpInst(inst):
+        predicate = SWAPPED_INT_PREDICATES.get(llvm.ICmpPredicate(inst))
+        build = llvm.BuildICmp
+    elif llvm.IsAFCmpInst(inst):
+        predicate = SWAPPED_REAL_PREDICATES.get(llvm.FCmpPredicate(inst))
+        build = llvm.BuildFCmp
+    else:
+        return None
+    if predicate is None:
+        return None
+    llvm.PositionBefore(builder, inst)
+    swapped = build(builder, predicate, llvm.GetOperand(inst, 1), llvm.GetOperand(inst, 0), b"")
+    if llvm.IsAICmpInst(swapped):
+        llvm.SetICmpSameSign(swapped, llvm.ICmpSameSign(inst))
+    elif llvm.IsAFCmpInst(swapped):
+        llvm.SetFastMathFlags(swapped, llvm.FastMathFlags(inst))
+    else:
+        # The builder folded two constants into one.
+        return swapped
+    location = llvm.DebugLoc(inst)
+    if location:
+        llvm.SetDebugLoc(swapped, location)
+    return swapped
+
+
+def swap_compares(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    ctx, mod = llvm.load(source)
+    builder = llvm.CreateBuilder(ctx)
+    summary = {"pass": "swap-compares", "swapped_compares": 0}
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        if not llvm.IsDeclaration(fn):
+            for inst in _instructions(llvm, fn):
+                swapped = _swapped_compare(llvm, builder, inst)
+                if swapped is None:
+                    continue
+                name = llvm.name(inst).encode()
+                llvm.ReplaceAllUses(inst, swapped)
+                llvm.Erase(inst)
+                if name and llvm.IsAInstruction(swapped):
+                    llvm.SetValueName2(swapped, name, len(name))
+                summary["swapped_compares"] += 1
+        fn = llvm.NextFunction(fn)
+    llvm.save(mod, output)
+    return summary
+
+
 def _holds_parameter(llvm: Llvm, expression) -> bool:
     for i in range(llvm.NumOperands(expression)):
         operand = llvm.GetOperand(expression, i)
@@ -445,7 +527,10 @@ def check_outlined(llvm: Llvm, source: pathlib.Path) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--libllvm", required=True, type=pathlib.Path)
-    parser.add_argument("command", choices=("outline-helpers", "sparse-constants", "expand-constant-exprs", "check-outlined"))
+    parser.add_argument(
+        "command",
+        choices=("outline-helpers", "sparse-constants", "expand-constant-exprs", "swap-compares", "check-outlined"),
+    )
     parser.add_argument("source", type=pathlib.Path)
     parser.add_argument("output", type=pathlib.Path, nargs="?")
     args = parser.parse_args(argv)
@@ -460,6 +545,7 @@ def main(argv: list[str] | None = None) -> int:
                 "outline-helpers": outline_helpers,
                 "sparse-constants": sparse_constants,
                 "expand-constant-exprs": expand_constant_exprs,
+                "swap-compares": swap_compares,
             }[args.command]
             summary = run(llvm, args.source, args.output)
     except (OSError, PassError) as error:

@@ -16,6 +16,7 @@ const debug_trace = @import("../../../shared/debug_trace.zig");
 const image_attachments = @import("../../../images/image_attachments.zig");
 const png_downscale = @import("../../../images/png_downscale.zig");
 const io_mod = @import("../../../shared/io.zig");
+const runtime_config = @import("../config.zig");
 const runtime_deps = @import("../deps.zig");
 const runtime_tool_contracts = @import("../tool_contracts.zig");
 const context_limits = @import("../../../config/context_limits.zig");
@@ -6651,7 +6652,7 @@ test "processQueuedPrompt cancellation during HTTP backoff finishes interrupted"
     try std.testing.expect(!checkpoint.outstanding_reservation);
 }
 
-test "processQueuedPrompt cancellation during recovery clears the durable checkpoint" {
+test "processQueuedPrompt cancellation during recovery ends the durable checkpoint with its commit" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{ .status = .service_unavailable },
@@ -6670,11 +6671,43 @@ test "processQueuedPrompt cancellation during recovery clears the durable checkp
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     // The cancel lands during the episode's first retry wait, before any
-    // recovery strategy is assigned: the checkpoint must still die with the
-    // turn or the next resume would revive a turn the user stopped.
+    // recovery strategy is assigned. The turn is saved as interrupted, and
+    // that commit ends its checkpoint, so the next resume cannot revive it. A
+    // separate clear first would end the turn twice in a libfx journal.
     try std.testing.expect(hooks.recovery_checkpoint_calls > 0);
-    try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
+    try std.testing.expectEqual(@as(usize, 0), hooks.recovery_checkpoint_clears);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt cancellation still clears the durable checkpoint when saving the turn fails" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .service_unavailable },
+        .{ .content = "must not send" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    hooks.history_propagation_error = error.TestHistoryPropagationFailed;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.cancel_on_auto_retry_status = &fixture.cancel_flag;
+    var config = fixture.config();
+    config.max_provider_attempts = 3;
+
+    try std.testing.expectError(
+        error.TestHistoryPropagationFailed,
+        runFakePrompt(&gateway, &hooks, config, fixture.job()),
+    );
+
+    // No commit reached the host, so the clear is what keeps a later resume
+    // from continuing the cancelled turn.
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
 }
 
 test "processQueuedPrompt cancellation during network backoff clears retry status" {
@@ -7967,6 +8000,337 @@ test "processQueuedPrompt regenerates a local tool until identical failures stal
     try expectRouteStatus(&hooks, 4, .terminal_provider_error, "⚠ Network interrupted · connection dropped · kept failing at the same point · stopped");
     try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+}
+
+const stall_work_tool_result = "{\"state\":\"no_match\",\"skills\":[],\"tools\":[],\"note\":\"STALL_TOOL_RESULT_SENTINEL\"}";
+const stall_partial_reply = [_][]const u8{"I'll move them into shared constants."};
+const stall_whitespace_reply = [_][]const u8{" \n"};
+
+const StallShape = enum {
+    /// Streams part of a reply, then the connection drops.
+    dropped_after_text,
+    /// The connection drops before any output.
+    dropped_silent,
+    /// The stream ends without a finish event.
+    missing_finish,
+    /// Streams only whitespace, then the connection drops.
+    dropped_after_whitespace,
+};
+
+const stall_shapes = [_]StallShape{ .dropped_after_text, .dropped_silent, .missing_finish, .dropped_after_whitespace };
+
+fn stallCompletion(shape: StallShape) FakeCompletion {
+    return switch (shape) {
+        .dropped_after_text => .{ .chunks = &stall_partial_reply, .stream_error_after_chunks = error.ReadFailed },
+        .dropped_silent => .{ .stream_error = error.ReadFailed },
+        .missing_finish => .{ .chunks = &stall_partial_reply, .omit_finish = true },
+        .dropped_after_whitespace => .{ .chunks = &stall_whitespace_reply, .stream_error_after_chunks = error.ReadFailed },
+    };
+}
+
+/// The reply a saved stalled turn keeps; whitespace is not a reply.
+fn stallSavedReply(shape: StallShape) ?[]const u8 {
+    return switch (shape) {
+        .dropped_after_text, .missing_finish => stall_partial_reply[0],
+        .dropped_silent, .dropped_after_whitespace => null,
+    };
+}
+
+/// One completed `capability_search` call per tool step, then three identical
+/// failures, which the stall detector stops. Allocated in `arena`.
+fn stallAfterToolWorkCompletions(
+    arena: Allocator,
+    call_prefix: []const u8,
+    tool_steps: usize,
+    shape: StallShape,
+) ![]FakeCompletion {
+    const completions = try arena.alloc(FakeCompletion, tool_steps + 3);
+    for (0..tool_steps) |index| {
+        const calls = try arena.alloc(ToolCall, 1);
+        calls[0] = toolCall(
+            try arena.print("{s}_{d:0>4}", .{ call_prefix, index }),
+            "capability_search",
+            try arena.print("{{\"query\":\"{s} step {d}\"}}", .{ call_prefix, index }),
+        );
+        completions[index] = .{ .tool_calls = calls };
+    }
+    for (completions[tool_steps..]) |*completion| completion.* = stallCompletion(shape);
+    return completions;
+}
+
+fn stallToolExecPlans(arena: Allocator, tool_steps: usize, output: []const u8) ![]test_support.FakeExecPlan {
+    const plans = try arena.alloc(test_support.FakeExecPlan, tool_steps);
+    for (plans) |*plan| plan.* = .{ .result = .{ .model_output = output } };
+    return plans;
+}
+
+fn stallWorkConfig(fixture: *PromptFixture) runtime_config.Config {
+    var config = fixture.config();
+    config.gateway_retry_count = 1;
+    config.max_provider_attempts = 1;
+    config.agent_step_limit = 0;
+    config.advertised_tool_names = &.{ "capability_search", "skill" };
+    config.advertised_functions = &.{ builtin_tools.capability_search.model_schema, builtin_tools.skill.model_schema };
+    return config;
+}
+
+/// Sends "continue" with `history` and returns an owned copy of the one
+/// request body the model receives.
+fn nextRequestBody(alloc: Allocator, history: []HistoryTurn) ![]u8 {
+    const completions = [_]FakeCompletion{.{ .content = "NEXT_TURN_REPLY" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("continue");
+    job.history = history;
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    return alloc.dupe(u8, gateway.request_bodies.items[0]);
+}
+
+fn expectSavedStalledTurn(
+    hooks: *const FakeAgentRuntimeDeps,
+    prompt: []const u8,
+    tool_steps: usize,
+    partial_reply: ?[]const u8,
+) !void {
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const turn = hooks.history_turns.items[0];
+    try std.testing.expect(turn == .interrupted);
+    try std.testing.expectEqual(types.InterruptedTerminalReason.failed, turn.interrupted.terminal_reason);
+    try std.testing.expectEqualStrings(prompt, turn.interrupted.user.text);
+    try std.testing.expectEqual(tool_steps, turn.interrupted.execution.tool_steps.len);
+    if (partial_reply) |expected| {
+        try std.testing.expectEqualStrings(expected, turn.interrupted.assistant.?);
+    } else {
+        try std.testing.expect(turn.interrupted.assistant == null);
+    }
+}
+
+fn runStalledToolWorkTurn(shape: StallShape) !void {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const prompt = "STALL_WORK_PROMPT_SENTINEL";
+    var gateway = FakeGateway.init(alloc, try stallAfterToolWorkCompletions(arena, "call_stall_work", 1, shape));
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_checkpoint = true;
+    hooks.tool_registry = builtin_tools.registry;
+    hooks.exec_plans = try stallToolExecPlans(arena, 1, stall_work_tool_result);
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast(prompt);
+
+    try runFakePrompt(&gateway, &hooks, stallWorkConfig(&fixture), job);
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    const last_status = hooks.route_recovery_statuses.items.len - 1;
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.terminal_provider_error, hooks.route_recovery_statuses.items[last_status].kind);
+    try std.testing.expectEqual(types.ModelRecoveryRequiredAction.surface_stall, hooks.route_recovery_statuses.items[last_status].required_action);
+    // Committing the saved turn closes its open checkpoint, so no separate
+    // clear ends the turn a second time.
+    try std.testing.expect(hooks.recovery_checkpoint_calls > 0);
+    try std.testing.expectEqual(@as(usize, 0), hooks.recovery_checkpoint_clears);
+    try expectSavedStalledTurn(&hooks, prompt, 1, stallSavedReply(shape));
+
+    const body = try nextRequestBody(alloc, hooks.history_turns.items);
+    defer alloc.free(body);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(body, prompt));
+    try std.testing.expect(countNeedle(body, "call_stall_work_0000") > 0);
+    try std.testing.expect(countNeedle(body, "STALL_TOOL_RESULT_SENTINEL") > 0);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(body, "<turn_aborted>"));
+}
+
+test "stall stop after a dropped stream keeps completed tool work for the next request" {
+    try runStalledToolWorkTurn(.dropped_after_text);
+}
+
+test "stall stop after silent drops keeps completed tool work for the next request" {
+    try runStalledToolWorkTurn(.dropped_silent);
+}
+
+test "stall stop after missing finish events keeps completed tool work for the next request" {
+    try runStalledToolWorkTurn(.missing_finish);
+}
+
+test "stall stop after whitespace-only replies keeps completed tool work without a reply" {
+    try runStalledToolWorkTurn(.dropped_after_whitespace);
+}
+
+test "stall stop still ends the turn when saving its completed work fails" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var gateway = FakeGateway.init(alloc, try stallAfterToolWorkCompletions(arena, "call_save_fails", 1, .dropped_after_text));
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_checkpoint = true;
+    hooks.capture_restored_prompts = true;
+    hooks.history_propagation_error = error.TestHistoryPropagationFailed;
+    hooks.tool_registry = builtin_tools.registry;
+    hooks.exec_plans = try stallToolExecPlans(arena, 1, stall_work_tool_result);
+    var fixture = PromptFixture{};
+
+    try std.testing.expectError(
+        error.TestHistoryPropagationFailed,
+        runFakePrompt(&gateway, &hooks, stallWorkConfig(&fixture), fixture.job()),
+    );
+
+    // The turn still ends stopped, a later resume must not continue it, and
+    // the prompt is back in the composer even though the save failed.
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
+    try std.testing.expectEqual(@as(usize, 1), hooks.restored_prompts.items.len);
+    try std.testing.expectEqualStrings(fixture.job().prompt, hooks.restored_prompts.items[0]);
+}
+
+test "stall stop keeps hundreds of completed tool steps" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tool_steps = 300;
+    const prompt = "STALL_MANY_STEPS_PROMPT";
+    var gateway = FakeGateway.init(alloc, try stallAfterToolWorkCompletions(arena, "call_many", tool_steps, .dropped_after_text));
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_registry = builtin_tools.registry;
+    hooks.exec_plans = try stallToolExecPlans(arena, tool_steps, stall_work_tool_result);
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast(prompt);
+
+    try runFakePrompt(&gateway, &hooks, stallWorkConfig(&fixture), job);
+
+    try std.testing.expectEqual(@as(usize, tool_steps + 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, tool_steps), hooks.executed_names.items.len);
+    try expectSavedStalledTurn(&hooks, prompt, tool_steps, stall_partial_reply[0]);
+    const body = try nextRequestBody(alloc, hooks.history_turns.items);
+    defer alloc.free(body);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(body, prompt));
+    for ([_][]const u8{ "call_many_0000", "call_many_0150", "call_many_0299" }) |call_id| {
+        try std.testing.expect(countNeedle(body, call_id) > 0);
+    }
+}
+
+test "stall stop keeps a turn whose tool returned a multi-megabyte result" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const output = try arena.alloc(u8, 4 * 1024 * 1024);
+    @memset(output, 'x');
+    const head = "HUGE_RESULT_HEAD_SENTINEL";
+    @memcpy(output[0..head.len], head);
+    const prompt = "STALL_HUGE_RESULT_PROMPT ünïcødé 漢字 𝒇";
+    var gateway = FakeGateway.init(alloc, try stallAfterToolWorkCompletions(arena, "call_huge", 1, .dropped_after_text));
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_registry = builtin_tools.registry;
+    hooks.exec_plans = try stallToolExecPlans(arena, 1, output);
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast(prompt);
+
+    try runFakePrompt(&gateway, &hooks, stallWorkConfig(&fixture), job);
+
+    try expectSavedStalledTurn(&hooks, prompt, 1, stall_partial_reply[0]);
+    const body = try nextRequestBody(alloc, hooks.history_turns.items);
+    defer alloc.free(body);
+    try std.testing.expect(countNeedle(body, "STALL_HUGE_RESULT_PROMPT") > 0);
+    try std.testing.expect(countNeedle(body, head) > 0);
+    try std.testing.expect(countNeedle(body, "call_huge_0000") > 0);
+}
+
+test "stall stop keeps tool work across 1000 consecutive stalled turns" {
+    const alloc = std.testing.allocator;
+    var cycle: usize = 0;
+    while (cycle < 1000) : (cycle += 1) {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const shape = stall_shapes[cycle % stall_shapes.len];
+        const prompt = try arena.print("STALL_FRESH_CYCLE_{d:0>4}_END", .{cycle});
+        var gateway = FakeGateway.init(alloc, try stallAfterToolWorkCompletions(arena, "call_fresh", 1, shape));
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.enable_recovery_checkpoint = true;
+        hooks.tool_registry = builtin_tools.registry;
+        hooks.exec_plans = try stallToolExecPlans(arena, 1, stall_work_tool_result);
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.prompt = prompt;
+
+        try runFakePrompt(&gateway, &hooks, stallWorkConfig(&fixture), job);
+
+        try std.testing.expectEqual(@as(usize, 0), hooks.recovery_checkpoint_clears);
+        try expectSavedStalledTurn(&hooks, prompt, 1, stallSavedReply(shape));
+        const body = try nextRequestBody(alloc, hooks.history_turns.items);
+        defer alloc.free(body);
+        try std.testing.expectEqual(@as(usize, 1), countNeedle(body, prompt));
+    }
+}
+
+test "stall stop keeps each turn's work exactly once across 100 stalls in one conversation" {
+    const alloc = std.testing.allocator;
+    var history: std.ArrayList(HistoryTurn) = .empty;
+    defer {
+        for (history.items) |turn| types.freeHistoryTurn(alloc, turn);
+        history.deinit(alloc);
+    }
+    const cycles = 100;
+    var cycle: usize = 0;
+    while (cycle < cycles) : (cycle += 1) {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const prompt = try arena.print("STALL_SHARED_CYCLE_{d:0>4}_END", .{cycle});
+        const call_prefix = try arena.print("call_shared_{d:0>4}", .{cycle});
+        var gateway = FakeGateway.init(alloc, try stallAfterToolWorkCompletions(arena, call_prefix, 1, stall_shapes[cycle % stall_shapes.len]));
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.tool_registry = builtin_tools.registry;
+        hooks.exec_plans = try stallToolExecPlans(arena, 1, stall_work_tool_result);
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.prompt = prompt;
+        job.history = history.items;
+
+        try runFakePrompt(&gateway, &hooks, stallWorkConfig(&fixture), job);
+
+        try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+        const saved = try types.dupeHistoryTurn(alloc, hooks.history_turns.items[0]);
+        errdefer types.freeHistoryTurn(alloc, saved);
+        try history.append(alloc, saved);
+    }
+
+    const body = try nextRequestBody(alloc, history.items);
+    defer alloc.free(body);
+    try std.testing.expectEqual(@as(usize, cycles), countNeedle(body, "<turn_aborted>"));
+    var buffer: [64]u8 = undefined;
+    cycle = 0;
+    while (cycle < cycles) : (cycle += 1) {
+        const prompt = try std.mem.print(&buffer, "STALL_SHARED_CYCLE_{d:0>4}_END", .{cycle});
+        try std.testing.expectEqual(@as(usize, 1), countNeedle(body, prompt));
+        const call_id = try std.mem.print(&buffer, "call_shared_{d:0>4}_0000", .{cycle});
+        try std.testing.expect(countNeedle(body, call_id) > 0);
+    }
 }
 
 test "processQueuedPrompt settles retry tool starts before pausing" {

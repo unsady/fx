@@ -2331,6 +2331,8 @@ pub fn appendExecutionMemoryChatMessages(
                 .tool_name = result.tool_name,
                 .tool_result_status = result.status,
                 .tool_result_memory = toolResultMemory(result),
+                // A turn resumed from its checkpoint keeps each result's time.
+                .tool_result_created_at_ms = if (result.created_at_ms > 0) result.created_at_ms else null,
             });
         }
         for (step.tool_results) |result| {
