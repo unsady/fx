@@ -7172,6 +7172,7 @@ fn processQueuedPromptLoop(
     var recovery_last_progress: ?usize = null;
     var recovery_no_progress_streak: usize = 0;
     const response_language_expectation = if (config.enforce_response_language and
+        config.reject_response_language_mismatch and
         config.origin == .root and
         job.recovery_checkpoint == null)
         response_language.infer_expectation(job.prompt)

@@ -74,6 +74,7 @@ pub const Config = struct {
     /// false.
     current_prompt_is_root_authority: bool = false,
     enforce_response_language: bool = true,
+    reject_response_language_mismatch: bool = false,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,

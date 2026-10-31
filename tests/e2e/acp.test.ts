@@ -1654,17 +1654,17 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP cancellation preserves earlier preview while replacement language is rejected",
+    "ACP cancellation preserves the latest preview in another language",
     async () => {
-      const root = createIsolatedRoot("fx-acp-rejected-replacement-");
+      const root = createIsolatedRoot("fx-acp-replacement-");
       const tracePath = join(root.root, "trace.log");
       const partialText = "The accepted English preview before the connection stopped.";
-      const rejectedText = "我会先检查锁文件和依赖清单。";
+      const replacementText = "我会先检查锁文件和依赖清单。";
       const laterText = "The later English answer is complete.";
       const heldReplacement = new Response(new ReadableStream({
         start(controller) {
           controller.enqueue(new TextEncoder().encode(
-            `data: ${JSON.stringify({ type: "text-delta", id: "replacement", delta: rejectedText })}\n\n`,
+            `data: ${JSON.stringify({ type: "text-delta", id: "replacement", delta: replacementText })}\n\n`,
           ));
         },
       }), { headers: { "content-type": "text/event-stream" } });
@@ -1689,7 +1689,7 @@ describe("acp: model-independent", () => {
           return (readFileSync(tracePath, "utf8").match(/event type=text-delta/g) ?? []).length === 2;
         }, TIMEOUT);
         expect(client.rawLines.join("\n")).toContain(partialText);
-        expect(client.rawLines.join("\n")).not.toContain(rejectedText);
+        expect(client.rawLines.join("\n")).toContain(replacementText);
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[1]!.body).not.toContain(partialText);
 
@@ -1724,16 +1724,15 @@ describe("acp: model-independent", () => {
           }
           loaded.push(message);
         }
-        expect(occurrenceCount(JSON.stringify(loaded), partialText)).toBe(1);
-        expect(JSON.stringify(loaded)).not.toContain(rejectedText);
+        expect(occurrenceCount(JSON.stringify(loaded), replacementText)).toBe(1);
 
         const later = await runPrompt(client, "Return another English answer.", TIMEOUT);
         expect(later.promptResult.result.stopReason).toBe("end_turn");
         expect(JSON.stringify(later.messages)).toContain(laterText);
         expect(JSON.stringify(later.messages)).not.toContain(partialText);
         expect(gateway.requests).toHaveLength(3);
-        expect(gateway.requests[2]!.body).toContain(partialText);
-        expect(gateway.requests[2]!.body).not.toContain(rejectedText);
+        expect(gateway.requests[2]!.body).not.toContain(partialText);
+        expect(gateway.requests[2]!.body).toContain(replacementText);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

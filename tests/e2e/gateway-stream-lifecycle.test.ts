@@ -4031,16 +4031,14 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
-  test("saved ask retries a clear response language mismatch without persisting it", async () => {
-    const root = createFixtureRoot("response-language-retry");
+  test("saved ask preserves a response in another language through resume", async () => {
+    const root = createFixtureRoot("response-language");
     const firstTracePath = join(root.root, "first-trace.log");
     const resumeTracePath = join(root.root, "resume-trace.log");
-    const rejected = "我会先检查锁文件和依赖清单。";
-    const accepted = "I will inspect the lockfile next.";
-    const resumedText = "The saved session contains only accepted English output.";
+    const responseText = "我会先检查锁文件和依赖清单。";
+    const resumedText = "The saved session contains the earlier output.";
     const responses = [
-      fakeGatewayFinalText(rejected),
-      fakeGatewayFinalText(accepted),
+      fakeGatewayFinalText(responseText),
       fakeGatewayFinalText(resumedText),
     ];
     const gateway = startGateway(() =>
@@ -4066,18 +4064,13 @@ describe("gateway stream lifecycle", () => {
       };
       expect(first.code).toBe(0);
       expect(first.stderr).toBe("");
-      expect(firstJson.output).toContain(accepted);
-      expect(firstJson.usage).toEqual({ input_tokens: 6, output_tokens: 10 });
-      expect(firstJson.output).not.toContain(rejected);
-      expect(gateway.requestCount()).toBe(2);
+      expect(firstJson.output).toContain(responseText);
+      expect(firstJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
+      expect(gateway.requestCount()).toBe(1);
       expect(gateway.requests[0]!.body).toContain(
         "Use the response language requested by the current external human.",
       );
-      expect(gateway.requests[1]!.body).toContain(
-        "The previous candidate used a different language",
-      );
-      // Nothing the session saved holds the rejected reply.
-      expect(savedText(root.home, firstJson.session_id)).not.toContain(rejected);
+      expect(savedText(root.home, firstJson.session_id)).toContain(responseText);
 
       const resumed = await runFx(
         [
@@ -4099,9 +4092,8 @@ describe("gateway stream lifecycle", () => {
       expect(resumed.stderr).toBe("");
       expect(parseAskJson(resumed.stdout).output).toContain(resumedText);
       expect(parseAskJson(resumed.stdout).usage).toEqual({ input_tokens: 3, output_tokens: 5 });
-      expect(gateway.requestCount()).toBe(3);
-      expect(gateway.requests[2]!.body).toContain(accepted);
-      expect(gateway.requests[2]!.body).not.toContain(rejected);
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain(responseText);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

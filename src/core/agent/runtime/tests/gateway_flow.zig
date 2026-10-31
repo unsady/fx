@@ -5717,6 +5717,7 @@ test "processQueuedPrompt retries one clear language mismatch without publishing
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var config = fixture.config();
+    config.reject_response_language_mismatch = true;
     config.max_provider_attempts = 2;
     var job = fixture.job();
     job.prompt = @constCast("The lockfile is broken again.");
@@ -5766,6 +5767,7 @@ test "processQueuedPrompt fails a second clear language mismatch without assista
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var config = fixture.config();
+    config.reject_response_language_mismatch = true;
     config.max_provider_attempts = 2;
     var job = fixture.job();
     job.prompt = @constCast("The lockfile is broken again.");
@@ -5820,10 +5822,12 @@ test "processQueuedPrompt does not language-retry a tool-bearing response" {
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.reject_response_language_mismatch = true;
     var job = fixture.job();
     job.prompt = @constCast("The lockfile is broken again.");
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
@@ -5853,9 +5857,11 @@ test "processQueuedPrompt discards prose replay without losing reasoning or tool
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.reject_response_language_mismatch = true;
     var job = fixture.job();
     job.prompt = @constCast("Please check the notes.");
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try runFakePrompt(&gateway, &hooks, config, job);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try expectBodyNotContains(&gateway, 1, prose);
