@@ -220,7 +220,8 @@ pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelR
     return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
 }
 
-/// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
+/// The returned entry borrows its strings and levels; fetch_catalog replaces
+/// them with owned copies.
 fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
     const vision = metadata.supports_vision orelse false;
     return .{
@@ -231,6 +232,14 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
         // vision support implies file input through the same path.
         .has_vision = vision,
         .has_file_input = vision,
+        .has_reasoning = (metadata.supports_reasoning orelse false) or metadata.reasoning_efforts.len != 0,
+        // Borrowed: the list points at registry storage, so never deinit this
+        // entry. fetch_catalog replaces it with an owned copy.
+        .reasoning_efforts = .{
+            .items = @constCast(metadata.reasoning_efforts),
+            .capacity = metadata.reasoning_efforts.len,
+            .pointer_stability = .{},
+        },
         .context_window = metadata.context_window orelse 0,
         .max_tokens = metadata.max_output_tokens orelse 0,
     };
@@ -252,6 +261,10 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
         errdefer alloc.free(entry.id);
         entry.model_type = try alloc.dupe(u8, entry.model_type);
         errdefer alloc.free(entry.model_type);
+        var efforts: std.ArrayList(types.ReasoningEffort) = .empty;
+        errdefer efforts.deinit(alloc);
+        try efforts.appendSlice(alloc, entry.reasoning_efforts.items);
+        entry.reasoning_efforts = efforts;
         try entries.append(alloc, entry);
     }
     return .{ .catalog = entries };
@@ -260,7 +273,7 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
 test "configured capability lookup matches catalog projection and preserves unknowns" {
     const alloc = std.testing.allocator;
     var registry = try definitions.Registry.parse_json(alloc,
-        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"small":{"context_window":8192,"max_output_tokens":512,"supports_tool_use":true,"supports_vision":true},"large":{"context_window":32768,"max_output_tokens":1024,"supports_tool_use":false},"partial":{"max_output_tokens":128},"unknown":{}}}}
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"small":{"context_window":8192,"max_output_tokens":512,"supports_tool_use":true,"supports_vision":true,"supports_reasoning":true,"reasoning_efforts":["low","high"]},"large":{"context_window":32768,"max_output_tokens":1024,"supports_tool_use":false},"partial":{"max_output_tokens":128},"unknown":{}}}}
     );
     defer registry.deinit(alloc);
     const provider = bundle(registry.get("local").?).model_catalog.?;
@@ -275,7 +288,11 @@ test "configured capability lookup matches catalog projection and preserves unkn
             if (declared_vision) model_capabilities.ImageInputSupport.native else model_capabilities.ImageInputSupport.non_native,
             actual.image_input_support,
         );
+        const declared_reasoning = std.mem.eql(u8, entry.id, "small");
+        try std.testing.expectEqual(declared_reasoning, actual.supports_reasoning);
+        try std.testing.expectEqual(if (declared_reasoning) @as(usize, 2) else 0, actual.reasoning_efforts.len);
     }
+    try std.testing.expectEqualStrings("high", provider.lookupCapabilities("small").?.reasoning_efforts.slice()[1].label());
     try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("small").?.max_output_tokens);
     try std.testing.expectEqual(@as(?u32, 1024), provider.lookupCapabilities("large").?.max_output_tokens);
     try std.testing.expect(provider.lookupCapabilities("partial").?.context_window == null);

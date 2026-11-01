@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 const max_providers = 32;
@@ -46,6 +47,12 @@ pub const ModelMetadata = struct {
     max_output_tokens: ?u32 = null,
     supports_tool_use: ?bool = null,
     supports_vision: ?bool = null,
+    /// Declaring reasoning levels implies reasoning support; the flag alone
+    /// enables reasoning without offering a level to choose.
+    supports_reasoning: ?bool = null,
+    /// Owned, in declaration order, and empty when the model declares none.
+    /// Registry deinit frees it.
+    reasoning_efforts: []const types.ReasoningEffort = &.{},
 };
 
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
@@ -98,7 +105,10 @@ pub const Definition = struct {
             .bearer => |env| alloc.free(env),
         }
         if (self.reviewer_model) |id| alloc.free(id);
-        for (self.model_metadata) |metadata| alloc.free(metadata.id);
+        for (self.model_metadata) |metadata| {
+            alloc.free(metadata.id);
+            alloc.free(metadata.reasoning_efforts);
+        }
         alloc.free(self.model_metadata);
     }
 };
@@ -234,29 +244,60 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const Mo
     const models = try alloc.alloc(ModelMetadata, value.object.count());
     var initialized: usize = 0;
     errdefer {
-        for (models[0..initialized]) |metadata| alloc.free(metadata.id);
+        for (models[0..initialized]) |metadata| {
+            alloc.free(metadata.id);
+            alloc.free(metadata.reasoning_efforts);
+        }
         alloc.free(models);
     }
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         try validate_model_id(entry.key_ptr.*);
         const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision" });
+        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "supports_reasoning", "reasoning_efforts" });
         const context = try positive_limit(metadata.object.get("context_window"));
         const output = try positive_limit(metadata.object.get("max_output_tokens"));
         if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
         const tools = try optional_bool(metadata.object.get("supports_tool_use"));
         const vision = try optional_bool(metadata.object.get("supports_vision"));
+        const reasoning = try optional_bool(metadata.object.get("supports_reasoning"));
+        const efforts = try parse_reasoning_efforts(alloc, metadata.object.get("reasoning_efforts"));
+        errdefer alloc.free(efforts);
         models[initialized] = .{
             .id = try alloc.dupe(u8, entry.key_ptr.*),
             .context_window = context,
             .max_output_tokens = output,
             .supports_tool_use = tools,
             .supports_vision = vision,
+            .supports_reasoning = reasoning,
+            .reasoning_efforts = efforts,
         };
         initialized += 1;
     }
     return models;
+}
+
+/// Levels the provider offers as reasoning_effort names. A declared level is a
+/// concrete name, so the default labels and repeats are rejected rather than
+/// shown twice in `/effort`.
+fn parse_reasoning_efforts(alloc: Allocator, value: ?std.json.Value) ParseError![]const types.ReasoningEffort {
+    const present = value orelse return &.{};
+    if (present != .array) return error.InvalidModelMetadata;
+    const items = present.array.items;
+    if (items.len == 0) return &.{};
+    if (items.len > types.ReasoningEffort.max_options) return error.LimitExceeded;
+    const efforts = try alloc.alloc(types.ReasoningEffort, items.len);
+    errdefer alloc.free(efforts);
+    for (items, 0..) |item, index| {
+        if (item != .string) return error.InvalidModelMetadata;
+        const effort = types.ReasoningEffort.parse(item.string) orelse return error.InvalidModelMetadata;
+        if (effort.isDefault()) return error.InvalidModelMetadata;
+        for (efforts[0..index]) |existing| {
+            if (existing.eql(effort)) return error.InvalidModelMetadata;
+        }
+        efforts[index] = effort;
+    }
+    return efforts;
 }
 
 fn positive_limit(value: ?std.json.Value) ParseError!?u32 {
@@ -371,7 +412,7 @@ fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
 
 const test_json =
     \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1/","auth":{"type":"none"}},
-    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
+    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false,"supports_reasoning":true,"reasoning_efforts":["low","high","max"]},"unknown":{}}}}
 ;
 
 test "configured provider owns definitions and preserves unknown metadata" {
@@ -397,9 +438,15 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqual(@as(?u32, 1024), metadata.max_output_tokens);
     try std.testing.expectEqual(@as(?bool, true), metadata.supports_tool_use);
     try std.testing.expectEqual(@as(?bool, false), metadata.supports_vision);
+    try std.testing.expectEqual(@as(?bool, true), metadata.supports_reasoning);
+    try std.testing.expectEqual(@as(usize, 3), metadata.reasoning_efforts.len);
+    try std.testing.expectEqualStrings("low", metadata.reasoning_efforts[0].label());
+    try std.testing.expectEqualStrings("high", metadata.reasoning_efforts[1].label());
+    try std.testing.expectEqualStrings("max", metadata.reasoning_efforts[2].label());
     const unknown = router.model("unknown").?;
     try std.testing.expect(unknown.context_window == null and unknown.max_output_tokens == null);
     try std.testing.expect(unknown.supports_tool_use == null and unknown.supports_vision == null);
+    try std.testing.expect(unknown.supports_reasoning == null and unknown.reasoning_efforts.len == 0);
     try std.testing.expect(router.model("missing") == null);
     try std.testing.expect(registry.get("Router") == null);
 }
@@ -515,8 +562,33 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_tool_use\":1}}}}", .err = error.InvalidModelMetadata },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_vision\":null}}}}", .err = error.InvalidModelMetadata },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_search\":true}}}}", .err = error.UnknownField },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_reasoning\":\"yes\"}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":\"low\"}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[1]}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"auto\"]}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"high\",\"high\"]}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"\"]}}}}", .err = error.InvalidModelMetadata },
     };
     for (cases) |case| try std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, case.json));
+}
+
+test "configured provider keeps declared reasoning levels in declaration order" {
+    const alloc = std.testing.allocator;
+    const json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"declared\":{\"supports_reasoning\":true,\"reasoning_efforts\":[\"none\",\"low\",\"high\",\"max\"]},\"flag-only\":{\"supports_reasoning\":true},\"empty\":{\"reasoning_efforts\":[]}}}}";
+    var registry = try Registry.parse_json(alloc, json);
+    defer registry.deinit(alloc);
+    const declared = registry.get("local").?.model("declared").?;
+    try std.testing.expectEqual(@as(?bool, true), declared.supports_reasoning);
+    try std.testing.expectEqual(@as(usize, 4), declared.reasoning_efforts.len);
+    try std.testing.expectEqualStrings("none", declared.reasoning_efforts[0].label());
+    try std.testing.expectEqualStrings("max", declared.reasoning_efforts[3].label());
+    const flag_only = registry.get("local").?.model("flag-only").?;
+    try std.testing.expectEqual(@as(usize, 0), flag_only.reasoning_efforts.len);
+    const empty = registry.get("local").?.model("empty").?;
+    try std.testing.expect(empty.supports_reasoning == null and empty.reasoning_efforts.len == 0);
+
+    const too_many = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"a1\",\"a2\",\"a3\",\"a4\",\"a5\",\"a6\",\"a7\",\"a8\",\"a9\",\"a10\",\"a11\",\"a12\",\"a13\",\"a14\",\"a15\",\"a16\",\"a17\"]}}}}";
+    try std.testing.expectError(error.LimitExceeded, Registry.parse_json(alloc, too_many));
 }
 
 test "configured provider auth admits only explicit none or a portable environment slot" {

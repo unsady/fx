@@ -175,6 +175,28 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("declared reasoning levels reach the request and the default sends none", async () => {
+    const f = fixture();
+    try {
+      const metadata = f.settings.providers.local.model_metadata["local-model"] as any;
+      metadata.supports_reasoning = true;
+      metadata.reasoning_efforts = ["none", "low", "high", "max"];
+      (f.settings as any).effort = "max";
+      f.save();
+      const selected = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (selected.code !== 0) throw new Error(`fx ask failed: ${selected.stdout} ${selected.stderr}`);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].body.reasoning_effort).toBe("max");
+
+      (f.settings as any).effort = "auto";
+      f.save();
+      const defaulted = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (defaulted.code !== 0) throw new Error(`fx ask failed: ${defaulted.stdout} ${defaulted.stderr}`);
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests[1].body.reasoning_effort).toBeUndefined();
+    } finally { f.close(); }
+  }, 30000);
+
   test("terminal usage may repeat an empty matching finished choice", async () => {
     const f = fixture(async body => {
       const response = completion(body.model);
