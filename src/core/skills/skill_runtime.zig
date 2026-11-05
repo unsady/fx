@@ -1668,13 +1668,16 @@ fn refreshKnownCatalog(
     {
         return .full_discovery;
     }
-    const current_roots = try collectRootFingerprints(
+    const current_roots = collectRootFingerprints(
         alloc,
         workspace_root,
         home,
         skills_dir,
         root_policy,
-    );
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .full_discovery;
+    };
     defer freeRootFingerprints(alloc, current_roots);
     if (!rootFingerprintsEqual(
         generation.catalog.root_fingerprints,
@@ -2015,18 +2018,21 @@ const CatalogRefreshTask = struct {
             self.done.store(true, .release);
             return;
         };
-        const roots = collectRootFingerprints(
+        const roots: []RootFingerprint = if (discovery.diagnostics.len > 0) &.{} else collectRootFingerprints(
             self.alloc,
             self.workspace_root,
             self.home,
             self.skills_dir,
             self.root_policy,
-        ) catch |err| {
-            var owned = discovery;
-            owned.deinit(self.alloc);
-            self.failure = err;
-            self.done.store(true, .release);
-            return;
+        ) catch |err| blk: {
+            if (err == error.OutOfMemory) {
+                var owned = discovery;
+                owned.deinit(self.alloc);
+                self.failure = err;
+                self.done.store(true, .release);
+                return;
+            }
+            break :blk &.{};
         };
         const dir = self.alloc.dupe(u8, self.skills_dir) catch |err| {
             freeRootFingerprints(self.alloc, roots);
@@ -3434,6 +3440,40 @@ const test_root_policy: skill_contract.RootPolicy = .{
 const test_managed_root_policy: skill_contract.RootPolicy = .{
     .managed_root_source = .global_fx,
 };
+
+test "catalog refresh keeps available skills when a compatibility root is inaccessible" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = io_mod.getIo();
+    const alloc = std.testing.allocator;
+    try tmp.dir.createDirPath(io, "home/.codex/skills");
+    try tmp.dir.createDirPath(io, "home/managed/example");
+    {
+        var file = try tmp.dir.createFile(io, "home/managed/example/SKILL.md", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "---\nname: example\ndescription: Example skill\n---\nbody\n");
+    }
+    var restricted = try tmp.dir.openDir(io, "home/.codex", .{});
+    defer restricted.close(io);
+    try restricted.setPermissions(io, .fromMode(0));
+    defer restricted.setPermissions(io, .fromMode(0o700)) catch {};
+    if (tmp.dir.statFile(io, "home/.codex/skills", .{})) |_| return error.SkipZigTest else |_| {}
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const managed = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/managed");
+    defer alloc.free(managed);
+    const task = try CatalogRefreshTask.create(alloc, home, home, managed, test_root_policy, 1, .{});
+    defer task.deinit();
+    task.run();
+
+    try std.testing.expect(task.failure == null);
+    const catalog = task.catalog orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), catalog.skills.len);
+    try std.testing.expectEqualStrings("example", catalog.skills[0].name);
+    try std.testing.expectEqual(@as(usize, 1), catalog.diagnostics.len);
+    try std.testing.expectEqual(SkillDiagnosticCause.unreadable, catalog.diagnostics[0].cause);
+}
 
 test "skill discovery bounds near-emergency valid metadata" {
     var tmp = std.testing.tmpDir(.{});
