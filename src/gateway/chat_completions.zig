@@ -139,6 +139,43 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
     return phase;
 }
 
+/// Adds OpenCode's routing identity only for its own HTTPS endpoint. The
+/// fallback is request-local when the caller has no persistent session.
+pub fn opencode_session_header(base_url: []const u8, session_id: ?[]const u8, fallback: *[32]u8) ?std.http.Header {
+    const uri = std.Uri.parse(base_url) catch return null;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return null;
+    const host = (uri.host orelse return null).percent_encoded;
+    if (!std.ascii.eqlIgnoreCase(host, "opencode.ai")) return null;
+    if (uri.port) |port| if (port != 443) return null;
+    if (session_id) |id| {
+        if (id.len > 0 and id.len <= 255) {
+            var valid = true;
+            for (id) |byte| if (byte <= 0x20 or byte >= 0x7f) {
+                valid = false;
+                break;
+            };
+            if (valid) return .{ .name = "x-opencode-session", .value = id };
+        }
+    }
+    var bytes: [16]u8 = undefined;
+    io.getIo().random(&bytes);
+    fallback.* = std.fmt.bytesToHex(bytes, .lower);
+    return .{ .name = "x-opencode-session", .value = fallback };
+}
+
+test "OpenCode session header is scoped to its endpoint and uses a safe session identity" {
+    var fallback: [32]u8 = undefined;
+    const header = opencode_session_header("https://opencode.ai/inference/go/openai/v1", "conversation-1", &fallback).?;
+    try std.testing.expectEqualStrings("x-opencode-session", header.name);
+    try std.testing.expectEqualStrings("conversation-1", header.value);
+    try std.testing.expect(opencode_session_header("https://opencode.ai.evil.example/v1", "conversation-1", &fallback) == null);
+    try std.testing.expect(opencode_session_header("https://opencode.ai:8443/v1", "conversation-1", &fallback) == null);
+    const missing = opencode_session_header("https://opencode.ai/v1", null, &fallback).?;
+    try std.testing.expectEqual(@as(usize, 32), missing.value.len);
+    const invalid = opencode_session_header("https://opencode.ai/v1", "bad\r\nheader", &fallback).?;
+    try std.testing.expectEqual(@as(usize, 32), invalid.value.len);
+}
+
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
     const url = try definition.chat_url(alloc);
     defer alloc.free(url);
@@ -148,11 +185,19 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     defer client.deinit();
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
+    var fallback: [32]u8 = undefined;
+    var request_headers: [2]std.http.Header = undefined;
+    request_headers[0] = .{ .name = "accept", .value = "text/event-stream" };
+    var header_count: usize = 1;
+    if (opencode_session_header(definition.base_url, request.session_id, &fallback)) |header| {
+        request_headers[header_count] = header;
+        header_count += 1;
+    }
     var operation = client_mod.PostOperation{
         .client = &client,
         .uri = uri,
         .authorization = authorization,
-        .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
+        .extra_headers = request_headers[0..header_count],
     };
     try request.admission.admit();
     var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
@@ -315,9 +360,11 @@ fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider
     }
 }
 
-const Review = struct { definition: *const definitions.Definition, input: classifier.ProviderInput };
+const Review = struct { definition: *const definitions.Definition, input: classifier.ProviderInput, session_id: [32]u8 };
 fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest) !classifier.ParseOutcome {
-    var state = Review{ .definition = definition_at(raw), .input = input };
+    var random: [16]u8 = undefined;
+    io.getIo().random(&random);
+    var state = Review{ .definition = definition_at(raw), .input = input, .session_id = std.fmt.bytesToHex(random, .lower) };
     return classifier.Reviewer.withTransportModel(.{ .context = &state, .build_fn = build_review, .send_fn = send_review }, input.cancel_flag, classifier.Reviewer.default_timeout_ms, state.definition.reviewer_model orelse request.review_turn.model).review(alloc, request);
 }
 fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const u8, instructions: []const types.ChatMessage, messages: []const types.ChatMessage, target_id: []const u8, deadline: std.Io.Clock.Timestamp, cancel: *std.atomic.Value(bool)) ![]u8 {
@@ -340,6 +387,7 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
     var event_context: u8 = 0;
     var result = gateway_step.streamModelCompletion(bundle(state.definition).agent_stream.?, alloc, .{
         .credential = .{ .direct = .{ .secret_bytes = state.input.credential, .source = state.input.credential_source } },
+        .session_id = &state.session_id,
         .model = model,
         .retry_count = 1,
         .messages = &.{},

@@ -75,12 +75,17 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     defer if (request.prepared_request_body == null) alloc.free(payload);
     const endpoint = try definition.chat_url(alloc);
     defer alloc.free(endpoint);
-    const headers = [_]std.http.Header{
-        .{ .name = "content-type", .value = "application/json" },
-        .{ .name = "accept", .value = "text/event-stream" },
-    };
+    var headers: [3]std.http.Header = undefined;
+    headers[0] = .{ .name = "content-type", .value = "application/json" };
+    headers[1] = .{ .name = "accept", .value = "text/event-stream" };
+    var header_count: usize = 2;
+    var fallback: [32]u8 = undefined;
+    if (chat_completions.opencode_session_header(definition.base_url, request.session_id, &fallback)) |header| {
+        headers[header_count] = header;
+        header_count += 1;
+    }
 
-    const opened = try host_stream.openPost(alloc, transport, request, endpoint, &headers, payload);
+    const opened = try host_stream.openPost(alloc, transport, request, endpoint, headers[0..header_count], payload);
     defer transport.close(opened.handle);
     if (opened.status != .ok) {
         const body = try host_stream.readErrorBody(alloc, transport, opened.handle, request);
@@ -139,6 +144,19 @@ test "host chat completions posts the CLI's request to the provider's base URL w
     try std.testing.expectEqualStrings("libfx on a custom provider", result.completed.completion.content.?);
     try std.testing.expectEqual(@as(usize, 1), fake.consumed);
     try std.testing.expectEqual(fake.calls, fake.closed);
+}
+
+test "host chat completions sends OpenCode the conversation session" {
+    const alloc = std.testing.allocator;
+    var fake = FakeTransport{ .model = "local-model", .responses = &.{.{ .status = 200, .body = reply_sse }} };
+    defer fake.deinit();
+    var context = try Context.init(alloc, fake.transport(),
+        \\{"opencode":{"protocol":"openai-chat-completions","base_url":"https://opencode.ai/inference/go/openai/v1","auth":{"type":"none"}}}
+    );
+    defer context.deinit(alloc);
+    var result = try bundle(&context, context.definition()).agent_stream.?.stream(alloc, fake.request(.host_managed));
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, fake.headers[0], "\"name\":\"x-opencode-session\",\"value\":\"session-1\"") != null);
 }
 
 test "host chat completions returns the error status and body of a rejected request" {
