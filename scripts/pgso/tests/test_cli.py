@@ -200,7 +200,9 @@ class PgsoCliTests(unittest.TestCase):
             output.write_bytes(b"profile")
             return 0
 
-        def write_profile_use_ir(_toolchain, paths, _sha):
+        def write_profile_use_ir(_toolchain, paths, _sha, *, no_outline_functions):
+            # macOS has no startup exemption, so nothing is kept out of outlining.
+            self.assertIsNone(no_outline_functions)
             paths.profile_use_ir.write_text("ir\n", encoding="utf-8")
 
         def link_candidate(_toolchain, paths):

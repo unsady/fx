@@ -103,14 +103,14 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         pub fn load(alloc: Allocator) !?Session {
             if (comptime host_target.is_wasm) return null;
             const home = io_mod.homeDir() orelse return null;
-            var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
+            var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| {
                 debug_trace.logf("auth", spec.trace_label ++ " session load failed step=open_home err={s}", .{@errorName(err)});
                 if (err == error.FileNotFound) return null;
                 return session_presence.storageError(spec.auth_file_name, err);
             };
             defer home_dir.close(io_mod.getIo());
 
-            var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+            var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{
                 .iterate = true,
                 .follow_symlinks = false,
             }) catch |err| {
@@ -125,12 +125,9 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         }
 
         fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
-            var file = fx_dir.openFile(io_mod.getIo(), spec.auth_file_name, .{
-                .mode = .read_only,
-                .allow_directory = false,
-                .follow_symlinks = false,
-                .resolve_beneath = true,
-            }) catch |err| switch (err) {
+            // A path that isn't a regular file, such as a fifo, fails without
+            // waiting for a writer.
+            var file = io_mod.openExistingReadOnlyRegularFile(fx_dir.*, spec.auth_file_name, .no_follow) catch |err| switch (err) {
                 error.FileNotFound => return null,
                 else => {
                     debug_trace.logf("auth", spec.trace_label ++ " session load failed step=open_file err={s}", .{@errorName(err)});
@@ -167,7 +164,7 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
             if (comptime host_target.is_wasm) return null;
             const home = io_mod.homeDir() orelse return error.HomeNotSet;
             var home_dir = io_mod.VerifiedDir{
-                .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(spec.auth_file_name, err),
+                .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| return session_presence.storageError(spec.auth_file_name, err),
             };
             defer home_dir.close();
 
@@ -181,11 +178,11 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         fn beginMutation() !Mutation {
             const home = io_mod.homeDir() orelse return error.HomeNotSet;
             var home_dir = io_mod.VerifiedDir{
-                .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(spec.auth_file_name, err),
+                .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| return session_presence.storageError(spec.auth_file_name, err),
             };
             defer home_dir.close();
 
-            const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
+            const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.rootName());
             return lockMutation(fx_dir);
         }
 
@@ -256,7 +253,7 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
 }
 
 fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
-    var dir = try home_dir.dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var dir = try home_dir.dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{
         .iterate = true,
         .follow_symlinks = false,
     });

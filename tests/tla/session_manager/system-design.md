@@ -799,7 +799,7 @@ Settled in the 2026-09-27 pre-wiring API check:
   work item, and `State.children` lists every child with its newest work,
   outcome, data and seq. **Why:** fx needs the whole list, not only running
   work, to continue a named child, detect replaced work and report status
-  (`src/core/subagent/child_state.zig` lines 42 to 57), and this removes
+  (`src/core/subagent/child_state.zig` `Kind`, `Phase`, and `Outcome`), and this removes
   `children.json` without a second owner. **Alternative:** keep
   `children.json` next to v2 for now, which gives the same state two owners.
 - **D23 Decision:** "continue" after an interrupted turn starts a new turn
@@ -1172,8 +1172,10 @@ Settled for `/fork` (2026-10-02):
   to the end of the previous turn under a new id and hard-links the
   blobs (D5), so the source is never written. The app switches to the
   fork as a resume does, opening it before it closes the source (D41),
-  writes `original session fx --resume` and the source's id in the
-  transcript, and puts the prompt back in the input box. The fork's title
+  writes `Resume the original session with:` and, on the line below,
+  `fx --resume` and the source's id after the replayed turns, so they stay
+  in view however long the session is, and puts the prompt back in the
+  input box. The fork's title
   is the source's with ` (fork)` once. `/fork` waits for a running turn
   to end. (Until D53 removed the switch, the line named `--sessions-v2`
   and `/fork` refused without it.)

@@ -9,6 +9,7 @@ const host_capabilities = @import("../hosts/host.zig");
 const session_layout = @import("../session/session_layout.zig");
 const process_identity = @import("../execution/process_identity.zig");
 const managed_execution_contract = @import("../execution/managed_execution_contract.zig");
+const json_decode = @import("../shared/json_decode.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
@@ -356,7 +357,7 @@ pub fn runLauncher(alloc: Allocator) !void {
     const config_bytes = try alloc.alloc(u8, config_len);
     defer alloc.free(config_bytes);
     try readExactFd(std.posix.STDIN_FILENO, config_bytes);
-    var parsed = try std.json.parseFromSlice(
+    var parsed = try json_decode.parseFromSlice(
         LauncherConfig,
         alloc,
         config_bytes,
@@ -826,7 +827,7 @@ const SupportedRegistry = struct {
             return;
         }
 
-        if (io_mod.getenv("FX_TERMINAL_TEST_FAIL_CANCELLATION_OPEN") != null) {
+        if (io_mod.getenv("FX_TEST_TERMINAL_FAIL_CANCELLATION_OPEN") != null) {
             return error.InjectedCancellationOpenFailure;
         }
         const durable = try self.profile.open_terminal(session_id);
@@ -2660,7 +2661,7 @@ const Session = struct {
 
     fn commitStartupBoundary(self: *Session) void {
         if (self.command != null) {
-            maybeDelayForTest("FX_TERMINAL_TEST_COMMAND_BOUNDARY_DELAY_MS");
+            maybeDelayForTest("FX_TEST_TERMINAL_COMMAND_BOUNDARY_DELAY_MS");
         }
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
@@ -3033,8 +3034,8 @@ fn writeAction(
     defer session.write_mutex.unlock(zio);
     if (cancelled.load(.acquire)) return error.Cancelled;
     if (request.lease == .use) {
-        signalTestBarrier("FX_TERMINAL_TEST_WRITE_BARRIER_PATH");
-        maybeDelayForTest("FX_TERMINAL_TEST_WRITE_DELAY_MS");
+        signalTestBarrier("FX_TEST_TERMINAL_WRITE_BARRIER_PATH");
+        maybeDelayForTest("FX_TEST_TERMINAL_WRITE_DELAY_MS");
     }
 
     const authorization = switch (request.lease) {
@@ -3366,7 +3367,7 @@ test "terminal signaling accepts a process group that exited during descendant d
 }
 
 fn failSignalStageForTest(stage: []const u8) bool {
-    const requested = io_mod.getenv("FX_TERMINAL_TEST_FAIL_SIGNAL_STAGE") orelse
+    const requested = io_mod.getenv("FX_TEST_TERMINAL_FAIL_SIGNAL_STAGE") orelse
         return false;
     return std.mem.eql(u8, requested, stage);
 }
@@ -3709,7 +3710,7 @@ fn controlMain(session: *Session) void {
         session.output_thread = null;
     }
 
-    maybeDelayForTest("FX_TERMINAL_TEST_BACKEND_CLEANUP_DELAY_MS");
+    maybeDelayForTest("FX_TEST_TERMINAL_BACKEND_CLEANUP_DELAY_MS");
 
     const zio = io_mod.getIo();
     session.write_mutex.lockUncancelable(zio);

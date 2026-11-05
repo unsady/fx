@@ -15,19 +15,35 @@ from collections.abc import Mapping, Sequence
 
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import (
+    _LLVM_FUNCTION_NAME,
+    _OUTLINED_IR_CALL,
     PipelinePaths,
+    _decode_llvm_identifier,
+    _discover_compiler_runtime,
     _extract_compiler_runtime,
     _require_nonempty_file,
     parse_compiler_runtime,
     validate_archive_unchanged,
 )
-from scripts.pgso.runner import run_checked
+from scripts.pgso.runner import CommandResult, run_checked
 from scripts.pgso.toolchain import Toolchain, _capture, _resolve_executable
 
 TARGET = "aarch64-macos"
 DISPLAY_NAME = "macOS arm64"
 HOST_ARCH = "arm64"
 LIBLLVM_NAME = "libLLVM.dylib"
+SIZE_CEILING_MIB = 6.500
+# The ordinary control build already records everything the links reuse.
+CONTROL_BUILD_FLAGS: tuple[str, ...] = ()
+# Apple ld's dead-code stripping for `zig cc` links.
+ZIG_CC_LINK_FLAGS = ("-Wl,-dead_strip",)
+STARTUP_SCENARIOS: tuple[str, ...] = ()
+
+
+def external_control_strip_argv(
+    toolchain: Toolchain, binary: pathlib.Path
+) -> tuple[str, ...]:
+    return (str(toolchain.tools.strip), "-S", "-x", str(binary))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,7 +93,6 @@ def _zig_darwin_sdk(zig: pathlib.Path) -> tuple[pathlib.Path, str]:
     if not isinstance(version, str) or re.fullmatch(r"\d+\.\d+(?:\.\d+)?", version) is None:
         raise PgsoError("invalid Zig Darwin SDK version")
     return sdk, version
-
 
 
 def discover_tools(zig_path: pathlib.Path, clang: pathlib.Path) -> tuple[Tools, pathlib.Path]:
@@ -215,7 +230,7 @@ def candidate_link_argv(
         "-target",
         toolchain.target,
         "-O2",
-        "-Wl,-dead_strip",
+        *ZIG_CC_LINK_FLAGS,
         "-s",
         str(paths.profile_use_object),
         "-o",
@@ -361,38 +376,9 @@ def map_temporal_symbols(
     }
 
 
-_LLVM_FUNCTION_NAME = re.compile(
-    r'@("(?:[^"\\]|\\[0-9a-fA-F]{2})*"|[A-Za-z$._][A-Za-z$._0-9]*)\('
-)
-
-
 _OUTLINED_IR_SYMBOL = re.compile(
     r"_outlined_ir_func_[0-9]+(?:\.[0-9]+)?"
 )
-
-
-_OUTLINED_IR_CALL = re.compile(
-    r"@(outlined_ir_func_[0-9]+(?:\.[0-9]+)?)\("
-)
-
-
-def _decode_llvm_identifier(value: str) -> str:
-    if not value.startswith('"'):
-        return value
-    raw = value[1:-1]
-    decoded = bytearray()
-    index = 0
-    while index < len(raw):
-        if raw[index] == "\\":
-            decoded.append(int(raw[index + 1:index + 3], 16))
-            index += 3
-        else:
-            decoded.extend(raw[index].encode())
-            index += 1
-    try:
-        return decoded.decode()
-    except UnicodeDecodeError as error:
-        raise PgsoError("invalid UTF-8 in LLVM function name") from error
 
 
 def order_outlined_ir_helpers(
@@ -839,9 +825,10 @@ def control_identity_from_evidence(control: Mapping[str, object]) -> dict[str, s
 def link_instrumented(
     toolchain: Toolchain,
     paths: PipelinePaths,
-    compiler_runtime_object: pathlib.Path,
     control: Mapping[str, str],
 ) -> None:
+    archive = _discover_compiler_runtime(toolchain, paths)
+    compiler_runtime_object = _extract_compiler_runtime(toolchain, archive, paths)
     run_checked(
         instrumented_link_argv(
             toolchain,
@@ -879,6 +866,30 @@ def link_instrumented(
         log_path=paths.logs / "instrumented-signature.json",
         require_empty_stderr=True,
     )
+
+
+def record_control_build(toolchain: Toolchain, result: CommandResult, paths: PipelinePaths) -> None:
+    """Nothing to record: the macOS links rebuild their own commands."""
+
+
+def prepare_candidate_bitcode(toolchain: Toolchain, paths: PipelinePaths) -> None:
+    """The Apple link orders sections, so private functions need no symbol."""
+
+
+def candidate_object_flags(paths: PipelinePaths) -> tuple[str, ...]:
+    return ()
+
+
+def os_versions(paths: PipelinePaths) -> dict[str, str]:
+    result = run_checked(
+        ("sw_vers", "-productVersion"),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=30,
+        log_path=paths.logs / "macos-version.json",
+        require_empty_stderr=True,
+    )
+    return {"macos_version": result.stdout.strip()}
 
 
 def public_api_flags(toolchain: Toolchain, paths: PipelinePaths) -> tuple[str, ...]:

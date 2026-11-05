@@ -104,6 +104,7 @@ pub const Projection = struct {
     current_entry: ?EntryProjection,
     current_index: usize,
     entry_count: usize,
+    asker: []const u8 = "",
 
     pub fn isFreeformSelected(self: Projection) bool {
         const entry = self.current_entry orelse return false;
@@ -117,6 +118,9 @@ pub const QuestionPrompt = struct {
     active: bool = false,
     entries: std.ArrayList(OwnedQuestionEntry) = .empty,
     current_index: u8 = 0,
+    /// The subagent that asked, while main's screen shows its question;
+    /// empty for the agent's own. Borrowed from the subagent.
+    asker: []const u8 = "",
 
     pub fn deinit(self: *QuestionPrompt, alloc: Allocator) void {
         self.discard(alloc, "deinit");
@@ -146,6 +150,7 @@ pub const QuestionPrompt = struct {
             .current_entry = current_entry,
             .current_index = current_index,
             .entry_count = self.entries.items.len,
+            .asker = self.asker,
         };
     }
 
@@ -554,7 +559,11 @@ pub const QuestionPrompt = struct {
         if (!self.isFreeformSelected()) return;
         var entry = &self.entries.items[self.current_index];
         entry.freeform_preferred_column = null;
-        const start = text_boundaries.logicalLineStart(entry.freeform_buffer.items, entry.freeform_cursor);
+        const line_start = text_boundaries.logicalLineStart(entry.freeform_buffer.items, entry.freeform_cursor);
+        const start = if (entry.freeform_cursor == line_start and line_start > 0)
+            line_start - 1
+        else
+            line_start;
         _ = edit_contract.deleteRange(&entry.freeform_buffer, &entry.freeform_cursor, start, entry.freeform_cursor);
     }
 
@@ -627,6 +636,12 @@ pub const QuestionPrompt = struct {
         if (entry.options.items.len == 0) return .none;
         const idx: usize = @min(entry.choice_index, entry.options.items.len - 1);
         const opt = entry.options.items[idx];
+        // Value-only prompts can accept blank strings; custom multiple-choice answers cannot.
+        if (opt.is_freeform_slot and entry.submission == .none and entry.options.items.len > 1 and
+            std.mem.trimStart(u8, entry.freeform_buffer.items, &std.ascii.whitespace).len == 0)
+        {
+            return .none;
+        }
         const encoded = if (entry.submission != .none) blk: {
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
@@ -1282,14 +1297,82 @@ test "submit on freeform slot stores the draft as its answer" {
     try std.testing.expectEqualStrings("xy", prompt.entries.items[0].answer.?);
 }
 
-test "submit on empty freeform slot stores an empty answer" {
+test "submit on blank freeform slot leaves the question unanswered" {
+    const alloc = std.testing.allocator;
     var prompt = QuestionPrompt{};
-    defer prompt.deinit(std.testing.allocator);
+    defer prompt.deinit(alloc);
     try syncTestQuestion(&prompt);
 
     prompt.moveChoice(-1);
-    try std.testing.expectEqual(QuestionInputEvent.all_decided, try prompt.apply(std.testing.allocator, .submit));
-    try std.testing.expectEqualStrings("", prompt.entries.items[0].answer.?);
+    for ([_][]const u8{ "", " \t\r\n " }) |draft| {
+        prompt.clearFreeformDraft("test");
+        _ = try prompt.insertFreeformSlice(alloc, draft, 64);
+        try std.testing.expectEqual(QuestionInputEvent.none, try prompt.apply(alloc, .submit));
+        try std.testing.expect(prompt.isActive());
+        try std.testing.expect(prompt.isFreeformSelected());
+        try std.testing.expectEqual(@as(u8, 0), prompt.current_index);
+        try std.testing.expect(prompt.entries.items[0].answer == null);
+        try std.testing.expect(prompt.entries.items[0].confirmed_choice_index == null);
+        try std.testing.expectEqualStrings(draft, prompt.entries.items[0].freeform_buffer.items);
+    }
+
+    _ = try prompt.apply(alloc, .{ .insert_ascii = 'x' });
+    try std.testing.expectEqual(QuestionInputEvent.all_decided, try prompt.apply(alloc, .submit));
+    try std.testing.expectEqualStrings(" \t\r\n x", prompt.entries.items[0].answer.?);
+}
+
+test "blank freeform submission does not advance a batch or replace a confirmed answer" {
+    const alloc = std.testing.allocator;
+    var prompt = QuestionPrompt{};
+    defer prompt.deinit(alloc);
+    const options = [_]types.QuestionOption{.{ .label = "Yes" }};
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "First?", .options = &options },
+        .{ .question = "Second?", .options = &options },
+    };
+    try prompt.syncFrom(alloc, &entries);
+    prompt.moveChoice(-1);
+    try std.testing.expectEqual(QuestionInputEvent.none, try prompt.apply(alloc, .submit));
+    try std.testing.expectEqual(@as(u8, 0), prompt.current_index);
+    try std.testing.expect(prompt.entries.items[0].answer == null);
+    try std.testing.expect(prompt.entries.items[1].answer == null);
+
+    _ = try prompt.apply(alloc, .{ .insert_ascii = 'x' });
+    _ = try prompt.apply(alloc, .submit);
+    _ = prompt.retreatToPrevious();
+    _ = try prompt.apply(alloc, .backspace);
+    try std.testing.expectEqual(QuestionInputEvent.none, try prompt.apply(alloc, .submit));
+    try std.testing.expectEqual(@as(u8, 0), prompt.current_index);
+    try std.testing.expectEqualStrings("x", prompt.entries.items[0].answer.?);
+    try std.testing.expectEqual(@as(?u8, 1), prompt.entries.items[0].confirmed_choice_index);
+
+    prompt.moveChoice(1);
+    _ = try prompt.apply(alloc, .submit);
+    try std.testing.expectEqual(QuestionInputEvent.all_decided, try prompt.apply(alloc, .submit));
+    try std.testing.expectEqualStrings("Yes", prompt.entries.items[0].answer.?);
+    try std.testing.expectEqualStrings("Yes", prompt.entries.items[1].answer.?);
+}
+
+test "value-only freeform submission still accepts blank values" {
+    const alloc = std.testing.allocator;
+    var prompt = QuestionPrompt{};
+    defer prompt.deinit(alloc);
+    for ([_][]const u8{ "", " \t\r\n " }) |draft| {
+        try prompt.syncFrom(alloc, &.{.{ .question = "Enter a value", .options = &.{} }});
+        _ = try prompt.insertFreeformSlice(alloc, draft, 64);
+        try std.testing.expectEqual(QuestionInputEvent.all_decided, try prompt.apply(alloc, .submit));
+        try std.testing.expectEqualStrings(draft, prompt.entries.items[0].answer.?);
+        prompt.resetAfterSubmission(alloc);
+    }
+}
+
+test "compact input submission still accepts an empty value" {
+    const alloc = std.testing.allocator;
+    var prompt = QuestionPrompt{};
+    defer prompt.deinit(alloc);
+    try prompt.syncFrom(alloc, &.{.{ .question = "Optional value", .options = &.{}, .submission = .input }});
+    try std.testing.expectEqual(QuestionInputEvent.all_decided, try prompt.apply(alloc, .submit));
+    try std.testing.expectEqualStrings("{\"value\":\"\"}", prompt.entries.items[0].answer.?);
 }
 
 test "moveChoice off freeform preserves buffer for re-entry" {
@@ -1371,6 +1454,17 @@ test "question freeform applies word and logical line deletions" {
     prompt.freeformDeleteToLineEnd();
     try std.testing.expectEqualStrings("alphabeta", prompt.entries.items[0].freeform_buffer.items);
     try std.testing.expectEqual(@as(usize, "alpha".len), prompt.entries.items[0].freeform_cursor);
+
+    prompt.clearFreeformDraft("test_cleanup");
+    try std.testing.expectEqual(
+        FreeformInsertResult.inserted,
+        try prompt.insertFreeformSlice(std.testing.allocator, "alpha\nbeta", 64),
+    );
+    for ([_][]const u8{ "alpha\n", "alpha", "", "" }) |expected| {
+        prompt.freeformDeleteToLineStart();
+        try std.testing.expectEqualStrings(expected, prompt.entries.items[0].freeform_buffer.items);
+        try std.testing.expectEqual(expected.len, prompt.entries.items[0].freeform_cursor);
+    }
 }
 
 test "question freeform word deletion keeps preceding characters intact" {

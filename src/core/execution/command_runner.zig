@@ -40,6 +40,14 @@ pub const Config = struct {
     /// Shell snapshot epoch of the remembered grant that admitted a `user`
     /// profile command, or null when it was not admitted by a grant.
     shell_grant_epoch: ?u64 = null,
+    /// Variables added to the command's environment after `AI_AGENT`,
+    /// such as the `fx mcp call` bridge's address. Borrowed for the run.
+    extra_environment: []const EnvironmentVariable = &.{},
+};
+
+pub const EnvironmentVariable = struct {
+    name: []const u8,
+    value: []const u8,
 };
 
 const ai_agent_env = "AI_AGENT";
@@ -47,6 +55,11 @@ const ai_agent_name = "fx";
 
 pub fn applyAgentEnvironment(environment: *std.process.Environ.Map) !void {
     try environment.put(ai_agent_env, ai_agent_name);
+}
+
+fn applyCommandEnvironment(environment: *std.process.Environ.Map, cfg: Config) !void {
+    try applyAgentEnvironment(environment);
+    for (cfg.extra_environment) |variable| try environment.put(variable.name, variable.value);
 }
 
 pub const CallbackProjection = enum {
@@ -1420,7 +1433,7 @@ fn executeProcessWithInput(
     const started_ms = io_mod.milliTimestamp();
     var environment = try io_mod.cloneEnvironMap(scratch);
     defer environment.deinit();
-    try applyAgentEnvironment(&environment);
+    try applyCommandEnvironment(&environment, cfg);
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = if (closed_input) .pipe else .ignore,
@@ -1482,7 +1495,7 @@ fn executeProcessWithScript(
     else
         try io_mod.cloneEnvironMap(scratch);
     defer environment.deinit();
-    try applyAgentEnvironment(&environment);
+    try applyCommandEnvironment(&environment, cfg);
     if (comptime supports_foreground_session) {
         return executeProcessWithDetachedSession(
             scratch,
@@ -2692,6 +2705,46 @@ test "zsh commands keep words that start with = literal in every captured profil
     try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
+test "a startup file's builtin function never runs in place of fx's shell setup" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    // zsh and bash run a function before a builtin of the same name, so this
+    // one would run in place of every `\builtin` line fx adds. It leaves a log
+    // each time it runs.
+    const rc = "builtin() { echo hijacked >> \"$HOME/hijack.log\"; }\n";
+    const command = "echo before; echo ======; echo after";
+    const expected = "exit_code=0\n<stdout>\nbefore\n======\nafter\n</stdout>\n";
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    const Shell = struct { name: []const u8, rc_name: []const u8 };
+    for ([_]Shell{
+        .{ .name = "zsh", .rc_name = ".zshrc" },
+        .{ .name = "bash", .rc_name = ".bash_profile" },
+    }) |shell| {
+        const real = try std.mem.concat(std.testing.allocator, u8, &.{ "/bin/", shell.name });
+        defer std.testing.allocator.free(real);
+        std.Io.Dir.accessAbsolute(io_mod.getIo(), real, .{}) catch continue;
+
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const paths = try writeSnapshotTestShellFor(arena, &tmp, shell.name, shell.rc_name, rc);
+        const log_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "hijack.log" });
+
+        shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+        const snapshot = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings(expected, snapshot.output);
+
+        shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+        const full_startup = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings(expected, full_startup.output);
+
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io_mod.getIo(), log_path, .{}));
+    }
+}
+
 fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: std.process.Child.Term, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
     return formatOutputWithStatus(
         alloc,
@@ -3224,7 +3277,7 @@ const ProcessObserver = struct {
     fn statusFromTerm(
         term: std.process.Child.Term,
     ) command_contract.CommandStatus {
-        if (io_mod.getenv("FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT") != null) {
+        if (io_mod.getenv("FX_TEST_COMMAND_INDETERMINATE_AFTER_EXIT") != null) {
             debug_trace.logf(
                 "core",
                 "command termination became indeterminate reason=injected_after_exit",
@@ -3729,7 +3782,7 @@ fn collectSpawnedProcess(
     );
     wait_pending = false;
     var output_incomplete = collected_output.output_incomplete;
-    if (io_mod.getenv("FX_COMMAND_TEST_OUTPUT_INCOMPLETE_AFTER_EXIT") != null) {
+    if (io_mod.getenv("FX_TEST_COMMAND_OUTPUT_INCOMPLETE_AFTER_EXIT") != null) {
         recordOutputDrainFailure(
             &output_incomplete,
             "injected_after_exit",
@@ -6671,8 +6724,11 @@ test "runtime cancellation observed at the timeout deadline stays graceful" {
         defer alloc.free(term_path);
         const quoted_term = try shellQuote(alloc, term_path);
         defer alloc.free(quoted_term);
+        // `wait` lets the trap run as soon as TERM arrives. A shell defers it
+        // while a foreground `sleep` runs, and a `sleep` that starts after
+        // fx's last look at the process tree outlasts the grace period.
         const command = try alloc.print(
-            "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1; done",
+            "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1 & wait $!; done",
             .{quoted_term},
         );
         defer alloc.free(command);

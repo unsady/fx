@@ -10,7 +10,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
-const text_utils = @import("../shared/text_utils.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const types = @import("../shared/types.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
@@ -22,7 +22,7 @@ else
     struct {};
 
 const Allocator = std.mem.Allocator;
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
+const e2e_gateway_models_url_env = "FX_TEST_GATEWAY_MODELS_URL";
 
 /// What asked for a catalog load. Every trigger is user activity, so an idle
 /// session never polls the models endpoint.
@@ -288,11 +288,7 @@ pub fn modelMenuFilteredItemCount(
     provider_filter: ModelProviderFilter,
     query: []const u8,
 ) usize {
-    var count: usize = 0;
-    for (items) |item| {
-        if (modelMenuItemMatch(item, provider_filter, query) != .none) count += 1;
-    }
-    return count;
+    return modelMenuRanking(items, provider_filter, query).count();
 }
 
 /// Returns the row at `display_index`. Better matches list first, and rows
@@ -303,15 +299,8 @@ pub fn modelMenuItemAt(
     query: []const u8,
     display_index: usize,
 ) ?*const ModelMenuItem {
-    var remaining = display_index;
-    for (ranked_model_matches) |rank| {
-        for (items) |*item| {
-            if (modelMenuItemMatch(item.*, provider_filter, query) != rank) continue;
-            if (remaining == 0) return item;
-            remaining -= 1;
-        }
-    }
-    return null;
+    const position = modelMenuRanking(items, provider_filter, query).at(display_index) orelse return null;
+    return &items[position];
 }
 
 /// The inverse of `modelMenuItemAt` for the first item with `id`.
@@ -321,130 +310,55 @@ fn modelMenuDisplayIndex(
     query: []const u8,
     id: []const u8,
 ) ?usize {
-    const target_position = for (items, 0..) |item, position| {
+    const position = for (items, 0..) |item, position| {
         if (std.mem.eql(u8, item.id, id)) break position;
     } else return null;
-    const target_match = modelMenuItemMatch(items[target_position], provider_filter, query);
-    if (target_match == .none) return null;
-
-    var display_index: usize = 0;
-    for (items, 0..) |item, position| {
-        const match = modelMenuItemMatch(item, provider_filter, query);
-        if (match.betterThan(target_match) or (match == target_match and position < target_position)) {
-            display_index += 1;
-        }
-    }
-    return display_index;
+    return modelMenuRanking(items, provider_filter, query).rankOf(position);
 }
 
-fn modelMenuItemMatch(
-    item: ModelMenuItem,
+/// Matches a model on its full id, provider prefix included, so one query
+/// can name both the provider and the model, and on the model's own name
+/// after the last `/`, so typing that name exactly lists it first:
+/// `gpt-4o` finds `openai/gpt-4o` before `openai/gpt-4o-mini`.
+pub fn modelIdMatch(query: []const u8, id: []const u8) ?fuzzy_match.Match {
+    const slash = std.mem.findScalarLast(u8, id, '/') orelse return fuzzy_match.match(query, &.{.{ .text = id }});
+    return fuzzy_match.match(query, &.{ .{ .text = id }, .{ .text = id[slash + 1 ..] } });
+}
+
+/// The Models menu in catalog order, without the rows outside the provider
+/// tab.
+const ModelMenuMatches = struct {
+    items: []const ModelMenuItem,
     provider_filter: ModelProviderFilter,
     query: []const u8,
-) ModelMatch {
-    if (!providerMatchesFilter(item.provider, provider_filter)) return .none;
-    return matchModelQuery(item.id, query);
-}
 
-/// How well a model id matches a picker query, from worst to best. Pickers
-/// list better matches first, so a query that names a model as written keeps
-/// the rows it found before fuzzy matching.
-const ModelMatch = enum(u2) {
-    none,
-    /// Each query word's letters and digits appear in order in the id,
-    /// starting at the beginning of an id word: `cs45` finds
-    /// `anthropic/claude-sonnet-4.5`.
-    fuzzy,
-    /// Each query word appears in the id once punctuation is ignored:
-    /// `anthropic sonnet` and `sonnet45` find `anthropic/claude-sonnet-4.5`.
-    words,
-    /// The whole query appears in the id as typed, ignoring case.
-    substring,
-
-    fn betterThan(self: ModelMatch, other: ModelMatch) bool {
-        return @backingInt(self) > @backingInt(other);
+    pub fn matchAt(self: ModelMenuMatches, position: usize) ?fuzzy_match.Match {
+        const item = self.items[position];
+        if (!providerMatchesFilter(item.provider, self.provider_filter)) return null;
+        return modelIdMatch(self.query, item.id);
     }
 };
 
-const ranked_model_matches = [_]ModelMatch{ .substring, .words, .fuzzy };
+fn modelMenuRanking(
+    items: []const ModelMenuItem,
+    provider_filter: ModelProviderFilter,
+    query: []const u8,
+) fuzzy_match.Ranking(ModelMenuMatches) {
+    return .{
+        .context = .{ .items = items, .provider_filter = provider_filter, .query = query },
+        .len = items.len,
+    };
+}
 
-/// Matches `query` against the full model id, provider prefix included, so
-/// one query can name both the provider and the model. Whitespace separates
-/// query words, and every word must match. An empty query matches everything.
-fn matchModelQuery(id: []const u8, query: []const u8) ModelMatch {
-    const text = std.mem.trim(u8, query, " \t\r\n");
-    if (text_utils.containsIgnoreCase(id, text)) return .substring;
+/// The catalog's ids matched the same way, for inline `/model` suggestions.
+const CatalogIdMatches = struct {
+    entries: []const model_catalog.ModelCatalogEntry,
+    query: []const u8,
 
-    var result: ModelMatch = .none;
-    var words = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    while (words.next()) |word| {
-        if (!hasAlphanumeric(word)) continue;
-        if (containsAlphanumericRun(id, word)) {
-            if (result == .none) result = .words;
-        } else if (containsWordStartSubsequence(id, word)) {
-            result = .fuzzy;
-        } else return .none;
+    pub fn matchAt(self: CatalogIdMatches, position: usize) ?fuzzy_match.Match {
+        return modelIdMatch(self.query, self.entries[position].id);
     }
-    return result;
-}
-
-fn hasAlphanumeric(text: []const u8) bool {
-    for (text) |byte| {
-        if (std.ascii.isAlphanumeric(byte)) return true;
-    }
-    return false;
-}
-
-/// Reports whether `word`'s letters and digits appear consecutively among
-/// `id`'s letters and digits, ignoring case and every other byte.
-fn containsAlphanumericRun(id: []const u8, word: []const u8) bool {
-    for (0..id.len) |start| {
-        if (!std.ascii.isAlphanumeric(id[start])) continue;
-        var position = start;
-        const matched = for (word) |byte| {
-            if (!std.ascii.isAlphanumeric(byte)) continue;
-            while (position < id.len and !std.ascii.isAlphanumeric(id[position])) position += 1;
-            if (position == id.len or std.ascii.toLower(id[position]) != std.ascii.toLower(byte)) break false;
-            position += 1;
-        } else true;
-        if (matched) return true;
-    }
-    return false;
-}
-
-/// Reports whether `word`'s letters and digits appear in order in `id`, the
-/// first of them at the start of an id word. Anchoring the first letter keeps
-/// short words from matching scattered letters across unrelated models.
-fn containsWordStartSubsequence(id: []const u8, word: []const u8) bool {
-    var word_index: usize = 0;
-    while (word_index < word.len and !std.ascii.isAlphanumeric(word[word_index])) word_index += 1;
-    if (word_index == word.len) return true;
-
-    const first = std.ascii.toLower(word[word_index]);
-    var position = for (0..id.len) |index| {
-        if (isIdWordStart(id, index) and std.ascii.toLower(id[index]) == first) break index + 1;
-    } else return false;
-
-    for (word[word_index + 1 ..]) |byte| {
-        if (!std.ascii.isAlphanumeric(byte)) continue;
-        const wanted = std.ascii.toLower(byte);
-        while (position < id.len and std.ascii.toLower(id[position]) != wanted) position += 1;
-        if (position == id.len) return false;
-        position += 1;
-    }
-    return true;
-}
-
-/// An id word starts after punctuation and where letters turn into digits or
-/// back, so `gpt-4o` has the words `gpt`, `4`, and `o`.
-fn isIdWordStart(id: []const u8, index: usize) bool {
-    const byte = id[index];
-    if (!std.ascii.isAlphanumeric(byte)) return false;
-    if (index == 0) return true;
-    const previous = id[index - 1];
-    if (!std.ascii.isAlphanumeric(previous)) return true;
-    return std.ascii.isDigit(previous) != std.ascii.isDigit(byte);
-}
+};
 
 fn providerFilter(provider: []const u8) ModelProviderFilter {
     return if (std.ascii.eqlIgnoreCase(provider, "anthropic"))
@@ -900,14 +814,15 @@ pub const Runtime = struct {
         defer self.mutex.unlock(io_mod.getIo());
         if (self.state != .ready) return 0;
 
+        const ranking: fuzzy_match.Ranking(CatalogIdMatches) = .{
+            .context = .{ .entries = self.catalog.items, .query = query },
+            .len = self.catalog.items.len,
+        };
+        var matches = ranking.iterator();
         var count: usize = 0;
-        for (ranked_model_matches) |rank| {
-            for (self.catalog.items) |entry| {
-                if (count >= out.len) return count;
-                if (matchModelQuery(entry.id, query) != rank) continue;
-                out[count] = entry.id;
-                count += 1;
-            }
+        while (count < out.len) : (count += 1) {
+            const position = matches.next() orelse break;
+            out[count] = self.catalog.items[position].id;
         }
         return count;
     }
@@ -2057,32 +1972,6 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expectEqualStrings("standalone", selected);
 }
 
-test "model queries match the full id verbatim, by words, and fuzzily" {
-    const id = "anthropic/claude-sonnet-4.5";
-
-    try std.testing.expectEqual(ModelMatch.substring, matchModelQuery(id, ""));
-    try std.testing.expectEqual(ModelMatch.substring, matchModelQuery(id, " \t"));
-    try std.testing.expectEqual(ModelMatch.substring, matchModelQuery(id, " Claude-Sonnet "));
-    try std.testing.expectEqual(ModelMatch.substring, matchModelQuery(id, "ANTHROPIC/claude"));
-
-    try std.testing.expectEqual(ModelMatch.words, matchModelQuery(id, "claude sonnet 4.5"));
-    try std.testing.expectEqual(ModelMatch.words, matchModelQuery(id, "anthropic sonnet"));
-    try std.testing.expectEqual(ModelMatch.words, matchModelQuery(id, "Sonnet45"));
-    try std.testing.expectEqual(ModelMatch.words, matchModelQuery(id, "sonnet 4-5"));
-    try std.testing.expectEqual(ModelMatch.words, matchModelQuery(id, "anthropic / sonnet"));
-
-    try std.testing.expectEqual(ModelMatch.fuzzy, matchModelQuery(id, "cs45"));
-    try std.testing.expectEqual(ModelMatch.fuzzy, matchModelQuery(id, "anthropic sonet"));
-    try std.testing.expectEqual(ModelMatch.fuzzy, matchModelQuery("acme/gpt4omni", "omi"));
-    try std.testing.expectEqual(ModelMatch.none, matchModelQuery("acme/gpt4omni", "mi"));
-
-    try std.testing.expectEqual(ModelMatch.none, matchModelQuery(id, "opus"));
-    try std.testing.expectEqual(ModelMatch.none, matchModelQuery(id, "sonnet opus"));
-    try std.testing.expectEqual(ModelMatch.none, matchModelQuery(id, "nthrpc"));
-    try std.testing.expectEqual(ModelMatch.none, matchModelQuery(id, "- /"));
-    try std.testing.expectEqual(ModelMatch.none, matchModelQuery("", "a"));
-}
-
 test "model menu ranks fuzzy matches below verbatim ones and keeps the selection" {
     const alloc = std.testing.allocator;
     const entries = [_]model_catalog.ModelCatalogEntry{
@@ -2120,6 +2009,32 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     try hydrateMenuSnapshot(alloc, &menu, &revalidated);
     try std.testing.expectEqual(@as(usize, 2), menu.selected_index);
     try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
+}
+
+test "a model's own name ranks it above longer ids that contain it" {
+    const alloc = std.testing.allocator;
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-4o-mini"), .model_type = @constCast("language") },
+        .{ .id = @constCast("azure/gpt-4o-mini-tts"), .model_type = @constCast("language") },
+        .{ .id = @constCast("openai/gpt-4o"), .model_type = @constCast("language") },
+        .{ .id = @constCast("standalone"), .model_type = @constCast("language") },
+    };
+    var menu: ModelMenu = .{};
+    defer menu.deinit(alloc);
+    try hydrateMenuSnapshot(alloc, &menu, &entries);
+    menu.active = true;
+
+    menu.setQuery("GPT-4o");
+    try std.testing.expectEqual(@as(usize, 3), menu.filteredItemCount());
+    try std.testing.expectEqualStrings("openai/gpt-4o", menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("openai/gpt-4o-mini", menu.itemAt(1).?.id);
+    try std.testing.expectEqualStrings("azure/gpt-4o-mini-tts", menu.itemAt(2).?.id);
+
+    menu.setQuery("stand");
+    try std.testing.expectEqualStrings("standalone", menu.itemAt(0).?.id);
+    try std.testing.expectEqual(@as(?fuzzy_match.Match, .{ .tier = .prefix, .field = 0 }), modelIdMatch("stand", "standalone"));
+    try std.testing.expectEqual(@as(?fuzzy_match.Match, .{ .tier = .exact, .field = 1 }), modelIdMatch("gpt-4o", "openai/gpt-4o"));
+    try std.testing.expectEqual(@as(?fuzzy_match.Match, .{ .tier = .substring, .field = 0 }), modelIdMatch("ai/gpt", "openai/gpt-4o"));
 }
 
 test "model completions rank fuzzy matches below verbatim ones" {

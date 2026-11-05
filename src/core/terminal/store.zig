@@ -7,6 +7,7 @@ const session_child_store = @import("../session/session_child_store.zig");
 const session_layout = @import("../session/session_layout.zig");
 const process_identity = @import("../execution/process_identity.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_decode = @import("../shared/json_decode.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
@@ -502,7 +503,7 @@ pub const ProfileStore = struct {
     ) !ProfileStore {
         try options.validate();
         var home_dir = io_mod.VerifiedDir{
-            .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{
+            .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{
                 .iterate = true,
                 .follow_symlinks = false,
             }),
@@ -510,7 +511,7 @@ pub const ProfileStore = struct {
         defer home_dir.close();
         var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(
             &home_dir,
-            profile_paths.root_dir_name,
+            profile_paths.rootName(),
         );
         errdefer fx_dir.close();
         var sessions_dir = try io_mod.openOrCreateVerifiedPrivateDir(
@@ -524,7 +525,7 @@ pub const ProfileStore = struct {
         var joined: usize = 0;
         errdefer for (display_outside_paths[0..joined]) |path| alloc.free(path);
         for (outside_roots, &display_outside_paths) |root_name, *path| {
-            path.* = try std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, root_name });
+            path.* = try profile_paths.rootPath(alloc, home, &.{root_name});
             joined += 1;
         }
         return .{
@@ -1858,7 +1859,7 @@ fn clone_record(alloc: Allocator, wire: RecordWire) Allocator.Error!Record {
 }
 
 fn parse_record(alloc: Allocator, bytes: []const u8) !Record {
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         RecordWire,
         alloc,
         bytes,
@@ -1985,7 +1986,7 @@ fn load_event(
         else => return err,
     };
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         EventWire,
         alloc,
         bytes,
@@ -5508,7 +5509,7 @@ fn load_owner_catalog_authority(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_record_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         OwnerCatalogAuthorityWire,
         alloc,
         bytes,
@@ -5619,7 +5620,7 @@ fn load_authority(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_record_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         AuthorityWire,
         alloc,
         bytes,
@@ -5710,7 +5711,7 @@ fn load_close_transaction(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_event_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         CloseTransaction,
         alloc,
         bytes,

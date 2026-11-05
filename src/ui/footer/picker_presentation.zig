@@ -109,12 +109,7 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
             .action => |action| switch (action) {
                 .connections => if (view.available_sources.count() > 0) "connected" else "not connected",
                 .switch_provider => view.choiceLabel(.{ .provider = view.active_provider }),
-                .change_team => if (!view.fx_login_session_available)
-                    "sign in to manage"
-                else if (view.current_team != null)
-                    "selected"
-                else
-                    "choose a team",
+                .change_team => changeTeamSetupValue(view),
                 .switch_credential => if (view.active_source != null)
                     view.activeSourceLabel()
                 else
@@ -141,6 +136,12 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
         .provider, .change_team, .switch_credential => view.choiceDescription(choice),
         .sign_in, .api_key => "",
     };
+}
+
+fn changeTeamSetupValue(view: auth_runtime.PickerView) []const u8 {
+    if (view.team_list_loading) return auth_runtime.team_list_loading_label;
+    if (!view.fx_login_session_available) return "sign in to manage";
+    return if (view.current_team != null) "selected" else "choose a team";
 }
 
 fn detailValueColumn(width: u16) usize {
@@ -410,7 +411,7 @@ fn composeOnboardingPickerRow(
         2 => "   fx can access AI models with an account, subscription, or API key.",
         3 => "   Choose a sign-in option below, or add your own API key.",
         4 => "",
-        5 => "   You can change this anytime with /setup.",
+        5 => "   You can change this anytime with /provider.",
         6 => "",
         7 => "   Get started",
         12 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
@@ -567,7 +568,7 @@ fn composeSignInPickerRow(
         else
             "   Sign in with Vercel",
         1, 4 => "",
-        2 => vercelOpenLabel(&label_buf, snapshot.verification_uri, width) orelse std.mem.print(
+        2 => if (snapshot.preparing) "" else vercelOpenLabel(&label_buf, snapshot.verification_uri, width) orelse std.mem.print(
             &label_buf,
             "   Open   {s}",
             .{snapshot.verification_uri},
@@ -585,7 +586,7 @@ fn composeSignInPickerRow(
                 "   Code   {s}",
                 .{snapshot.user_code},
             ) catch "   Code unavailable",
-        5 => switch (snapshot.state) {
+        5 => if (snapshot.preparing) "   Preparing sign-in…" else switch (snapshot.state) {
             .idle => "   Preparing sign-in…",
             .polling => "   Waiting for authorization…",
             .succeeded => "   Authorization complete",
@@ -833,7 +834,7 @@ pub noinline fn composePickerOptionRowAnnotated(
     // brightness alone, like the question panel; other pickers keep the filled row.
     const selected_style = switch (kind) {
         .model_stage, .provider_stage, .models, .effort => ui_render.selected_completion_style,
-        .file, .slash, .skills, .help, .settings, .sessions, .fork, .mcp, .auth => ui_render.approval_button_inactive_style,
+        .file, .slash, .skills, .help, .settings, .sessions, .fork, .agents, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     const base_style = if (selected) selected_style else ui_render.dim_style;
     const available = width_usize - @as(usize, start_col - 1);
@@ -925,7 +926,7 @@ pub fn composePickerStatusRowWithProvider(
         .provider_stage => switch (provider_stage) {
             .provider => "no matching providers",
             .method => "no matching sign-in methods",
-            .team => if (loading) "loading teams..." else if (failed) "unable to load teams" else "no matching teams",
+            .team => if (loading) auth_runtime.team_list_loading_label else if (failed) "unable to load teams" else "no matching teams",
             .key_source => "no matching key sources",
             .api_key => "",
         },
@@ -943,6 +944,7 @@ pub fn composePickerStatusRowWithProvider(
         .settings => "no matching settings",
         .sessions => "no matching sessions",
         .fork => "nothing to fork yet",
+        .agents => "no fx instances open",
         .mcp => "no MCP items available",
         .auth => "authentication actions unavailable",
     };
@@ -1149,11 +1151,7 @@ pub fn prepareSlashMenu(
     };
     errdefer prepared.deinit(alloc);
 
-    if (command_specs.argCompletionAnchor(prefix) != 0 or
-        prefix.len == 0 or prefix[0] != '/' or skills.len == 0)
-    {
-        return prepared;
-    }
+    if (!slashMenuListsSkills(registry, prefix) or skills.len == 0) return prepared;
 
     try prepared.skill_matches.resize(alloc, skills.len);
     const written = skill_runtime.fillSkillMenuRangeAtQuery(
@@ -1169,9 +1167,18 @@ pub fn prepareSlashMenu(
 
 pub fn mixedSlashCompletionCount(registry: command_specs.SlashRegistry, prefix: []const u8, skills: []const skill_runtime.Skill) usize {
     const command_count = command_specs.slashCompletionCount(registry, prefix);
-    if (command_specs.argCompletionAnchor(prefix) != 0) return command_count;
-    if (prefix.len == 0 or prefix[0] != '/') return command_count;
+    if (!slashMenuListsSkills(registry, prefix)) return command_count;
     return command_count + skill_runtime.skillMenuFilterQueryCount(skills, .all, prefix[1..]);
+}
+
+/// Skills join the slash menu only while the text can still name one: not
+/// under a command's own argument completion, and not once a known command
+/// and whitespace are typed, since the rest is that command's argument.
+fn slashMenuListsSkills(registry: command_specs.SlashRegistry, prefix: []const u8) bool {
+    if (prefix.len == 0 or prefix[0] != '/') return false;
+    if (command_specs.argCompletionAnchor(prefix) != 0) return false;
+    const command_end = std.mem.findAny(u8, prefix, " \t\r\n") orelse return true;
+    return registry.lookup(prefix[0..command_end]) == null;
 }
 
 pub fn mixedSlashCompletionIsSkill(registry: command_specs.SlashRegistry, prefix: []const u8, skills: []const skill_runtime.Skill, n: usize) bool {
@@ -1213,8 +1220,7 @@ pub fn mixedSlashCompletionCommandColumnWidth(
 fn mixedSlashCompletionEntry(registry: command_specs.SlashRegistry, prefix: []const u8, skills: []const skill_runtime.Skill, n: usize) ?MixedSlashCompletionEntry {
     const command_count = command_specs.slashCompletionCount(registry, prefix);
     if (n < command_count) return .{ .command = n };
-    if (command_specs.argCompletionAnchor(prefix) != 0) return null;
-    if (prefix.len == 0 or prefix[0] != '/') return null;
+    if (!slashMenuListsSkills(registry, prefix)) return null;
     const skill = skill_runtime.skillMenuSkillAtQuery(skills, .all, prefix[1..], n - command_count) orelse return null;
     return .{ .skill = skill };
 }
@@ -2193,7 +2199,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
 
     try std.testing.expect(std.mem.find(u8, screen.items, "Welcome to fx") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "fx can access AI models with an account, subscription, or API key") != null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "You can change this anytime with /setup.") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "You can change this anytime with /provider.") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: fx is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
@@ -2534,6 +2540,33 @@ test "sign-in stage renders the complete device authorization screen" {
     defer narrow.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow.items, "Open   https://") != null);
     try std.testing.expect(std.mem.find(u8, narrow.items, "\x1b]8;") == null);
+}
+
+test "sign-in stage shows a preparing flow without an empty device link" {
+    const alloc = std.testing.allocator;
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .sign_in,
+        .sign_in = .{ .state = .polling, .preparing = true },
+    };
+
+    var screen: std.ArrayList(u8) = .empty;
+    defer screen.deinit(alloc);
+    for (0..authPickerRowCount(view)) |row_index| {
+        var row = try composeAuthPickerRow(alloc, view, @intCast(row_index), 7, 100);
+        defer row.deinit(alloc);
+        try screen.appendSlice(alloc, row.items);
+        try screen.append(alloc, '\n');
+    }
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Preparing sign-in…") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Waiting for authorization") == null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Open") == null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Code") == null);
 }
 
 test "Codex sign-in stage renders a bounded clickable authorization action" {

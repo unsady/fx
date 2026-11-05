@@ -27,6 +27,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const secret = @import("../auth/secret.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -188,9 +189,9 @@ pub const Store = struct {
     };
 
     fn openDir(s: Store) !io_mod.VerifiedDir {
-        var home = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), s.home, .{ .iterate = true }) };
+        var home = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(s.home), .{ .iterate = true }) };
         defer home.close();
-        var root = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
+        var root = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.rootName());
         defer root.close();
         return io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.mcp_credentials_dir_name);
     }
@@ -283,14 +284,16 @@ pub const Snapshot = struct {
     }
 };
 
+/// The store file's bytes, or null when there is none. A path that isn't a
+/// regular file, such as a fifo, fails with `error.CredentialStoreUnreadable`
+/// instead of waiting for a writer.
 fn readFile(alloc: Allocator, dir: *io_mod.VerifiedDir) !?[]u8 {
-    var file = dir.dir.openFile(io_mod.getIo(), file_name, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
+    var file = io_mod.openExistingReadOnlyRegularFile(dir.dir, file_name, .no_follow) catch |err| switch (err) {
         error.FileNotFound => return null,
+        error.DurablePathUnsafe => {
+            debug_trace.logf("mcp", "MCP credential store isn't a regular file, left as it is", .{});
+            return error.CredentialStoreUnreadable;
+        },
         else => return err,
     };
     defer file.close(io_mod.getIo());
@@ -352,7 +355,7 @@ const Doc = struct {
         };
         var arena: std.heap.ArenaAllocator = .init(alloc);
         defer arena.deinit();
-        const saved = try std.json.parseFromSliceLeaky(Saved, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
+        const saved = try json_decode.parseFromSliceLeaky(Saved, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
         if (saved.version != 1 and saved.version != 2) return error.UnsupportedVersion;
         var doc: Doc = .{};
         errdefer doc.deinit(alloc);
@@ -637,7 +640,23 @@ test "the credential file is private, and one this fx can't read is never writte
         defer testing.allocator.free(after);
         try testing.expectEqualStrings(bytes, after);
     }
+
+    // A fifo in its place is unreadable the same way, and nothing waits for a
+    // writer to open it.
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+    try tmp.dir.deleteFile(testing.io, test_path);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const fifo = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ home, test_path }, 0);
+    if (mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;
+    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "plain", .url = url }));
+    try testing.expectError(error.CredentialStoreUnreadable, store.lookup(testing.allocator, .{ .name = "plain", .url = url }));
+    try testing.expectError(error.CredentialStoreUnreadable, store.check(testing.allocator));
+    try testing.expectError(error.CredentialStoreUnreadable, store.put(testing.allocator, .{ .name = "plain", .url = url }, "{\"access\":\"p2\"}"));
+    try testing.expectError(error.CredentialStoreUnreadable, store.remove(testing.allocator, .{ .name = "plain", .url = url }));
+    try testing.expectEqual(std.Io.File.Kind.named_pipe, (try tmp.dir.statFile(testing.io, test_path, .{ .follow_symlinks = false })).kind);
 }
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 test "a refused login removes only its own: one another fx saved since stays" {
     var tmp = testing.tmpDir(.{});

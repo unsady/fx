@@ -55,12 +55,6 @@ fn isStageSeparator(token: command_lex.ArgvToken) bool {
     return std.mem.eql(u8, token.raw, "&&");
 }
 
-/// Every shell reads a word that starts with an unquoted `#` as the start of
-/// a comment, so the rest of the command never reaches the program.
-fn startsComment(raw: []const u8) bool {
-    return raw.len > 0 and raw[0] == '#';
-}
-
 fn isUnsupportedAutoOperator(token: command_lex.ArgvToken) bool {
     return isUnsupportedAutoControlOperator(token) or
         (!token.quoted and command_lex.redirection_kind(token.value) != null);
@@ -105,8 +99,7 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
     if (tokens.len == 0) return false;
     for (tokens) |token| {
         if (isUnsupportedAutoOperator(token) or
-            tokenHasDynamicShellSyntax(token.raw) or
-            startsComment(token.raw))
+            tokenHasDynamicShellSyntax(token.raw))
         {
             return false;
         }
@@ -133,7 +126,8 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
 
 // `^` and `#` are globs in zsh with `extendedglob`, which fx replays from the
 // user's startup files: `^x` matches every file not named `x`, and `x#`
-// matches any run of `x`, so a workspace file could supply the word.
+// matches any run of `x`, so a workspace file could supply the word. A word
+// that starts with an unquoted `#` also starts a comment in every shell.
 fn tokenHasDynamicShellSyntax(raw: []const u8) bool {
     for (raw) |byte| switch (byte) {
         '$', '`', '*', '?', '[', '~', '^', '#', '\n', '\r', ';', '(', ')', '{', '}' => return true,
@@ -364,6 +358,8 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git fetch ^nomatch .",
         "git fetch --prun#e",
         "npm install react@^18",
+        // Quoting does not help: the check reads the word as written.
+        "npm install 'react@^18'",
         "npm test x##",
         // The shell reads `2` as a file descriptor only when it is bare and
         // touches `>&`. Each of these passes `2` to git as an argument and
@@ -2140,7 +2136,7 @@ fn checkShellParity(command: []const u8, mode: ParityMode) !void {
 
 /// Finds the shell, or returns null to skip it. The Linux unit test job and
 /// the nightly Fuzz workflow install every shell and set
-/// `FX_SHELL_PARITY_ALL_SHELLS`, so a missing shell there fails instead of
+/// `FX_TEST_SHELL_PARITY_ALL_SHELLS`, so a missing shell there fails instead of
 /// quietly narrowing the check. Tests read the process environment from
 /// `std.testing.environ`, since fx's own environment is never set up in them.
 fn parityShellPath(shell: ParityShell) !?[]const u8 {
@@ -2148,7 +2144,7 @@ fn parityShellPath(shell: ParityShell) !?[]const u8 {
         std.Io.Dir.accessAbsolute(std.testing.io, path, .{}) catch continue;
         return path;
     }
-    if (try std.testing.environ.contains(std.testing.allocator, "FX_SHELL_PARITY_ALL_SHELLS")) {
+    if (try std.testing.environ.contains(std.testing.allocator, "FX_TEST_SHELL_PARITY_ALL_SHELLS")) {
         // The failure output names the path where the shell was expected.
         std.testing.expectEqualStrings(shell.paths[0], "") catch {};
         return error.TestShellParityShellMissing;

@@ -15,8 +15,8 @@ const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const result_store = @import("../../session/result_store.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
-const diagnostics = @import("../../workspace/diagnostics.zig");
 const gateway_error_format = @import("../../shared/gateway_error_format.zig");
+const diagnostics = @import("../../workspace/diagnostics.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
@@ -40,8 +40,10 @@ const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../../permissions/auto_classifier_context.zig");
 const subagent_model_contract = @import("../../subagent/model_contract.zig");
+const subagent_reports = @import("../../subagent/reports.zig");
 
 const runtime_config = @import("config.zig");
+const cache_warming = @import("cache_warming.zig");
 const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
@@ -68,7 +70,8 @@ const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
 const observation = @import("observation.zig");
-const model_response_recovery = @import("model_response_recovery.zig");
+const resend_strategy = @import("resend_strategy.zig");
+const runtime_request_recovery = @import("request_recovery.zig");
 const response_language = @import("response_language.zig");
 const tool_mcp_runtime = @import("../../tooling/tool_mcp_runtime.zig");
 
@@ -84,8 +87,67 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
-const empty_length_retry_notice = "The reply ran out of output tokens before any text. Retrying with a higher limit.";
 const empty_length_limited_reply = "The reply ran out of output tokens before any text.";
+// The AI SDK folds the stop reasons it does not list, such as Gemini's
+// UNEXPECTED_TOOL_CALL, into `other`. A reply that stops that way with no text
+// and no tool call has stalled mid-task, so the turn asks once for the next step
+// (`tests/tla/agent_runtime/EmptyReply.tla` EverySeparateEmptyNudged).
+const empty_reply_nudge_prompt =
+    "Your last reply had no text and no tool call. Continue the task: call the next tool you need, or give your final answer.";
+
+// What the empty-reply notice says happens next: fx asks the model again, or
+// the turn has failed and the next step is the user's.
+const empty_reply_asking = "Asking it to continue.";
+const empty_reply_follow_up = "Continue with a follow-up prompt if needed.";
+
+/// What fx shows for a reply that stopped for `other` with no text and no tool
+/// call: the provider's own reason when it sent one, then `next_step`.
+fn emptyReplyNotice(arena: Allocator, provider_reason: []const u8, next_step: []const u8) ![]const u8 {
+    if (provider_reason.len == 0) return try arena.print("The model stopped without a reply (finish reason: other). {s}", .{next_step});
+    return try arena.print("The model stopped without a reply (provider reason: {s}). {s}", .{ provider_reason, next_step });
+}
+
+test "empty reply notice names the provider's reason and the next step" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Asking it to continue.",
+        try emptyReplyNotice(arena, "UNEXPECTED_TOOL_CALL", empty_reply_asking),
+    );
+    try std.testing.expectEqualStrings(
+        "The model stopped without a reply (finish reason: other). Continue with a follow-up prompt if needed.",
+        try emptyReplyNotice(arena, "", empty_reply_follow_up),
+    );
+}
+
+/// Asks the model to go on after a step with no tool call: the reply's
+/// provider state, when it has any, stays in the turn so the provider can
+/// resume from it, then `prompt` follows as the next user message.
+fn appendContinuationPrompt(
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    content: ?[]const u8,
+    provider_replay: ?types.ProviderReplay,
+    prompt: []const u8,
+) !void {
+    if (provider_replay) |state| {
+        try within_turn_suffix.append(arena, .{
+            .role = .assistant,
+            .content = content,
+            .provider_replay = state,
+        });
+    }
+    try within_turn_suffix.append(arena, .{ .role = .user, .content = prompt });
+}
+
+fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
+    const prefix = empty_length_limited_reply ++ " Retrying with";
+    if (raised_limit and lowered_effort) return prefix ++ " a higher limit and low effort.";
+    if (raised_limit) return prefix ++ " a higher limit.";
+    std.debug.assert(lowered_effort);
+    return prefix ++ " low effort.";
+}
 const assistant_prefill_recovery_prompt =
     "Continue from the preceding tool result.";
 pub const assistant_tail_continuation_prompt =
@@ -170,13 +232,12 @@ fn observe_steering_boundary(
     result_alloc: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
     turn_id: u64,
-    origin: runtime_config.TurnOrigin,
     kind: worker_runtime.SteeringBoundaryKind,
 ) !SteeringBoundaryAction {
     const boundary = try take_steering_boundary(deps, result_alloc, turn_id, kind);
     switch (boundary) {
         .continue_turn => |guidance| {
-            try append_steering_guidance(arena, within_turn_suffix, guidance, origin);
+            try append_steering_guidance(arena, within_turn_suffix, guidance);
             return .continued;
         },
         .handoff => return .handoff,
@@ -184,39 +245,22 @@ fn observe_steering_boundary(
     }
 }
 
+/// Adds each boundary message to the turn, framed by who wrote it: the
+/// user's as a live user update, a parent agent's as that agent's feedback,
+/// and a subagent's as the untrusted report it already is, never the
+/// user's.
 fn append_steering_guidance(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
-    guidance: []const []const u8,
-    origin: runtime_config.TurnOrigin,
+    guidance: []const worker_runtime.SteeringMessage,
 ) !void {
-    for (guidance) |text| {
+    for (guidance) |message| {
         try within_turn_suffix.append(arena, .{
             .role = .user,
-            .content = if (origin == .subagent)
-                try runtime_execution_memory.parentSteeringMessage(arena, text)
-            else
-                try runtime_execution_memory.steeringMessage(arena, text),
+            .content = try framedMessage(arena, message.author, message.text),
         });
+        if (message.author == .child) subagent_reports.traceTaken(arena, .{}, message.text);
     }
-}
-
-fn continue_pending_subagent(
-    deps: *const AgentRuntimeDeps,
-    arena: Allocator,
-    suffix: *std.ArrayList(ChatMessage),
-    turn_id: u64,
-    step_id: u64,
-    text: []const u8,
-    replay: ?types.ProviderReplay,
-) !bool {
-    const wait = deps.wait_for_subagent orelse return false;
-    if (!try wait(deps.ctx, turn_id, step_id)) return false;
-    try suffix.append(arena, .{ .role = .assistant, .content = try arena.dupe(u8, text), .provider_replay = replay, .standalone_response = true });
-    const steered = try append_immediate_steering_after_cancel(deps, arena, suffix, turn_id, "");
-    debug_trace.eventf("agent", "subagent_parent_continuation", .{ .turn_id = turn_id }, "steering_consumed={} retained_messages={d}", .{ steered, suffix.items.len });
-    try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
-    return true;
 }
 
 fn append_pending_steering_after_assistant(
@@ -226,7 +270,6 @@ fn append_pending_steering_after_assistant(
     turn_id: u64,
     assistant_text: []const u8,
     provider_replay: ?types.ProviderReplay,
-    origin: runtime_config.TurnOrigin,
     boundary_kind: worker_runtime.SteeringBoundaryKind,
 ) !bool {
     const boundary = try take_steering_boundary(deps, arena, turn_id, boundary_kind);
@@ -235,13 +278,27 @@ fn append_pending_steering_after_assistant(
         .none, .handoff, .interrupt => return false,
     };
 
-    try within_turn_suffix.append(arena, .{
-        .role = .assistant,
-        .content = assistant_text,
-        .provider_replay = provider_replay,
-    });
-    try append_steering_guidance(arena, within_turn_suffix, guidance, origin);
+    // A reply with no text and nothing to replay adds no assistant message, as
+    // after a cancel (append_immediate_steering_after_cancel).
+    if (assistant_text.len > 0 or provider_replay != null) {
+        try within_turn_suffix.append(arena, .{
+            .role = .assistant,
+            .content = assistant_text,
+            .provider_replay = provider_replay,
+        });
+    }
+    try append_steering_guidance(arena, within_turn_suffix, guidance);
     return true;
+}
+
+/// A message an agent receives mid-turn, framed by its author.
+fn framedMessage(arena: Allocator, author: worker_runtime.MessageAuthor, text: []const u8) ![]u8 {
+    return switch (author) {
+        .user => runtime_execution_memory.steeringMessage(arena, text),
+        .parent => runtime_execution_memory.parentSteeringMessage(arena, text),
+        // Framed by the sender, as an untrusted report.
+        .child => arena.dupe(u8, text),
+    };
 }
 
 fn append_immediate_steering_after_cancel(
@@ -263,7 +320,7 @@ fn append_immediate_steering_after_cancel(
             .content = try arena.dupe(u8, assistant_text),
         });
     }
-    try append_steering_guidance(arena, within_turn_suffix, guidance, .root);
+    try append_steering_guidance(arena, within_turn_suffix, guidance);
     return true;
 }
 
@@ -276,10 +333,9 @@ fn continue_steering_after_stop(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
     turn_id: u64,
-    origin: runtime_config.TurnOrigin,
     stop_state: *CommonStopState,
 ) !bool {
-    const action = try observe_steering_boundary(deps, arena, arena, within_turn_suffix, turn_id, origin, .finalizing);
+    const action = try observe_steering_boundary(deps, arena, arena, within_turn_suffix, turn_id, .finalizing);
     if (action != .continued) return false;
     stop_state.retained_candidate = null;
     stop_state.latest_partial = null;
@@ -288,16 +344,12 @@ fn continue_steering_after_stop(
 }
 
 fn reset_recovery_after_immediate_steering(
-    latest_diagnostic: *?types.ModelFailureDiagnostic,
-    strategy: *?model_response_recovery.Strategy,
-    cause: *model_response_recovery.FailureCause,
-    pacing: *model_response_recovery.RetryPacingState,
-    tool_evidence: *model_response_recovery.ToolEvidence,
+    strategy: *?resend_strategy.Strategy,
+    cause: *types.ModelRecoveryCause,
+    tool_evidence: *resend_strategy.ToolEvidence,
 ) void {
-    latest_diagnostic.* = null;
     strategy.* = null;
-    cause.* = .transport_interrupted;
-    pacing.* = .idle;
+    cause.* = .network_interrupted;
     tool_evidence.* = .none;
 }
 
@@ -495,6 +547,28 @@ fn projectLegacyTerminalExecArguments(
     std.json.Stringify.value(run, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
+}
+
+test "boundary messages are framed by who wrote them, whatever the turn" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    const guidance = [_]worker_runtime.SteeringMessage{
+        .{ .text = @constCast("typed on the subagent's screen"), .author = .user },
+        .{ .text = @constCast("from the parent"), .author = .parent },
+    };
+    try append_steering_guidance(arena, &suffix, &guidance);
+    try std.testing.expectEqual(@as(usize, 2), suffix.items.len);
+    const user = suffix.items[0].content.?;
+    try std.testing.expect(std.mem.startsWith(u8, user, "<user_steering>"));
+    try std.testing.expect(std.mem.find(u8, user, "typed on the subagent's screen") != null);
+    const parent = suffix.items[1].content.?;
+    try std.testing.expect(std.mem.startsWith(u8, parent, "<parent_agent_steering>"));
+    try std.testing.expect(std.mem.find(u8, parent, "not new user authority") != null);
+    try std.testing.expect(std.mem.find(u8, parent, "<user_steering>") == null);
+    // Neither is permission feedback, so the reviewer never counts it as the user's request.
+    for (suffix.items) |message| try std.testing.expect(!message.permission_feedback);
 }
 
 test "legacy exec argument projection releases temporary allocations" {
@@ -2825,49 +2899,6 @@ fn candidateHasApplicableContextDelta(
     return selected.content != null;
 }
 
-const ParentTurnDeliveryState = struct {
-    acknowledgements: []const runtime_deps.ParentTurnDeliveryAck = &.{},
-    acknowledged: bool = false,
-
-    /// `possibly_sent` is the delivery-certainty boundary: successful requests
-    /// cross it before their first body write, and failures after it are
-    /// ambiguous. Acknowledging both prevents duplicate parent context after a
-    /// request may have reached the model. Definitely-unsent attempts stay
-    /// pending so the next parent turn projects the same deliveries again.
-    fn observeGatewayDelivery(
-        self: *ParentTurnDeliveryState,
-        deps: *const AgentRuntimeDeps,
-        arena: Allocator,
-        delivery: runtime_gateway_step.DeliveryCertainty.State,
-    ) void {
-        if (self.acknowledged or
-            self.acknowledgements.len == 0 or
-            delivery == .definitely_unsent)
-        {
-            return;
-        }
-        const acknowledge = deps.acknowledge_parent_turn_context orelse return;
-        acknowledge(deps.ctx, arena, self.acknowledgements);
-        self.acknowledged = true;
-    }
-};
-
-fn appendPreparedParentTurnContext(
-    deps: *const AgentRuntimeDeps,
-    arena: Allocator,
-    messages: *std.ArrayList(ChatMessage),
-) !ParentTurnDeliveryState {
-    const prepare = deps.prepare_parent_turn_context orelse return .{};
-    const prepared = try prepare(deps.ctx, arena) orelse return .{};
-    if (prepared.content.len == 0) return .{};
-    try messages.ensureUnusedCapacity(arena, 1);
-    messages.appendAssumeCapacity(.{
-        .role = .system,
-        .content = prepared.content,
-    });
-    return .{ .acknowledgements = prepared.acknowledgements };
-}
-
 fn appendNotExecutedToolResult(
     deps: *const AgentRuntimeDeps,
     provisional_statuses: *runtime_tool_presentation.ProvisionalToolStatuses,
@@ -3418,10 +3449,6 @@ pub const CommonStopState = struct {
     terminal_materializing: bool = false,
 };
 
-fn semanticAttemptLimit(max_provider_attempts: usize) usize {
-    return if (max_provider_attempts == 0) 1 else max_provider_attempts;
-}
-
 fn completionContentBytes(completion: types.ModelCompletion) usize {
     return if (completion.content) |content| content.len else 0;
 }
@@ -3442,29 +3469,13 @@ fn attemptReplaySafe(
 ) bool {
     return stream_ctx.raw_text.items.len == 0 and !stream_ctx.saw_tool_start;
 }
-
-const continue_response_recovery_prompt =
-    "The previous response was interrupted. Restart that response from the beginning using the completed tool results above. Do not repeat completed tool actions.";
-const regenerate_tool_recovery_prompt =
-    "The previous response ended during an incomplete tool call. fx did not execute that call. Recreate it only if it is still needed.";
-const continue_after_confirmed_tool_recovery_prompt =
-    "Continue from the confirmed tool result above without repeating the tool.";
-const reconcile_tool_recovery_prompt =
-    "Reconcile the available tool evidence above before continuing. Do not repeat the tool unless the evidence proves it is safe.";
-
 fn appendRecoveryConversationContext(
     alloc: Allocator,
     messages: *std.ArrayList(ChatMessage),
-    strategy: ?model_response_recovery.Strategy,
+    strategy: ?resend_strategy.Strategy,
 ) !void {
     const selected = strategy orelse return;
-    const prompt = switch (selected) {
-        .retry_request, .pause, .stop, .wait_for_connectivity, .probe_liveness => return,
-        .continue_response => continue_response_recovery_prompt,
-        .regenerate_tool => regenerate_tool_recovery_prompt,
-        .continue_after_confirmed_tool => continue_after_confirmed_tool_recovery_prompt,
-        .reconcile_tool => reconcile_tool_recovery_prompt,
-    };
+    const prompt = resend_strategy.prompt(selected) orelse return;
     try messages.append(alloc, .{
         .role = .user,
         .content = prompt,
@@ -3474,11 +3485,11 @@ fn appendRecoveryConversationContext(
 test "recovery conversation context is chronological and system free" {
     const alloc = std.testing.allocator;
 
-    {
+    for ([_]?resend_strategy.Strategy{ null, .retry_request }) |strategy| {
         var messages: std.ArrayList(ChatMessage) = .empty;
         defer messages.deinit(alloc);
         try messages.append(alloc, .{ .role = .user, .content = "request" });
-        try appendRecoveryConversationContext(alloc, &messages, .retry_request);
+        try appendRecoveryConversationContext(alloc, &messages, strategy);
         try std.testing.expectEqual(@as(usize, 1), messages.items.len);
     }
 
@@ -3486,13 +3497,13 @@ test "recovery conversation context is chronological and system free" {
         var messages: std.ArrayList(ChatMessage) = .empty;
         defer messages.deinit(alloc);
         try messages.append(alloc, .{ .role = .user, .content = "request" });
-        try appendRecoveryConversationContext(alloc, &messages, .continue_response);
+        try appendRecoveryConversationContext(alloc, &messages, .regenerate_tool);
         try std.testing.expectEqual(@as(usize, 2), messages.items.len);
         try std.testing.expectEqual(types.ChatRole.user, messages.items[1].role);
-        try std.testing.expectEqualStrings(continue_response_recovery_prompt, messages.items[1].content.?);
+        try std.testing.expectEqualStrings(resend_strategy.regenerate_tool_prompt, messages.items[1].content.?);
     }
 
-    const prompted = [_]model_response_recovery.Strategy{
+    const prompted = [_]resend_strategy.Strategy{
         .regenerate_tool,
         .continue_after_confirmed_tool,
         .reconcile_tool,
@@ -3504,14 +3515,6 @@ test "recovery conversation context is chronological and system free" {
         try appendRecoveryConversationContext(alloc, &messages, strategy);
         try std.testing.expectEqual(@as(usize, 2), messages.items.len);
         try std.testing.expectEqual(types.ChatRole.user, messages.items[1].role);
-    }
-
-    for ([_]model_response_recovery.Strategy{ .pause, .stop }) |strategy| {
-        var messages: std.ArrayList(ChatMessage) = .empty;
-        defer messages.deinit(alloc);
-        try messages.append(alloc, .{ .role = .user, .content = "request" });
-        try appendRecoveryConversationContext(alloc, &messages, strategy);
-        try std.testing.expectEqual(@as(usize, 1), messages.items.len);
     }
 }
 
@@ -3628,7 +3631,7 @@ fn response_language_context_conflicts(
 fn recoveryToolEvidence(
     completion: ?types.ModelCompletion,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
-) model_response_recovery.ToolEvidence {
+) resend_strategy.ToolEvidence {
     if (completion) |value| {
         if (value.tool_calls.len > 0) {
             if (types.allToolCallsProviderExecuted(value.tool_calls)) {
@@ -3646,34 +3649,17 @@ fn recoveryToolEvidence(
 }
 
 noinline fn effectiveRecoveryToolEvidence(
-    preserved: model_response_recovery.ToolEvidence,
+    preserved: resend_strategy.ToolEvidence,
     completion: ?types.ModelCompletion,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
-) model_response_recovery.ToolEvidence {
+) resend_strategy.ToolEvidence {
     const observed = recoveryToolEvidence(completion, stream_ctx);
     return if (observed == .none) preserved else observed;
 }
 
-fn restoredRecoveryCause(
-    cause: types.ModelRecoveryCause,
-) model_response_recovery.FailureCause {
-    return switch (cause) {
-        .network_interrupted => .transport_interrupted,
-        .connectivity_lost => .connectivity_lost,
-        .response_interrupted => .response_interrupted,
-        .provider_stream_timeout => .provider_stream_timeout,
-        .provider_unavailable => .provider_unavailable,
-        .rate_limited => .rate_limited,
-        .system_resumed => .system_resumed,
-        .compaction_prepared => .compaction_prepared,
-        .authentication => .authentication,
-        .request_limit_reached => .request_limit_reached,
-    };
-}
-
 fn restoredRecoveryToolEvidence(
     state: session_codec.RecoveryToolState,
-) model_response_recovery.ToolEvidence {
+) resend_strategy.ToolEvidence {
     return switch (state) {
         .none => .none,
         .proven_unexecuted => .proven_unexecuted,
@@ -3684,27 +3670,14 @@ fn restoredRecoveryToolEvidence(
 
 fn restoredRecoveryStrategy(
     checkpoint: session_codec.RecoveryCheckpoint,
-) ?model_response_recovery.Strategy {
+) ?resend_strategy.Strategy {
     if (checkpoint.cause == .request_limit_reached) return null;
     return switch (checkpoint.tool_state) {
         .proven_unexecuted => .regenerate_tool,
         .confirmed => .continue_after_confirmed_tool,
         .uncertain => .reconcile_tool,
-        .none => if (checkpoint.assistant_source.len > 0)
-            .continue_response
-        else
-            .retry_request,
+        .none => .retry_request,
     };
-}
-
-fn restoredConsumedAttempts(
-    checkpoint: session_codec.RecoveryCheckpoint,
-) usize {
-    return @min(
-        checkpoint.max_provider_attempts,
-        checkpoint.consumed_provider_attempts +|
-            @intFromBool(checkpoint.outstanding_reservation),
-    );
 }
 
 fn recoverySelectionChanged(
@@ -3822,41 +3795,26 @@ test "potentially sent recovery rejects missing or changed credential authority"
     try std.testing.expect(shouldRejectRecoveryAuthority(legacy, null, null));
 }
 
-fn checkpointCause(
-    cause: model_response_recovery.FailureCause,
-) types.ModelRecoveryCause {
-    return switch (cause) {
-        .transport_interrupted => .network_interrupted,
-        .connectivity_lost => .connectivity_lost,
-        .response_interrupted => .response_interrupted,
-        .provider_stream_timeout => .provider_stream_timeout,
-        .provider_unavailable => .provider_unavailable,
-        .rate_limited => .rate_limited,
-        .system_resumed => .system_resumed,
-        .compaction_prepared => .compaction_prepared,
-        .authentication => .authentication,
-        .request_limit_reached => .request_limit_reached,
-        .content_filter => .provider_unavailable,
-    };
-}
+/// Saved as `max_provider_attempts` in the recovery checkpoint. Attempts no
+/// longer have a limit, but the field stays for older readers and its
+/// validation (consumed <= max, and < max with a send outstanding). The
+/// recovery module counts attempts in a saturating `u16`, so this bound
+/// always holds.
+const checkpoint_provider_attempts: usize = std.math.maxInt(u16) + 1;
 
 fn checkpointAction(
-    strategy: ?model_response_recovery.Strategy,
+    strategy: ?resend_strategy.Strategy,
 ) types.ModelRecoveryAction {
     return switch (strategy orelse .retry_request) {
         .retry_request => .retrying_request,
-        .continue_response => .continuing_response,
         .regenerate_tool => .regenerating_tool,
         .continue_after_confirmed_tool => .continuing_after_tool,
         .reconcile_tool => .reconciling_tool,
-        .wait_for_connectivity => .waiting_for_connectivity,
-        .probe_liveness => .checking_liveness,
-        .pause, .stop => .paused,
     };
 }
 
 fn checkpointToolState(
-    evidence: model_response_recovery.ToolEvidence,
+    evidence: resend_strategy.ToolEvidence,
 ) session_codec.RecoveryToolState {
     return switch (evidence) {
         .none => .none,
@@ -3864,27 +3822,6 @@ fn checkpointToolState(
         .confirmed => .confirmed,
         .uncertain => .uncertain,
     };
-}
-
-fn recoveryRequiredAction(
-    action: model_response_recovery.RequiredAction,
-) types.ModelRecoveryRequiredAction {
-    return switch (action) {
-        .none => .none,
-        .continue_later => .continue_later,
-        .inspect_uncertain_tool => .inspect_uncertain_tool,
-        .change_request => .change_request,
-        .surface_stall => .surface_stall,
-    };
-}
-
-noinline fn pausedRequiredAction(
-    evidence: model_response_recovery.ToolEvidence,
-) types.ModelRecoveryRequiredAction {
-    return if (evidence == .uncertain)
-        .inspect_uncertain_tool
-    else
-        .continue_later;
 }
 
 /// Hands the model's tool calls to `append_turn_piece` before any of them
@@ -3909,7 +3846,7 @@ fn appendRunningToolCalls(
     const issuing = current_turn_messages[current_turn_messages.len - 1];
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
-        .user = .{ .text = @constCast(job.prompt), .images = job.images },
+        .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
         .execution = try finalization.persistedExecution(arena, execution),
         .running_calls = running,
         .running_assistant = issuing.content,
@@ -3920,6 +3857,60 @@ fn appendRunningToolCalls(
 /// owns the session, so no tool call runs in a session another process
 /// took over. A lost writer fails like the stream itself, through the same
 /// recovery path; other check failures are only traced.
+/// A real request is about to go out, so the warmer stops pinging the last
+/// one (`tests/tla/cache_warming/CacheWarming.tla` NoPingWhileSending), and
+/// the usage of its pings is saved with the session's.
+fn disarmCacheWarming(deps: *const AgentRuntimeDeps) void {
+    const warmer = deps.cache_warmer orelse return;
+    warmer.disarm("request");
+    const usage = warmer.takeUsage() orelse return;
+    const record = deps.record_usage orelse {
+        debug_trace.logf("cache_warming", "event=usage_not_saved reason=no_session read={d} write={d}", .{
+            usage.cache_read_tokens orelse 0, usage.cache_write_tokens orelse 0,
+        });
+        return;
+    };
+    record(deps.ctx, usage) catch |err| {
+        debug_trace.logf("cache_warming", "event=usage_not_saved err={s}", .{@errorName(err)});
+    };
+}
+
+const CacheWarmingRequest = struct {
+    candidate: cache_warming.Candidate,
+    provider: agent_stream_provider.Provider,
+    body: ?[]const u8,
+    session_id: ?[]const u8,
+    api_key: []const u8,
+    credential_source: ?types.CredentialSource,
+    account_id: ?[]const u8,
+    gateway_team: ?[]const u8,
+    started_ms: i64,
+};
+
+/// A main request completed: keep its cache entry warm until the next one.
+fn armCacheWarming(deps: *const AgentRuntimeDeps, request: CacheWarmingRequest) void {
+    const warmer = deps.cache_warmer orelse return;
+    if (cache_warming.skipReason(request.candidate)) |reason| {
+        if (reason != .not_claude) debug_trace.logf("cache_warming", "event=skipped reason={s} model={s}", .{ @tagName(reason), request.candidate.model });
+        return;
+    }
+    const body = request.body orelse {
+        debug_trace.logf("cache_warming", "event=skipped reason=no_prepared_body model={s}", .{request.candidate.model});
+        return;
+    };
+    warmer.arm(.{
+        .provider = request.provider,
+        .model = request.candidate.model,
+        .session_id = request.session_id,
+        .body = body,
+        .api_key = request.api_key,
+        .credential_source = request.credential_source,
+        .account_id = request.account_id,
+        .gateway_team = request.gateway_team,
+        .started_ms = request.started_ms,
+    });
+}
+
 fn streamMainCompletion(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -3951,13 +3942,15 @@ fn persistRecoveryCheckpoint(
     route_model: []const u8,
     requested_fast_mode: bool,
     fast_mode: bool,
-    attempt_limit: usize,
     consumed_attempts: usize,
     outstanding_reservation: bool,
-    cause: model_response_recovery.FailureCause,
-    strategy: ?model_response_recovery.Strategy,
-    tool_evidence: model_response_recovery.ToolEvidence,
+    cause: types.ModelRecoveryCause,
+    strategy: ?resend_strategy.Strategy,
+    tool_evidence: resend_strategy.ToolEvidence,
     trace_ctx: TraceContext,
+    /// The recovery module's record for the send this write goes before or
+    /// the response it saves (`RequestRecovery.sendRecord`, `responseRecord`).
+    record: types.RecoveryRecordWrite,
 ) !void {
     try persistRecoveryCheckpointWithAction(
         deps,
@@ -3968,13 +3961,13 @@ fn persistRecoveryCheckpoint(
         route_model,
         requested_fast_mode,
         fast_mode,
-        attempt_limit,
         consumed_attempts,
         outstanding_reservation,
         cause,
         checkpointAction(strategy),
         tool_evidence,
         trace_ctx,
+        record,
     );
 }
 
@@ -3989,13 +3982,15 @@ fn persistRecoveryCheckpointWithAction(
     route_model: []const u8,
     requested_fast_mode: bool,
     fast_mode: bool,
-    attempt_limit: usize,
     consumed_attempts: usize,
     outstanding_reservation: bool,
-    cause: model_response_recovery.FailureCause,
+    cause: types.ModelRecoveryCause,
     action: types.ModelRecoveryAction,
-    tool_evidence: model_response_recovery.ToolEvidence,
+    tool_evidence: resend_strategy.ToolEvidence,
     trace_ctx: TraceContext,
+    /// The recovery module's record for the send this write goes before or
+    /// the response it saves (`RequestRecovery.sendRecord`, `responseRecord`).
+    record: types.RecoveryRecordWrite,
 ) !void {
     if (deps.recovery_checkpoint == null and deps.append_turn_piece == null) return;
     // Every sink copies or serializes the borrowed checkpoint synchronously.
@@ -4008,16 +4003,16 @@ fn persistRecoveryCheckpointWithAction(
         current_turn_messages,
     );
     const projected = try finalization.persistedExecution(arena, execution);
-    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images };
+    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author };
     // Every completed piece reaches the session before the next request.
-    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected });
+    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .recovery_record = record });
     const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
         .user = user,
         .assistant_source = @constCast(assistant_source),
         .execution = projected,
-        .cause = checkpointCause(cause),
+        .cause = cause,
         .action = action,
         .tool_state = checkpointToolState(tool_evidence),
         .authority = .{
@@ -4036,7 +4031,7 @@ fn persistRecoveryCheckpointWithAction(
         .fast_mode = fast_mode,
         .requested_ultrafast_mode = job.agent_settings.ultrafast_mode,
         .ultrafast_mode = job.agent_settings.ultrafast_mode,
-        .max_provider_attempts = attempt_limit,
+        .max_provider_attempts = checkpoint_provider_attempts,
         .consumed_provider_attempts = consumed_attempts,
         .outstanding_reservation = outstanding_reservation,
     });
@@ -4044,10 +4039,9 @@ fn persistRecoveryCheckpointWithAction(
         "agent",
         "recovery_checkpoint_set",
         trace_ctx,
-        "provider_attempts={d}/{d} outstanding={s} cause={s} action={s}",
+        "provider_attempts={d} outstanding={s} cause={s} action={s}",
         .{
             consumed_attempts,
-            attempt_limit,
             if (outstanding_reservation) "true" else "false",
             @tagName(cause),
             @tagName(action),
@@ -4068,9 +4062,8 @@ fn persistFinalReplyCheckpoint(
     route_model: []const u8,
     requested_fast_mode: bool,
     fast_mode: bool,
-    attempt_limit: usize,
     consumed_attempts: usize,
-    cause: model_response_recovery.FailureCause,
+    cause: types.ModelRecoveryCause,
     trace_ctx: TraceContext,
 ) !void {
     if (std.mem.trim(u8, reply, " \t\r\n").len == 0) return;
@@ -4083,13 +4076,14 @@ fn persistFinalReplyCheckpoint(
         route_model,
         requested_fast_mode,
         fast_mode,
-        attempt_limit,
         consumed_attempts,
         false,
         cause,
         .delivering_response,
         .none,
         trace_ctx,
+        // The response's own write already cleared its record.
+        .keep,
     );
 }
 
@@ -4114,9 +4108,8 @@ const CompactionSource = struct {
     route_model: []const u8,
     requested_fast_mode: bool,
     fast_mode: bool,
-    attempt_limit: usize,
     consumed_attempts: usize,
-    tool_evidence: model_response_recovery.ToolEvidence,
+    tool_evidence: resend_strategy.ToolEvidence,
     trace_ctx: TraceContext,
 
     fn hook(self: *CompactionSource) BeforeSummary {
@@ -4131,7 +4124,7 @@ const CompactionSource = struct {
         const execution = try runtime_execution_memory.buildExecutionMemory(self.arena, self.current_turn_messages);
         try effect.set(deps.ctx, .{
             .turn_id = job.turn_id,
-            .user = .{ .text = @constCast(job.prompt), .images = job.images },
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
             .assistant_source = @constCast(""),
             .execution = try self.finalization.persistedExecution(self.arena, execution),
             .cause = .compaction_prepared,
@@ -4145,7 +4138,7 @@ const CompactionSource = struct {
             },
             .requested_fast_mode = self.requested_fast_mode,
             .fast_mode = self.fast_mode,
-            .max_provider_attempts = self.attempt_limit,
+            .max_provider_attempts = checkpoint_provider_attempts,
             .consumed_provider_attempts = self.consumed_attempts,
             .outstanding_reservation = false,
         });
@@ -4200,14 +4193,14 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
             .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = text_utils.repeat("current evidence", 16) },
         });
         const retained_bytes = turn.queryCapacity();
-        try persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "partial", "model", false, false, 10, 1, false, .transport_interrupted, .retry_request, .confirmed, .{});
+        try persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "partial", "model", false, false, 1, false, .network_interrupted, .retry_request, .confirmed, .{}, .keep);
         try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
         try std.testing.expectEqual(step_index + 1, sink.checkpoint.?.execution.tool_steps.len);
         try std.testing.expectEqualStrings(id, sink.checkpoint.?.execution.tool_steps[step_index].tool_calls[0].id);
     }
     sink.fail = true;
     const retained_bytes = turn.queryCapacity();
-    try std.testing.expectError(error.CheckpointWriteFailed, persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "cancelled", "model", false, false, 10, 1, false, .transport_interrupted, .pause, .confirmed, .{}));
+    try std.testing.expectError(error.CheckpointWriteFailed, persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "cancelled", "model", false, false, 1, false, .network_interrupted, .continue_after_confirmed_tool, .confirmed, .{}, .keep));
     try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
     try std.testing.expectEqual(@as(usize, 1000), sink.checkpoint.?.execution.tool_steps.len);
 }
@@ -4500,19 +4493,144 @@ fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
     };
 }
 
+test "every HTTP status retries exactly when it is 429 or a 5xx other than 501 and 505, and its failure names that status" {
+    var code: u16 = 100;
+    while (code <= 999) : (code += 1) {
+        const status: std.http.Status = @fromBackingInt(@intCast(code));
+        const kind = agent_stream_provider.FailureKind.fromHttpStatus(status);
+        try std.testing.expectEqual(code == 429 or (code >= 500 and code <= 599 and code != 501 and code != 505), isRetryableModelFailure(kind));
+        try std.testing.expectEqual(status, failureStatus(.{ .kind = kind, .http_status = status }));
+    }
+}
+
+/// The module takes Retry-After in milliseconds. Absurd hints saturate; the
+/// module caps every hint, a rate limit's included, at its 30 second ceiling.
+fn retryAfterMs(seconds: ?u64) ?u32 {
+    const value = seconds orelse return null;
+    return std.math.cast(u32, value *| std.time.ms_per_s) orelse std.math.maxInt(u32);
+}
+
+test "retry after converts to milliseconds and saturates" {
+    try std.testing.expectEqual(@as(?u32, null), retryAfterMs(null));
+    try std.testing.expectEqual(@as(?u32, 3_000), retryAfterMs(3));
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), retryAfterMs(std.math.maxInt(u64)));
+}
+
+fn failureStatus(failure: agent_stream_provider.Failure) std.http.Status {
+    return failure.http_status orelse failureHttpStatus(failure.kind);
+}
+
 fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
     return switch (kind) {
         .invalid_request => .bad_request,
         .unauthorized => .unauthorized,
         .forbidden => .forbidden,
         .request_too_large => .payload_too_large,
-        .rate_limited => .too_many_requests,
+        .rate_limited, .quota_exhausted => .too_many_requests,
         .server_error => .internal_server_error,
         .bad_gateway => .bad_gateway,
         .unavailable => .service_unavailable,
         .gateway_timeout => .gateway_timeout,
         .provider_error => .bad_gateway,
     };
+}
+
+/// The failure kind an HTTP error that needs the user reports, or null when
+/// fx keeps its own handling, which ends the turn. Only a host that can ask
+/// the user calls this. A context overflow that reaches it already went
+/// through fx's compaction.
+fn needsUserFailureKind(
+    alloc: Allocator,
+    failure: agent_stream_provider.Failure,
+    credential_source: ?types.CredentialSource,
+) ?runtime_request_recovery.Failure.Kind {
+    if (failure.kind == .quota_exhausted or
+        gateway_error_format.namesOutOfCredits(alloc, failure.detail orelse ""))
+    {
+        return .quota;
+    }
+    if (isContextOverflowFailure(failure)) return .too_long;
+    return switch (failure.kind) {
+        .invalid_request, .forbidden, .request_too_large, .provider_error => .rejected,
+        // fx already refreshed the credential once. A source that /login
+        // repairs waits for the user to sign in; any other keeps its notice.
+        .unauthorized => if (signInRepairs(credential_source)) .sign_in else null,
+        // 429 and 5xx retry.
+        .rate_limited, .quota_exhausted, .server_error, .bad_gateway, .unavailable, .gateway_timeout => null,
+    };
+}
+
+/// Whether `/login` repairs the source, so fx can open it on its own.
+fn signInRepairs(credential_source: ?types.CredentialSource) bool {
+    const source = credential_source orelse return false;
+    return switch (source) {
+        .fx_login, .chatgpt_subscription, .grok_subscription => true,
+        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => false,
+    };
+}
+
+/// The provider's HTTP error detail, clipped, as fx shows it.
+fn httpFailureDetail(
+    arena: Allocator,
+    failure: agent_stream_provider.Failure,
+    job: QueuedPrompt,
+    request_capabilities: model_capabilities.Capabilities,
+) ![]const u8 {
+    const detail = if (failure.detail) |body| std.mem.trim(u8, body, " \r\n\t") else "";
+    const clipped = detail[0..@min(detail.len, http_error_detail_max_bytes)];
+    return runtime_gateway_step.gatewayHttpErrorDetail(
+        arena,
+        failureStatus(failure),
+        clipped,
+        job.model,
+        request_capabilities,
+    );
+}
+
+/// Shows the provider's reason in the transcript while a request waits for
+/// the user, since the status line holds what the user can do.
+fn pushWaitingHttpFailureReason(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    failure: agent_stream_provider.Failure,
+    job: QueuedPrompt,
+    request_capabilities: model_capabilities.Capabilities,
+) !void {
+    const detail = try httpFailureDetail(arena, failure, job, request_capabilities);
+    const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
+    if (deps.push_interactive_notice) |push| {
+        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
+    } else {
+        try deps.push_system_notice(deps.ctx, message);
+    }
+}
+
+const UserAnswer = enum { resend, cancelled, switch_model };
+
+/// Reports a failure that needs the user and waits for their answer.
+fn waitForUser(
+    request_recovery: *runtime_request_recovery.RequestRecovery,
+    deps: *const AgentRuntimeDeps,
+    kind: runtime_request_recovery.Failure.Kind,
+) !UserAnswer {
+    var send = try request_recovery.failed(.{ .kind = kind });
+    // fx compacts a request that is too long before it reports one, so the
+    // module's compacted send would repeat the same request. That send fails
+    // the same way without going out, and the module asks the user.
+    if (send) |pending| if (kind == .too_long and pending.compact_first) {
+        send = try request_recovery.failed(.{ .kind = .too_long });
+    };
+    if (send != null) return .resend;
+    if (kind == .quota) if (deps.ask_out_of_credits) |ask| {
+        const choice = try ask(deps.ctx);
+        debug_trace.logf("recovery", "out of credits choice={s}", .{@tagName(choice)});
+        return switch (choice) {
+            .retry => if (try request_recovery.userContinue() != null) .resend else .cancelled,
+            .switch_model => .switch_model,
+            .cancel => .cancelled,
+        };
+    };
+    return if (try request_recovery.waitForSend() != null) .resend else .cancelled;
 }
 
 fn isContextOverflowFailure(failure: agent_stream_provider.Failure) bool {
@@ -4655,6 +4773,122 @@ fn fitRequestImages(
         request.* = smaller;
         body = rebuilt;
     }
+}
+
+/// Rounds the images left out of `request` up to the end of a block
+/// (`request_image_budget.blockCut`), so a session past its image limit keeps
+/// the same images in its cached prompt until the cut reaches the next block.
+/// `sizes` holds every image the request had before any was left out. Returns
+/// the body to send: `body` itself when nothing more is left out, or when the
+/// rounded request would not fit.
+fn holdImagesToBlocks(
+    arena: Allocator,
+    provider: agent_stream_provider.Provider,
+    request: *agent_stream_provider.RequestData,
+    body: []const u8,
+    sizes: []const usize,
+    limits: request_image_budget.Limits,
+    tool_text_limit: usize,
+    trace_ctx: TraceContext,
+) ![]const u8 {
+    const kept = (try request_image_budget.imageSizes(arena, request.messages)).len;
+    const cut = sizes.len -| kept;
+    const rounded_cut = request_image_budget.blockCut(sizes, cut, limits);
+    if (rounded_cut <= cut) return body;
+    const projection = try request_image_budget.withhold(arena, request.messages, rounded_cut - cut, tool_text_limit);
+    var rounded = request.*;
+    rounded.messages = projection.messages;
+    const rebuilt = (try provider.buildRequest(arena, rounded)) orelse return body;
+    if (rebuilt.len > limits.max_request_bytes) {
+        debug_trace.eventf("images", "request_images_block_skipped", trace_ctx, "cut={d} block_cut={d} request_bytes={d} limit_bytes={d}", .{
+            cut,
+            rounded_cut,
+            rebuilt.len,
+            limits.max_request_bytes,
+        });
+        return body;
+    }
+    debug_trace.eventf("images", "request_images_withheld_to_block", trace_ctx, "cut={d} block_cut={d} request_bytes_before={d} request_bytes_after={d}", .{
+        cut,
+        rounded_cut,
+        body.len,
+        rebuilt.len,
+    });
+    request.* = rounded;
+    return rebuilt;
+}
+
+test "a session past its size limit leaves images out a block at a time" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A body as long as the request's text and images.
+    const Builder = struct {
+        fn build(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.RequestData) anyerror![]u8 {
+            var len: usize = 100;
+            for (request.messages) |message| {
+                const text: []const u8 = message.content orelse "";
+                len += text.len;
+                if (message.tool_result_memory) |memory| {
+                    for (memory.tool_images) |image| len += image.data.len;
+                }
+            }
+            const body = try alloc.alloc(u8, len);
+            @memset(body, 'x');
+            return body;
+        }
+        fn stream(_: ?*anyopaque, _: Allocator, _: agent_stream_provider.ModelRequest) anyerror!agent_stream_provider.Result {
+            return error.TestUnexpectedStream;
+        }
+    };
+    const provider = agent_stream_provider.Provider{ .stream_fn = Builder.stream, .build_request_fn = Builder.build };
+    const limits = request_image_budget.Limits{ .max_request_bytes = 100_000 };
+
+    var messages: [40]types.ChatMessage = undefined;
+    for (&messages, 0..) |*message, index| {
+        const data = try arena.alloc(u8, 4000);
+        @memset(data, 'A');
+        const images = try arena.alloc(types.ToolImage, 1);
+        images[0] = .{ .data = data, .mime_type = try arena.dupe(u8, "image/png") };
+        message.* = .{
+            .role = .tool,
+            .content = try arena.print("<path>shot-{d}.png</path>", .{index}),
+            .tool_result_memory = .{ .tool_images = images, .tool_image_handle = try arena.print("image-result-{d}", .{index}) },
+        };
+    }
+
+    var previous_cut: usize = 0;
+    var cut_changes: usize = 0;
+    var minimal_changes: usize = 0;
+    var previous_minimal: usize = 0;
+    for (1..messages.len + 1) |count| {
+        var request: agent_stream_provider.RequestData = .{
+            .model = "test/model",
+            .messages = messages[0..count],
+            .tool_choice = .auto,
+            .provider_options = .{},
+        };
+        const sizes = try request_image_budget.imageSizes(arena, request.messages);
+        const first = (try provider.buildRequest(arena, request)).?;
+        const fitted = try fitRequestImages(arena, provider, &request, first, limits, 4096, .{});
+        const minimal = sizes.len - (try request_image_budget.imageSizes(arena, request.messages)).len;
+        const body = try holdImagesToBlocks(arena, provider, &request, fitted, sizes, limits, 4096, .{});
+        const cut = sizes.len - (try request_image_budget.imageSizes(arena, request.messages)).len;
+
+        try std.testing.expect(body.len <= limits.max_request_bytes);
+        try std.testing.expect(cut >= minimal and cut >= previous_cut);
+        // The newest image is always sent.
+        try std.testing.expectEqual(@as(usize, 1), request.messages[count - 1].tool_result_memory.?.tool_images.len);
+        if (cut != previous_cut) cut_changes += 1;
+        if (minimal != previous_minimal) minimal_changes += 1;
+        previous_cut = cut;
+        previous_minimal = minimal;
+    }
+    // Leaving out one more image per request would change the cached prompt
+    // on every request past the limit. A block ends at a quarter of the
+    // limit, seven of these images, so the cut changes every seventh.
+    try std.testing.expect(minimal_changes >= 10);
+    try std.testing.expect(cut_changes * 4 <= minimal_changes);
 }
 
 test "size rejections retry with fewer images only while images remain" {
@@ -4802,36 +5036,6 @@ test "assistant prefill rejection recovers after any tool result tail" {
     try std.testing.expect(postToolAssistantPrefillRejection(.bad_request, detail, &after_user) == null);
 }
 
-fn recovery_deadline(delay_ns: u64) std.Io.Clock.Timestamp {
-    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-    return .{
-        .clock = .awake,
-        .raw = started.raw.addDuration(.fromNanoseconds(@intCast(delay_ns))),
-    };
-}
-
-fn wait_for_recovery_deadline(
-    cancel_flag: *std.atomic.Value(bool),
-    deadline: std.Io.Clock.Timestamp,
-) bool {
-    if (comptime builtin.is_test) return !cancel_flag.load(.seq_cst);
-    std.debug.assert(deadline.clock == .awake);
-    const quantum: i96 = 25 * std.time.ns_per_ms;
-    while (true) {
-        if (cancel_flag.load(.seq_cst)) return false;
-        const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-        if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) break;
-        const remaining = now.raw.durationTo(deadline.raw).toNanoseconds();
-        io_mod.getIo().sleep(.fromNanoseconds(@min(remaining, quantum)), .awake) catch {};
-    }
-    return !cancel_flag.load(.seq_cst);
-}
-
-fn recoveryPauseRequested(config: Config) bool {
-    const flag = config.recovery_pause_flag orelse return false;
-    return flag.load(.seq_cst);
-}
-
 fn providerFailureReplaySafe(
     completion: types.ModelCompletion,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
@@ -4840,31 +5044,6 @@ fn providerFailureReplaySafe(
         completionContentBytes(completion) == 0 and
         completion.tool_calls.len == 0 and
         streamReplaySafe(stream_ctx);
-}
-
-fn disableFastRouteAfterFailure(
-    route_fast_mode: *bool,
-    route_model: *[]const u8,
-    selected_model: []const u8,
-    cause: model_response_recovery.FailureCause,
-    replay_safe: bool,
-    trace_ctx: TraceContext,
-) bool {
-    if (!model_response_recovery.shouldDisableFastRoute(
-        route_fast_mode.*,
-        cause,
-        replay_safe,
-    )) return false;
-    debug_trace.eventf(
-        "agent",
-        "recovery_fast_fallback",
-        trace_ctx,
-        "failed_route={s} selected_model={s}",
-        .{ route_model.*, selected_model },
-    );
-    route_fast_mode.* = false;
-    route_model.* = selected_model;
-    return true;
 }
 
 fn routeFailureDetail(completion: types.ModelCompletion) []const u8 {
@@ -4877,29 +5056,11 @@ fn isTerminalProviderExecutedCompletion(completion: types.ModelCompletion) bool 
     return content.len > 0 and types.allToolCallsProviderExecuted(completion.tool_calls);
 }
 
-noinline fn pushRouteRecoveryStatus(
-    deps: *const AgentRuntimeDeps,
-    status: types.RouteRecoveryStatus,
-) !void {
-    try deps.push_route_recovery_status(deps.ctx, status);
-}
-
-noinline fn clearAutoRetryStatusIfNeeded(
-    deps: *const AgentRuntimeDeps,
-    recovery_active: bool,
-) !void {
-    if (!recovery_active) return;
-    try deps.push_event(deps.ctx, .clear_route_recovery_status);
-}
-
-noinline fn clear_deferred_retry_status(deps: *const AgentRuntimeDeps) void {
-    clearAutoRetryStatusIfNeeded(deps, true) catch |clear_err| {
-        debug_trace.logf(
-            "agent",
-            "failed to clear due retry status err={s}",
-            .{@errorName(clear_err)},
-        );
-    };
+fn hasProviderExecutedCall(tool_calls: []const types.ToolCall) bool {
+    for (tool_calls) |call| {
+        if (call.provenance == .provider_executed) return true;
+    }
+    return false;
 }
 
 noinline fn settle_deferred_tool_starts(
@@ -4931,23 +5092,6 @@ noinline fn settle_deferred_tool_starts(
             .{@errorName(err)},
         );
     };
-}
-
-test "deferred retry cleanup clears status and contains sink errors" {
-    const support = @import("tests/support.zig");
-    var normal = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
-    defer normal.deinit();
-    const deps = normal.deps();
-    clear_deferred_retry_status(&deps);
-    try std.testing.expectEqual(@as(usize, 1), normal.route_recovery_clear_count);
-
-    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
-    var failed = support.FakeAgentRuntimeDeps.init(failing.allocator());
-    defer failed.deinit();
-    const failed_deps = failed.deps();
-    clear_deferred_retry_status(&failed_deps);
-    try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(@as(usize, 1), failed.route_recovery_clear_count);
 }
 
 test "deferred tool cleanup preserves interruption and cancellation outcomes" {
@@ -5017,18 +5161,17 @@ test "deferred tool cleanup contains publication failure and preserves tracking"
     try std.testing.expect(stream_ctx.provisional_statuses.visibleId(.{ .id = "local", .name = "read_file", .arguments_json = "{}" }) != null);
 }
 
+/// A recovered step whose response still failed ends with fx's terminal
+/// status in place of the module's.
 fn pushTerminalAutoRetryStatusIfNeeded(
-    deps: *const AgentRuntimeDeps,
+    request: *runtime_request_recovery.RequestRecovery,
     recovery_active: bool,
-    semantic_attempt: usize,
-    semantic_limit: usize,
     diagnostic: types.ModelFailureDiagnostic,
 ) !void {
     if (!recovery_active) return;
-    try pushRouteRecoveryStatus(deps, .{
+    try request.replaceStatus(.{
         .kind = .terminal_provider_error,
-        .failed_attempt = semantic_attempt + 1,
-        .attempt_limit = semantic_limit,
+        .attempt = request.attempt(),
         .diagnostic = diagnostic,
     });
 }
@@ -5055,11 +5198,15 @@ fn onRequiredVisionStreamToolStart(
 
 const ProviderEventContext = struct {
     stream: *runtime_assistant_stream.StreamChunkContext,
+    recovery: *runtime_request_recovery.RequestRecovery,
     required_vision: bool,
 };
 
 fn onProviderEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
     const ctx: *ProviderEventContext = @ptrCast(@alignCast(raw));
+    // The first output of a send clears any recovery status before it
+    // reaches the screen (`tests/tla/recovery/Recovery.tla` StatusHonest).
+    ctx.recovery.responding();
     switch (event) {
         .content_delta => |chunk| runtime_assistant_stream.onStreamContentChunk(ctx.stream, chunk),
         .reasoning_delta => |chunk| runtime_assistant_stream.onStreamReasoningChunk(ctx.stream, chunk),
@@ -5118,141 +5265,47 @@ fn refreshGatewayCredentialForJob(
     return true;
 }
 
-fn auto_retry_status(
-    failed_attempt: usize,
-    attempt_limit: usize,
-    cause: model_response_recovery.FailureCause,
-    strategy: model_response_recovery.Strategy,
-    delay_seconds: u64,
-    retry_deadline: ?std.Io.Clock.Timestamp,
-    diagnostic: types.ModelFailureDiagnostic,
-) types.RouteRecoveryStatus {
-    return .{
-        .kind = .auto_retry,
-        .failed_attempt = failed_attempt,
-        .attempt_limit = attempt_limit,
-        .cause = switch (cause) {
-            .transport_interrupted => .network_interrupted,
-            .connectivity_lost => .connectivity_lost,
-            .response_interrupted => .response_interrupted,
-            .provider_stream_timeout => .provider_stream_timeout,
-            .provider_unavailable => .provider_unavailable,
-            .rate_limited => .rate_limited,
-            .system_resumed => .system_resumed,
-            .compaction_prepared => .compaction_prepared,
-            .authentication => .authentication,
-            .request_limit_reached => .request_limit_reached,
-            .content_filter => null,
-        },
-        .action = switch (strategy) {
-            .retry_request => .retrying_request,
-            .continue_response => .continuing_response,
-            .regenerate_tool => .regenerating_tool,
-            .continue_after_confirmed_tool => .continuing_after_tool,
-            .reconcile_tool => .reconciling_tool,
-            .wait_for_connectivity => .waiting_for_connectivity,
-            .probe_liveness => .checking_liveness,
-            .pause => .paused,
-            .stop => null,
-        },
-        .delay_seconds = delay_seconds,
-        .retry_deadline = retry_deadline,
-        .diagnostic = diagnostic,
-    };
-}
-
-/// The status row must not change shape between the wait and the in-flight
-/// beat: when the countdown segment vanished, right-aligned footer content
-/// shifted with it. Mirror exactly what the wait row displayed (the segment
-/// appears only when the wait rendered one); the next failure or the
-/// recovered status replaces it.
-fn inFlightDelaySeconds(delay_ns: u64) u64 {
-    return delay_ns / std.time.ns_per_s;
-}
-
-fn pushAutoRetryStatus(
-    deps: *const AgentRuntimeDeps,
-    failed_attempt: usize,
-    attempt_limit: usize,
-    cause: model_response_recovery.FailureCause,
-    decision: model_response_recovery.Decision,
-    diagnostic: types.ModelFailureDiagnostic,
-) !std.Io.Clock.Timestamp {
-    const deadline = recovery_deadline(decision.delay_ns);
-    try pushRouteRecoveryStatus(deps, auto_retry_status(
-        failed_attempt,
-        attempt_limit,
-        cause,
-        decision.strategy,
-        decision.delay_ns / std.time.ns_per_s,
-        deadline,
-        diagnostic,
-    ));
-    return deadline;
-}
-
 const ProviderAdmission = struct {
-    deps: *const AgentRuntimeDeps,
     stream: *runtime_assistant_stream.StreamChunkContext,
-    pending_status: *?types.RouteRecoveryStatus,
 
     fn admit(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         runtime_assistant_stream.publishTurnPhase(self.stream, .thinking);
-        if (self.pending_status.*) |status| {
-            try pushRouteRecoveryStatus(self.deps, status);
-            self.pending_status.* = null;
-        }
     }
 };
 
-fn pushAutoRecoveredStatus(
-    deps: *const AgentRuntimeDeps,
-    retry_count: usize,
-    attempt_limit: usize,
-) !void {
-    try pushRouteRecoveryStatus(deps, .{
-        .kind = .auto_recovered,
-        .succeeded_attempt = retry_count + 1,
-        .attempt_limit = attempt_limit,
-    });
-}
-
 fn pushTerminalProviderFailureStatus(
-    deps: *const AgentRuntimeDeps,
-    attempts: usize,
-    attempt_limit: usize,
+    request: *runtime_request_recovery.RequestRecovery,
     completion: types.ModelCompletion,
     diagnostic: types.ModelFailureDiagnostic,
 ) !void {
     const reason = completion.finish_reason orelse return;
     if (reason == .content_filter) {
-        try pushRouteRecoveryStatus(deps, .{
+        try request.replaceStatus(.{
             .kind = .content_filter,
-            .required_action = .change_request,
             .diagnostic = diagnostic,
         });
         return;
     }
-    try pushRouteRecoveryStatus(deps, .{
+    try request.replaceStatus(.{
         .kind = .terminal_provider_error,
-        .failed_attempt = attempts,
-        .attempt_limit = attempt_limit,
+        .attempt = request.attempt(),
         .diagnostic = diagnostic,
     });
 }
 
-fn finishRecoveryPaused(
+/// A resend that had to reconcile uncertain tool evidence returned another
+/// tool call. fx cannot prove the earlier call didn't run, so the turn stops
+/// with its checkpoint kept for the user to inspect, as before; only the
+/// automatic recovery around it changed.
+fn finishUncertainToolReview(
     deps: *const AgentRuntimeDeps,
+    request: *runtime_request_recovery.RequestRecovery,
     finalization: *TurnFinalizationGuard,
     stream_ctx: *runtime_assistant_stream.StreamChunkContext,
     arena: Allocator,
     finish_trace: *PromptFinishTrace,
-    cause: model_response_recovery.FailureCause,
-    consumed_attempts: usize,
-    attempt_limit: usize,
-    required_action: types.ModelRecoveryRequiredAction,
-    diagnostic: ?types.ModelFailureDiagnostic,
+    diagnostic: types.ModelFailureDiagnostic,
 ) !void {
     try stream_ctx.provisional_statuses.finishUnmatchedRecoveryStarts(
         deps,
@@ -5261,127 +5314,26 @@ fn finishRecoveryPaused(
         finalization.turn_id,
         &.{},
     );
-    try pushRouteRecoveryStatus(deps, .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = consumed_attempts,
-        .attempt_limit = attempt_limit,
-        .cause = checkpointCause(cause),
-        .action = .paused,
-        .required_action = required_action,
-        .diagnostic = diagnostic orelse defaultRecoveryDiagnostic(cause),
+    try request.replaceStatus(.{
+        .kind = .unsafe_tool_start,
+        .diagnostic = diagnostic,
     });
     try finalization.finish(.paused, null, null);
-    finish_trace.finish("recovery_paused");
-}
-
-/// No-progress stop: the exchange kept failing at the same point, so the turn
-/// ends honestly (terminal, prompt restored) instead of pausing or restarting
-/// forever. Used when decide() returns stop + surface_stall.
-fn finishRecoveryStalled(
-    deps: *const AgentRuntimeDeps,
-    finalization: *TurnFinalizationGuard,
-    stream_ctx: *runtime_assistant_stream.StreamChunkContext,
-    arena: Allocator,
-    finish_trace: *PromptFinishTrace,
-    cause: model_response_recovery.FailureCause,
-    consumed_attempts: usize,
-    attempt_limit: usize,
-    diagnostic: ?types.ModelFailureDiagnostic,
-    job: QueuedPrompt,
-    config: Config,
-    current_turn_messages: []const ChatMessage,
-    partial_assistant: []const u8,
-    interrupted_persisted: *bool,
-    terminal_materializing: *bool,
-    trace_ctx: TraceContext,
-) !void {
-    // The prompt goes back before the turn is saved, so a failed save cannot
-    // also lose it.
-    restorePromptAfterTerminalFailure(deps, job, config);
-    try stream_ctx.provisional_statuses.finishUnmatchedRecoveryStarts(
-        deps,
-        stream_ctx.alloc,
-        arena,
-        finalization.turn_id,
-        &.{},
-    );
-    try pushRouteRecoveryStatus(deps, .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = consumed_attempts,
-        .attempt_limit = attempt_limit,
-        .cause = checkpointCause(cause),
-        .required_action = .surface_stall,
-        .diagnostic = diagnostic orelse defaultRecoveryDiagnostic(cause),
-    });
-    // The turn stops, but the work it already did stays in the conversation.
-    // Without it the next request has no record of the prompt or the completed
-    // tool steps, and the agent treats its own changes as someone else's.
-    // Committing the saved turn also closes its durable checkpoint, so a
-    // separate clear first would end the turn twice in a libfx journal.
-    const kept_work = runtime_interruption.persistFailedTurnWorkOnce(
-        deps,
-        finalization,
-        job,
-        partial_assistant,
-        interrupted_persisted,
-        trace_ctx,
-        current_turn_messages,
-        terminal_materializing,
-    ) catch |err| {
-        // Before saving starts, the caller's fallback commits the work and
-        // that commit closes the checkpoint; a clear here would end it twice.
-        if (terminal_materializing.*) clearRecoveryCheckpoint(deps, "stall stop");
-        debug_trace.logf(
-            "agent",
-            "stall stop could not save the turn's completed work err={s} saving_started={s}",
-            .{ @errorName(err), if (terminal_materializing.*) "true" else "false" },
-        );
-        return err;
-    };
-    if (kept_work) {
-        debug_trace.logf("agent", "stall stop kept the turn's completed work partial_bytes={d}", .{partial_assistant.len});
-    } else {
-        clearRecoveryCheckpoint(deps, "stall stop");
-        debug_trace.logf(
-            "agent",
-            "stall stop dropped a turn with no completed work partial_bytes={d}",
-            .{partial_assistant.len},
-        );
-        try finalization.finish(.failed, null, null);
-    }
-    finish_trace.finish("recovery_stalled");
+    finish_trace.finish("uncertain_tool_review");
 }
 
 fn pushUnsafeNoRetryStatus(
-    deps: *const AgentRuntimeDeps,
+    request: *runtime_request_recovery.RequestRecovery,
     reason: types.RouteRecoveryUnsafeReason,
     diagnostic: types.ModelFailureDiagnostic,
 ) !void {
-    try pushRouteRecoveryStatus(deps, .{
+    try request.replaceStatus(.{
         .kind = switch (reason) {
             .assistant_output => .unsafe_assistant_output,
             .tool_start => .unsafe_tool_start,
         },
         .diagnostic = diagnostic,
     });
-}
-
-// Elapsed recovery time from a wall-clock anchor. Wall-clock deltas can go
-// negative under NTP correction; a backward step reads as zero elapsed,
-// never a trap.
-fn recoveryElapsedNs(recovery_started_at_ms: ?i64) ?u64 {
-    const started = recovery_started_at_ms orelse return null;
-    const delta_ms = io_mod.milliTimestamp() - started;
-    if (delta_ms <= 0) return 0;
-    return @as(u64, @intCast(delta_ms)) * std.time.ns_per_ms;
-}
-
-test "recoveryElapsedNs clamps backward wall-clock steps" {
-    try std.testing.expectEqual(@as(?u64, null), recoveryElapsedNs(null));
-    try std.testing.expectEqual(@as(?u64, 0), recoveryElapsedNs(io_mod.milliTimestamp() + 60_000));
-    const elapsed = recoveryElapsedNs(io_mod.milliTimestamp() - 2_000).?;
-    try std.testing.expect(elapsed >= 1_500 * std.time.ns_per_ms);
-    try std.testing.expect(elapsed <= 3_000 * std.time.ns_per_ms);
 }
 
 /// A turn that can never recover hands the user's prompt back to the composer
@@ -5459,16 +5411,6 @@ fn persistCancelledTurn(
     };
 }
 
-fn defaultRecoveryDiagnostic(cause: model_response_recovery.FailureCause) types.ModelFailureDiagnostic {
-    if (cause == .content_filter) return types.ModelFailureDiagnostic.init("content_filter");
-    return types.ModelFailureDiagnostic.forCause(checkpointCause(cause));
-}
-
-fn defaultRecoveryDiagnosticText(cause: model_response_recovery.FailureCause) []const u8 {
-    if (cause == .content_filter) return "content_filter";
-    return types.ModelFailureDiagnostic.defaultTextForCause(checkpointCause(cause));
-}
-
 fn prepareExternalFailureDiagnostic(
     alloc: Allocator,
     raw: []const u8,
@@ -5517,23 +5459,12 @@ fn providerCompletionDiagnostic(
     );
 }
 
-fn httpFailureDiagnostic(
-    alloc: Allocator,
-    status: std.http.Status,
-    detail: []const u8,
-) !types.ModelFailureDiagnostic {
-    const formatted = try gateway_error_format.formatHttpRecoveryDiagnostic(alloc, status, detail);
-    defer alloc.free(formatted);
-    return types.ModelFailureDiagnostic.init(formatted);
-}
-
 fn traceRouteFailure(
     step_ctx: TraceContext,
     selected_model: []const u8,
     route_model: []const u8,
     fast_mode: bool,
-    semantic_attempt: usize,
-    semantic_limit: usize,
+    attempt: usize,
     completion: types.ModelCompletion,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
     retry: bool,
@@ -5548,13 +5479,12 @@ fn traceRouteFailure(
         "agent",
         "route_failure",
         step_ctx,
-        "selected_model={s} route={s} fast_mode={s} semantic_attempt={d}/{d} http_status=200 finish_reason={s} saw_content={s} saw_tool_start={s} retry={s} detail={s}",
+        "selected_model={s} route={s} fast_mode={s} attempt={d} http_status=200 finish_reason={s} saw_content={s} saw_tool_start={s} retry={s} detail={s}",
         .{
             selected_model,
             route_model,
             if (fast_mode) "true" else "false",
-            semantic_attempt,
-            semantic_limit,
+            attempt,
             reason,
             if (stream_ctx.saw_visible_text or completionContentBytes(completion) > 0) "true" else "false",
             if (stream_ctx.saw_tool_start) "true" else "false",
@@ -5878,6 +5808,7 @@ fn processQueuedPromptInner(
     var interrupted_persisted = false;
 
     debug_trace.eventf("agent", "prompt_start", finish_trace.ctx, "prompt_bytes={d} model={s}", .{ job.prompt.len, job.model });
+    if (job.author == .child) subagent_reports.traceTaken(arena, finish_trace.ctx, job.prompt);
 
     const vision_fallback_available = config.provider_capabilities.vision_fallback and
         deps.tool_registry.lookup("vision") != null;
@@ -6011,11 +5942,16 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
         .{ active_history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    if (job.delivery.isContinuation()) {
+    // A resumed request continues the turn fx stopped: superseded resume
+    // turns are dropped and the stopped turn is projected without its abort
+    // note, as a steering continuation is.
+    const resumed_request = job.recovery_resume != null;
+    const resumed_history = if (resumed_request) session_runtime.withoutSupersededResumes(job.history) else job.history;
+    if (job.delivery.isContinuation() or resumed_request) {
         try session_runtime.appendSteeringActiveContextHistoryChatMessages(
             arena,
             &history_messages,
-            job.history,
+            resumed_history,
             0,
         );
     } else {
@@ -6055,7 +5991,9 @@ fn processQueuedPromptInner(
     const current_user_message: ChatMessage = .{
         .role = .user,
         .content = if (job.delivery.isContinuation())
-            try runtime_execution_memory.steeringMessage(arena, job.prompt)
+            try framedMessage(arena, job.author, job.prompt)
+        else if (resumed_request)
+            session_runtime.resumedRequestNote(resumed_history)
         else
             job.prompt,
         .images = job.images,
@@ -7092,9 +7030,18 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
+    // The last reply stopped for `other` with nothing in it and was answered
+    // with the empty-reply nudge. A step that shows text or calls a tool clears
+    // it, so each separate stall in a long turn gets one nudge.
+    var empty_reply_nudged = false;
     // The limit the turn's one retry of an empty, cut-short reply set. Later
     // steps keep it until the catalog names a limit of its own.
     var length_retry_output_tokens: ?u32 = null;
+    // The effort of the next step when it resends a reply that hit its output
+    // limit with nothing usable; null when the next step is not a resend. A
+    // resend's own reply is never resent, so one such reply costs at most one
+    // more request.
+    var length_resend_effort: ?types.ReasoningEffort = null;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
@@ -7114,10 +7061,6 @@ fn processQueuedPromptLoop(
     var pending_image_ids: []const usize = initial_pending_image_ids;
     var configured_first_tool_choice_pending = true;
     var active_presentation_group_id: ?types.ToolPresentationGroupId = null;
-    const restored_attempts = if (job.recovery_checkpoint) |checkpoint|
-        restoredConsumedAttempts(checkpoint)
-    else
-        0;
     const selected_fast_mode = config.fast_mode and !config.ultrafast_mode;
     const selected_ultrafast_mode = job.agent_settings.ultrafast_mode;
     const selection_changed = if (job.recovery_checkpoint) |checkpoint|
@@ -7139,17 +7082,7 @@ fn processQueuedPromptLoop(
             return error.RecoveryCredentialAuthorityChanged;
         }
     }
-    const restored_budget_exhausted = if (job.recovery_checkpoint) |checkpoint|
-        !selection_changed and restored_attempts >= checkpoint.max_provider_attempts
-    else
-        false;
-    const semantic_limit = if (selection_changed or restored_budget_exhausted)
-        semanticAttemptLimit(config.max_provider_attempts)
-    else if (job.recovery_checkpoint) |checkpoint|
-        checkpoint.max_provider_attempts
-    else
-        semanticAttemptLimit(config.max_provider_attempts);
-    var route_fast_mode = if (selection_changed)
+    const route_fast_mode = if (selection_changed)
         selected_fast_mode
     else if (job.recovery_checkpoint) |checkpoint|
         checkpoint.fast_mode
@@ -7160,17 +7093,6 @@ fn processQueuedPromptLoop(
     // Attachment pixel sizes probed during this turn, so each step does not
     // reread every attachment snapshot. Entries live in the turn arena.
     var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
-    var semantic_attempt: usize = if (selection_changed or restored_budget_exhausted)
-        0
-    else
-        restored_attempts;
-    var retry_pacing: model_response_recovery.RetryPacingState = .idle;
-    // Wall-clock state for autonomous recovery: when this turn entered
-    // recovery (drives the billable-retry throttle), and the no-progress
-    // detector that stops identical-failure restart loops.
-    var recovery_started_at_ms: ?i64 = null;
-    var recovery_last_progress: ?usize = null;
-    var recovery_no_progress_streak: usize = 0;
     const response_language_expectation = if (config.enforce_response_language and
         config.reject_response_language_mismatch and
         config.origin == .root and
@@ -7179,22 +7101,24 @@ fn processQueuedPromptLoop(
     else
         null;
     var response_language_correction_attempted = false;
-    var recovery_strategy: ?model_response_recovery.Strategy = if (job.recovery_checkpoint) |checkpoint|
+    // How the next resend is phrased, from the tool evidence of the attempt
+    // that failed. `src/core/recovery/` decides when to resend.
+    var recovery_strategy: ?resend_strategy.Strategy = if (job.recovery_checkpoint) |checkpoint|
         restoredRecoveryStrategy(checkpoint)
     else
         null;
-    var recovery_cause: model_response_recovery.FailureCause = if (job.recovery_checkpoint) |checkpoint|
-        restoredRecoveryCause(checkpoint.cause)
+    var recovery_cause: types.ModelRecoveryCause = if (job.recovery_checkpoint) |checkpoint|
+        checkpoint.cause
     else
-        .transport_interrupted;
-    var latest_recovery_diagnostic: ?types.ModelFailureDiagnostic = null;
-    var pending_auto_retry_status: ?types.RouteRecoveryStatus = null;
-    errdefer if (pending_auto_retry_status != null) clear_deferred_retry_status(deps);
-    var preserved_tool_evidence: model_response_recovery.ToolEvidence = if (job.recovery_checkpoint) |checkpoint|
+        .network_interrupted;
+    var preserved_tool_evidence: resend_strategy.ToolEvidence = if (job.recovery_checkpoint) |checkpoint|
         restoredRecoveryToolEvidence(checkpoint.tool_state)
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
+    // The turn's first model request resumes the one a previous fx process
+    // left unfinished, when there is one.
+    var recovery_resume = job.recovery_resume;
     // The session sends one runtime context ahead of the history; a change
     // joins the conversation instead (D94).
     var runtime_context = try runtime_context_state.State.init(
@@ -7213,6 +7137,9 @@ fn processQueuedPromptLoop(
             pending_context_notes.clearRetainingCapacity();
         }
         current_step_index = step + 1;
+        const resend_effort = length_resend_effort;
+        length_resend_effort = null;
+        const step_effort = resend_effort orelse config.effort;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
         defer if (deps.observer) |observer| observer.endStep();
         const step_ctx: TraceContext = .{ .turn_id = turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
@@ -7251,15 +7178,7 @@ fn processQueuedPromptLoop(
             try within_turn_suffix.append(arena, .{ .role = .system, .content = note, .context_note = true });
             debug_trace.logf("context", "runtime context update queued step={d} bytes={d}", .{ current_step_index, note.len });
         }
-        const steering_action = try observe_steering_boundary(
-            deps,
-            arena,
-            overlay_arena,
-            &within_turn_suffix,
-            turn_id,
-            config.origin,
-            .model,
-        );
+        const steering_action = try observe_steering_boundary(deps, arena, overlay_arena, &within_turn_suffix, turn_id, .model);
         if (steering_action == .handoff) {
             try finish_steering_handoff(
                 deps,
@@ -7276,11 +7195,6 @@ fn processQueuedPromptLoop(
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         try ephemeral_overlay.appendSlice(overlay_arena, runtime_context.messages());
-        var parent_turn_delivery = try appendPreparedParentTurnContext(
-            deps,
-            overlay_arena,
-            &ephemeral_overlay,
-        );
         var provider_prompt = try build_provider_prompt_with_response_language_control(
             overlay_arena,
             stable_prefix,
@@ -7382,6 +7296,10 @@ fn processQueuedPromptLoop(
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
         var reset_stream_for_next_attempt = false;
+        // The current failure's HTTP error notice is already on screen.
+        var http_failure_notice_shown = false;
+        // The next send reads the stored credential again, after a sign-in.
+        var credential_reload_pending = false;
         var auth_retry_used = false;
         var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
@@ -7390,10 +7308,52 @@ fn processQueuedPromptLoop(
         // The images the last request refused for its size carried.
         var request_images_last_refused: ?usize = null;
         var recovery_has_unexecuted_tool_start = false;
-        var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
+        var successful_recovery_strategy: ?resend_strategy.Strategy = null;
         defer {
             if (recovery_has_unexecuted_tool_start and finalization.outcome != .paused) {
                 settle_deferred_tool_starts(deps, &stream_ctx, arena, turn_id, config.cancel_flag);
+            }
+        }
+        // This step's model request, recovered by `src/core/recovery/`: it
+        // decides when to resend after a transient failure, and the status
+        // line says so. Prefill, language, image-size, and overflow retries
+        // stay fx's own and resend inside the same module send.
+        var request_recovery = runtime_request_recovery.RequestRecovery.init(deps, config.cancel_flag, step_ctx);
+        request_recovery.continue_flag = config.recovery_continue_flag;
+        // `deinit` clears a status still shown on every exit; an error exit
+        // reports `failed` first.
+        defer request_recovery.deinit();
+        errdefer request_recovery.endWithError();
+        const resumed = recovery_resume;
+        recovery_resume = null;
+        if (try request_recovery.start(route_fast_mode, resumed) == null) {
+            // The module asks before resending a resumed request. The turn
+            // reaches the log now, with the question's record, so Esc ends
+            // it and a relaunch asks again
+            // (`tests/tla/recovery/Resume.tla` CancelNeverResumes).
+            try persistRecoveryCheckpoint(
+                deps,
+                finalization,
+                job,
+                within_turn_suffix.items,
+                "",
+                gateway_model,
+                route_fast_mode,
+                route_fast_mode,
+                0,
+                false,
+                recovery_cause,
+                recovery_strategy,
+                preserved_tool_evidence,
+                step_ctx,
+                request_recovery.sendRecord(),
+            );
+            if (try request_recovery.waitForSend() == null) {
+                runtime_telemetry.traceCancelObserved(step_ctx, false);
+                try request_recovery.cancel();
+                try persistCancelledTurn(deps, finalization, job, "", completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                finish_trace.finish("interrupted");
+                return;
             }
         }
 
@@ -7404,58 +7364,23 @@ fn processQueuedPromptLoop(
             }
 
             gateway_model = job.model;
-            if (recoveryPauseRequested(config)) {
-                recovery_strategy = .pause;
-                try persistRecoveryCheckpoint(
-                    deps,
-                    finalization,
-                    job,
-                    within_turn_suffix.items,
-                    stream_ctx.interruption_source_or(""),
-                    gateway_model,
-                    selected_fast_mode,
-                    route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt,
-                    false,
-                    recovery_cause,
-                    recovery_strategy,
-                    preserved_tool_evidence,
-                    step_ctx,
-                );
-                try finishRecoveryPaused(
-                    deps,
-                    finalization,
-                    &stream_ctx,
-                    arena,
-                    &finish_trace,
-                    recovery_cause,
-                    semantic_attempt,
-                    semantic_limit,
-                    pausedRequiredAction(preserved_tool_evidence),
-                    latest_recovery_diagnostic,
-                );
-                pending_auto_retry_status = null;
-                return;
-            }
-            // The provider-attempt budget is deliberately not a turn limit:
-            // transient failures keep recovering autonomously (throttled past
-            // the billable window, stall-stopped when nothing progresses, and
-            // always esc-cancellable). Only a lifecycle pause flag parks a turn.
-
+            // A resend without Fast keeps it off for the rest of this request.
+            const attempt_fast_mode = route_fast_mode and !request_recovery.send.no_fast;
             const just_rebuilt_request = skip_next_preflight_refresh and active_compaction_handoff != null and context_overflow_recovery != .pending;
-            if (skip_next_preflight_refresh) {
+            if (skip_next_preflight_refresh and !credential_reload_pending) {
                 skip_next_preflight_refresh = false;
             } else {
+                skip_next_preflight_refresh = false;
                 _ = try refreshGatewayCredentialForJob(
                     deps,
                     std.heap.c_allocator,
                     job,
-                    .if_needed,
+                    if (credential_reload_pending) .reload else .if_needed,
                     &active_api_key,
                     &owned_refreshed_api_key,
                     step_ctx,
                 );
+                credential_reload_pending = false;
             }
             provider_prompt = try build_provider_prompt_with_response_language_control(
                 overlay_arena,
@@ -7655,16 +7580,16 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
-            var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, config.effort, route_fast_mode, config.ultrafast_mode);
+            var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, step_effort, attempt_fast_mode, config.ultrafast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
             provider_opts.provider_order = config.provider_order;
             provider_opts.provider_strict = config.provider_strict;
-            runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
+            runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
             // Fast drops silently when the catalog cannot confirm support.
             // Tell the user once per turn, but only when the catalog itself is
             // known to be down; a reachable catalog that simply lacks fast
             // metadata for the model stays quiet.
-            if (route_fast_mode and !provider_opts.fast and !fast_unavailable_notified and
+            if (attempt_fast_mode and !provider_opts.fast and !fast_unavailable_notified and
                 deps.model_catalog_unavailable != null and deps.model_catalog_unavailable.?(deps.ctx))
             {
                 fast_unavailable_notified = true;
@@ -7696,7 +7621,9 @@ fn processQueuedPromptLoop(
             // The request re-sends every image the session keeps, and
             // building it whole would hold all of them, encoded, at once.
             // Images that pass every limit by their own size leave before the
-            // build; `fitRequestImages` fits the rest to this model's limit.
+            // build; `fitRequestImages` fits the rest to this model's limit,
+            // and `holdImagesToBlocks` rounds what it left out to a block.
+            const request_image_sizes = try request_image_budget.imageSizes(overlay_arena, request_data.messages);
             const past_limit = try request_image_budget.withholdImagesPastLimit(
                 overlay_arena,
                 request_data.messages,
@@ -7714,15 +7641,26 @@ fn processQueuedPromptLoop(
                 overlay_arena,
                 request_data,
             )) |built_request_body| {
-                const request_body = try fitRequestImages(
+                const image_limits: request_image_budget.Limits = .{ .max_request_bytes = request_image_budget.maxRequestBytes(
+                    agent.requestByteLimit(gateway_model),
+                    deps.agent_stream_provider.max_request_bytes,
+                ) };
+                const fitted_body = try fitRequestImages(
                     overlay_arena,
                     deps.agent_stream_provider,
                     &request_data,
                     built_request_body,
-                    .{ .max_request_bytes = request_image_budget.maxRequestBytes(
-                        agent.requestByteLimit(gateway_model),
-                        deps.agent_stream_provider.max_request_bytes,
-                    ) },
+                    image_limits,
+                    config.max_tool_result_bytes,
+                    step_ctx,
+                );
+                const request_body = try holdImagesToBlocks(
+                    overlay_arena,
+                    deps.agent_stream_provider,
+                    &request_data,
+                    fitted_body,
+                    request_image_sizes,
+                    image_limits,
                     config.max_tool_result_bytes,
                     step_ctx,
                 );
@@ -7791,7 +7729,7 @@ fn processQueuedPromptLoop(
                 } else {
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
-                        .user = .{ .text = job.prompt, .images = job.images },
+                        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
                         .assistant = @constCast(""),
                         .execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]),
                     };
@@ -7803,9 +7741,8 @@ fn processQueuedPromptLoop(
                         .current_turn_messages = within_turn_suffix.items,
                         .route_model = gateway_model,
                         .requested_fast_mode = selected_fast_mode,
-                        .fast_mode = route_fast_mode,
-                        .attempt_limit = semantic_limit,
-                        .consumed_attempts = semantic_attempt,
+                        .fast_mode = attempt_fast_mode,
+                        .consumed_attempts = request_recovery.attempt() - 1,
                         .tool_evidence = preserved_tool_evidence,
                         .trace_ctx = step_ctx,
                     };
@@ -7905,15 +7842,7 @@ fn processQueuedPromptLoop(
                         skip_next_preflight_refresh = true;
                         // A message queued while the compaction ran must ride the
                         // rebuilt request, not wait for the reply after it.
-                        const post_compaction_action = try observe_steering_boundary(
-                            deps,
-                            arena,
-                            overlay_arena,
-                            &within_turn_suffix,
-                            turn_id,
-                            config.origin,
-                            .model,
-                        );
+                        const post_compaction_action = try observe_steering_boundary(deps, arena, overlay_arena, &within_turn_suffix, turn_id, .model);
                         if (post_compaction_action == .handoff) {
                             try finish_steering_handoff(
                                 deps,
@@ -7949,9 +7878,8 @@ fn processQueuedPromptLoop(
                     stream_ctx.interruption_source_or(""),
                     gateway_model,
                     selected_fast_mode,
-                    route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt,
+                    attempt_fast_mode,
+                    request_recovery.attempt() - 1,
                     true,
                     recovery_cause,
                     recovery_strategy,
@@ -7961,20 +7889,27 @@ fn processQueuedPromptLoop(
                         &stream_ctx,
                     ),
                     step_ctx,
+                    request_recovery.sendRecord(),
                 );
+            } else {
+                // No write goes before this send, so its record goes now.
+                request_recovery.flushRecord();
             }
 
+            disarmCacheWarming(deps);
             const gateway_wait_started_ms = io_mod.milliTimestamp();
+            // When the answered request started: the provider keeps its cache
+            // entry for its lifetime from then.
+            var request_started_ms = gateway_wait_started_ms;
             var gateway_delivery = runtime_gateway_step.DeliveryCertainty.init();
             var gateway_attempt_evidence: runtime_gateway_step.AttemptEvidence = .{};
             var provider_events = ProviderEventContext{
                 .stream = &stream_ctx,
+                .recovery = &request_recovery,
                 .required_vision = vision_mode == .required,
             };
             var provider_admission = ProviderAdmission{
-                .deps = deps,
                 .stream = &stream_ctx,
-                .pending_status = &pending_auto_retry_status,
             };
             var model_request = agent_stream_provider.ModelRequest{
                 .observer = deps.observer,
@@ -8001,7 +7936,7 @@ fn processQueuedPromptLoop(
                 .prepared_request_body = prepared_request_body,
                 .trace_ctx = step_ctx,
                 .content_capture_limit = null,
-                .cooperative_pulse = deps.cooperative_transport_pulse,
+                .cooperative_pulse = request_recovery.cooperativePulse(deps.cooperative_transport_pulse),
                 .delivery = &gateway_delivery,
                 .attempt_evidence = &gateway_attempt_evidence,
                 .events = .{ .context = &provider_events, .emit_fn = onProviderEvent },
@@ -8009,133 +7944,76 @@ fn processQueuedPromptLoop(
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
-            stream_result = streamMainCompletion(deps, arena, model_request) catch |err| {
-                parent_turn_delivery.observeGatewayDelivery(
-                    deps,
-                    overlay_arena,
-                    gateway_delivery.load(),
-                );
+            request_recovery.beginSend();
+            const streamed = streamMainCompletion(deps, arena, model_request);
+            request_recovery.endSend();
+            stream_result = streamed catch |err| {
                 runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.finishTokenRequestWithoutUsage(gateway_delivery.load() == .possibly_sent)) catch |progress_err| {
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
-                const consumed_attempts = semantic_attempt +
+                const consumed_attempts = (request_recovery.attempt() - 1) +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
-                const network_failure = gateway_attempt_evidence.network_failure;
-                const failure_cause: model_response_recovery.FailureCause = if (network_failure) |evidence|
+                const network_failure = if (gateway_attempt_evidence.network_failure) |evidence| blk: {
+                    if (evidence.cause == .unreadable_reply and request_recovery.unreadableReplyEndsRequest()) {
+                        debug_trace.logf("recovery", "unreadable reply limit reached, ending the turn err={s}", .{@errorName(err)});
+                        break :blk null;
+                    }
+                    break :blk evidence;
+                } else null;
+                const failure_cause: types.ModelRecoveryCause = if (network_failure) |evidence|
                     switch (evidence.cause) {
-                        .transport_interrupted => .transport_interrupted,
-                        .system_resumed => .system_resumed,
+                        // Saved sessions name only causes every version reads.
+                        .transport_interrupted, .unreadable_reply => .network_interrupted,
                         .connectivity_lost => .connectivity_lost,
                         .stream_stalled => .provider_stream_timeout,
                     }
                 else
                     recovery_cause;
                 const failure_diagnostic = types.ModelFailureDiagnostic.init(@errorName(err));
-                latest_recovery_diagnostic = failure_diagnostic;
-                if (recoveryPauseRequested(config)) {
-                    try persistRecoveryCheckpoint(
-                        deps,
-                        finalization,
-                        job,
-                        within_turn_suffix.items,
-                        stream_ctx.interruption_source_or(""),
-                        gateway_model,
-                        selected_fast_mode,
-                        route_fast_mode,
-                        semantic_limit,
-                        consumed_attempts,
-                        false,
-                        failure_cause,
-                        .pause,
-                        effectiveRecoveryToolEvidence(
-                            preserved_tool_evidence,
-                            null,
-                            &stream_ctx,
-                        ),
-                        step_ctx,
-                    );
-                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                    try finishRecoveryPaused(
-                        deps,
-                        finalization,
-                        &stream_ctx,
-                        arena,
-                        &finish_trace,
-                        failure_cause,
-                        consumed_attempts,
-                        semantic_limit,
-                        pausedRequiredAction(effectiveRecoveryToolEvidence(
-                            preserved_tool_evidence,
-                            null,
-                            &stream_ctx,
-                        )),
-                        failure_diagnostic,
-                    );
-                    pending_auto_retry_status = null;
-                    return;
-                }
-                const failure_progress = stream_ctx.streamed_output_bytes;
-                if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
-                const had_previous_progress = recovery_last_progress != null;
-                if (recovery_last_progress != null and recovery_last_progress.? == failure_progress) {
-                    recovery_no_progress_streak += 1;
-                } else {
-                    recovery_no_progress_streak = 0;
-                }
-                recovery_last_progress = failure_progress;
-                const progress_evidence: model_response_recovery.Progress = if (recovery_no_progress_streak >= 2)
-                    .stalled
-                else if (had_previous_progress)
-                    .advancing
-                else
-                    .unknown;
-
-                var recovery_decision = if (network_failure) |evidence|
-                    model_response_recovery.decide(.{
-                        .cause = failure_cause,
-                        .delivery = switch (evidence.delivery) {
+                const failure_tool_evidence = effectiveRecoveryToolEvidence(
+                    preserved_tool_evidence,
+                    null,
+                    &stream_ctx,
+                );
+                const next_strategy: ?resend_strategy.Strategy = if (network_failure) |evidence|
+                    resend_strategy.select(
+                        switch (evidence.delivery) {
                             .definitely_unsent => .definitely_unsent,
                             .possibly_sent => .possibly_sent,
                         },
-                        .attempts = .{ .consumed = consumed_attempts, .limit = semantic_limit },
-                        .pacing = retry_pacing,
-                        .output = if (stream_ctx.interruption_source_or("").len > 0) .partial else .none,
-                        .tool = effectiveRecoveryToolEvidence(
-                            preserved_tool_evidence,
-                            null,
-                            &stream_ctx,
-                        ),
-                        .cancelled = cancel_requested,
-                        .progress = progress_evidence,
-                        .recovery_elapsed_ns = recoveryElapsedNs(recovery_started_at_ms),
-                    })
+                        failure_tool_evidence,
+                    )
                 else
-                    model_response_recovery.Decision{ .strategy = .stop };
+                    null;
                 const replay_safe = network_failure != null and streamReplaySafe(&stream_ctx);
+                // A resend that reconciles uncertain tool evidence must not
+                // start another tool, so a tool start ends the turn instead.
                 const reconciliation_tool_violation =
                     recovery_strategy == .reconcile_tool and stream_ctx.saw_tool_start;
-                if (reconciliation_tool_violation) {
-                    recovery_decision = .{
-                        .strategy = .pause,
-                        .required_action = .inspect_uncertain_tool,
-                    };
-                }
-                const will_auto_retry = recovery_decision.autoRecovers();
+                // Network failures wait and resend through the recovery
+                // module. Any other thrown error keeps its terminal path.
+                const failure_kind: ?runtime_request_recovery.Failure.Kind = if (network_failure) |evidence|
+                    if (evidence.cause == .unreadable_reply) .unreadable else runtime_request_recovery.failureKind(failure_cause)
+                else
+                    null;
+                const retryable = !cancel_requested and
+                    failure_kind != null and
+                    !reconciliation_tool_violation;
+                const will_auto_retry = retryable;
                 debug_trace.eventf(
                     "gateway",
                     "stream_error",
                     step_ctx,
-                    "err={s} cancel_requested={s} provider_attempts={d}/{d} saw_content={s} saw_tool_start={s} saw_provider_tool_start={s} recovery={s} replay_safe={s} retry={s}",
+                    "err={s} cancel_requested={s} attempt={d} saw_content={s} saw_tool_start={s} saw_provider_tool_start={s} recovery={s} replay_safe={s} retry={s}",
                     .{
                         @errorName(err),
                         if (cancel_requested) "true" else "false",
-                        consumed_attempts,
-                        semantic_limit,
+                        request_recovery.attempt(),
                         if (stream_ctx.saw_visible_text) "true" else "false",
                         if (stream_ctx.saw_tool_start) "true" else "false",
                         if (stream_ctx.saw_provider_tool_start) "true" else "false",
-                        @tagName(recovery_decision.strategy),
+                        if (next_strategy) |strategy| @tagName(strategy) else "stop",
                         if (replay_safe) "true" else "false",
                         if (will_auto_retry) "true" else "false",
                     },
@@ -8155,83 +8033,23 @@ fn processQueuedPromptLoop(
                     stream_ctx.interruption_source_or(""),
                     gateway_model,
                     selected_fast_mode,
-                    route_fast_mode,
-                    semantic_limit,
+                    attempt_fast_mode,
                     consumed_attempts,
                     false,
                     failure_cause,
-                    recovery_decision.strategy,
-                    effectiveRecoveryToolEvidence(
-                        preserved_tool_evidence,
-                        null,
-                        &stream_ctx,
-                    ),
+                    next_strategy orelse recovery_strategy,
+                    failure_tool_evidence,
                     step_ctx,
+                    .keep,
                 );
-                const auto_retry_status_published = will_auto_retry;
-                var retry_deadline: ?std.Io.Clock.Timestamp = null;
-                if (auto_retry_status_published) {
-                    retry_deadline = try pushAutoRetryStatus(
-                        deps,
-                        consumed_attempts,
-                        semantic_limit,
-                        failure_cause,
-                        recovery_decision,
-                        failure_diagnostic,
-                    );
-                }
-                const delay_completed = !will_auto_retry or wait_for_recovery_deadline(
-                    config.cancel_flag,
-                    retry_deadline.?,
-                );
-                if (recoveryPauseRequested(config)) {
-                    try persistRecoveryCheckpoint(
-                        deps,
-                        finalization,
-                        job,
-                        within_turn_suffix.items,
-                        stream_ctx.interruption_source_or(""),
-                        gateway_model,
-                        selected_fast_mode,
-                        route_fast_mode,
-                        semantic_limit,
-                        consumed_attempts,
-                        false,
-                        failure_cause,
-                        .pause,
-                        effectiveRecoveryToolEvidence(
-                            preserved_tool_evidence,
-                            null,
-                            &stream_ctx,
-                        ),
-                        step_ctx,
-                    );
-                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                    try finishRecoveryPaused(
-                        deps,
-                        finalization,
-                        &stream_ctx,
-                        arena,
-                        &finish_trace,
-                        failure_cause,
-                        consumed_attempts,
-                        semantic_limit,
-                        pausedRequiredAction(effectiveRecoveryToolEvidence(
-                            preserved_tool_evidence,
-                            null,
-                            &stream_ctx,
-                        )),
-                        failure_diagnostic,
-                    );
-                    return;
+                var delay_completed = true;
+                if (will_auto_retry) {
+                    _ = try request_recovery.failed(.{ .kind = failure_kind.? });
+                    delay_completed = try request_recovery.waitForSend() != null;
                 }
                 if (cancel_requested or !delay_completed) {
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
-                    try clearAutoRetryStatusIfNeeded(
-                        deps,
-                        recovery_strategy != null or auto_retry_status_published,
-                    );
-                    pending_auto_retry_status = null;
+                    try request_recovery.cancel();
                     try stream_ctx.provisional_statuses.finishTrackedCancelled(
                         deps,
                         stream_ctx.alloc,
@@ -8248,10 +8066,8 @@ fn processQueuedPromptLoop(
                         interruption_source,
                     )) {
                         reset_recovery_after_immediate_steering(
-                            &latest_recovery_diagnostic,
                             &recovery_strategy,
                             &recovery_cause,
-                            &retry_pacing,
                             &preserved_tool_evidence,
                         );
                         if (interruption_source.len > 0) {
@@ -8264,106 +8080,35 @@ fn processQueuedPromptLoop(
                     return;
                 }
                 if (will_auto_retry) {
-                    std.debug.assert(pending_auto_retry_status == null);
-                    pending_auto_retry_status = auto_retry_status(
-                        consumed_attempts + 1,
-                        semantic_limit,
-                        failure_cause,
-                        recovery_decision.strategy,
-                        inFlightDelaySeconds(recovery_decision.delay_ns),
-                        null,
-                        failure_diagnostic,
-                    );
-                    preserved_tool_evidence = effectiveRecoveryToolEvidence(
-                        preserved_tool_evidence,
-                        null,
-                        &stream_ctx,
-                    );
-                    recovery_strategy = recovery_decision.strategy;
+                    preserved_tool_evidence = failure_tool_evidence;
+                    recovery_strategy = next_strategy;
                     recovery_cause = failure_cause;
-                    retry_pacing = recovery_decision.next_pacing;
                     if (recovery_strategy == .regenerate_tool) {
                         recovery_has_unexecuted_tool_start = true;
                     }
-                    semantic_attempt = consumed_attempts;
                     reset_stream_for_next_attempt = true;
                     continue;
                 }
-                if (recovery_decision.strategy == .pause) {
+                if (reconciliation_tool_violation) {
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                    try finishRecoveryPaused(
+                    try finishUncertainToolReview(
                         deps,
+                        &request_recovery,
                         finalization,
                         &stream_ctx,
                         arena,
                         &finish_trace,
-                        failure_cause,
-                        consumed_attempts,
-                        semantic_limit,
-                        recoveryRequiredAction(recovery_decision.required_action),
                         failure_diagnostic,
                     );
                     return;
                 }
-                if (recovery_decision.required_action == .surface_stall) {
-                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                    try finishRecoveryStalled(
-                        deps,
-                        finalization,
-                        &stream_ctx,
-                        arena,
-                        &finish_trace,
-                        failure_cause,
-                        consumed_attempts,
-                        semantic_limit,
-                        failure_diagnostic,
-                        job,
-                        config,
-                        within_turn_suffix.items,
-                        stream_ctx.interruption_source_or(""),
-                        &interrupted_persisted,
-                        &stop_state.terminal_materializing,
-                        step_ctx,
-                    );
-                    return;
-                }
-                if (network_failure != null) {
-                    const exhausted_retryable =
-                        stream_ctx.interruption_source_or("").len == 0 and
-                        !stream_ctx.saw_provider_tool_start and
-                        consumed_attempts >= semantic_limit;
-                    if (replay_safe or exhausted_retryable) {
-                        try pushRouteRecoveryStatus(deps, .{
-                            .kind = .terminal_provider_error,
-                            .failed_attempt = consumed_attempts,
-                            .attempt_limit = semantic_limit,
-                            .cause = checkpointCause(failure_cause),
-                            .required_action = recoveryRequiredAction(recovery_decision.required_action),
-                            .diagnostic = failure_diagnostic,
-                        });
-                        pending_auto_retry_status = null;
-                        restorePromptAfterTerminalFailure(deps, job, config);
-                    } else {
-                        try pushUnsafeNoRetryStatus(
-                            deps,
-                            if (stream_ctx.saw_tool_start)
-                                .tool_start
-                            else
-                                .assistant_output,
-                            failure_diagnostic,
-                        );
-                        restorePromptAfterTerminalFailure(deps, job, config);
-                    }
-                } else if (semantic_attempt > 0) {
-                    try pushRouteRecoveryStatus(deps, .{
+                if (request_recovery.attempt() > 1) {
+                    try request_recovery.replaceStatus(.{
                         .kind = .terminal_provider_error,
-                        .failed_attempt = consumed_attempts,
-                        .attempt_limit = semantic_limit,
-                        .cause = checkpointCause(failure_cause),
-                        .required_action = recoveryRequiredAction(recovery_decision.required_action),
+                        .attempt = consumed_attempts,
+                        .cause = failure_cause,
                         .diagnostic = failure_diagnostic,
                     });
-                    pending_auto_retry_status = null;
                     restorePromptAfterTerminalFailure(deps, job, config);
                 }
                 try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
@@ -8403,11 +8148,6 @@ fn processQueuedPromptLoop(
                 }
                 return err;
             };
-            parent_turn_delivery.observeGatewayDelivery(
-                deps,
-                overlay_arena,
-                gateway_delivery.load(),
-            );
             stream_result_set = true;
             pushNetworkRecord(deps, job.provider, gateway_model, gateway_wait_started_ms, &stream_result);
             const first_failure = streamFailure(stream_result);
@@ -8436,19 +8176,15 @@ fn processQueuedPromptLoop(
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
+                    request_started_ms = replay_wait_started_ms;
                     stream_result = try streamMainCompletion(deps, arena, model_request);
                     pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
-                    parent_turn_delivery.observeGatewayDelivery(
-                        deps,
-                        overlay_arena,
-                        replay_delivery.load(),
-                    );
                     debug_trace.eventf(
                         "auth",
                         "authenticated_request_replayed",
                         step_ctx,
-                        "semantic_attempt={d}",
-                        .{semantic_attempt + 1},
+                        "attempt={d}",
+                        .{request_recovery.attempt()},
                     );
                 }
             }
@@ -8464,6 +8200,25 @@ fn processQueuedPromptLoop(
                 if (deps.record_usage) |record| record(deps.ctx, completion.usage) catch |err| {
                     debug_trace.logf("agent", "event=usage_not_saved err={s}", .{@errorName(err)});
                 };
+                armCacheWarming(deps, .{
+                    .candidate = .{
+                        .gateway_with_direct_credential = job.provider == .gateway and
+                            job.credential_source != .host_managed and active_api_key.len > 0,
+                        .model = gateway_model,
+                        .root_turn = config.origin == .root,
+                        .prompt_caching = request_data.provider_options.prompt_caching,
+                        .reasoning = request_data.provider_options.reasoning != null,
+                        .model_has_efforts = request_capabilities.reasoning_efforts.len > 0,
+                    },
+                    .provider = deps.agent_stream_provider,
+                    .body = prepared_request_body,
+                    .session_id = lifecycle.scope.session_id,
+                    .api_key = active_api_key,
+                    .credential_source = job.credential_source,
+                    .account_id = job.account_id,
+                    .gateway_team = job.gateway_team,
+                    .started_ms = request_started_ms,
+                });
                 // The completion buffer is step-scoped, so no cross-step
                 // dedupe: each completion reports its serving provider once.
                 // The push_event callback takes ownership of the payload on
@@ -8511,26 +8266,23 @@ fn processQueuedPromptLoop(
                     stream_ctx.interruption_source_or(""),
                     gateway_model,
                     selected_fast_mode,
-                    route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt + 1,
+                    attempt_fast_mode,
+                    request_recovery.attempt(),
                     false,
                     recovery_cause,
-                    .pause,
+                    .reconcile_tool,
                     .uncertain,
                     step_ctx,
+                    .keep,
                 );
                 try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                try finishRecoveryPaused(
+                try finishUncertainToolReview(
                     deps,
+                    &request_recovery,
                     finalization,
                     &stream_ctx,
                     arena,
                     &finish_trace,
-                    recovery_cause,
-                    semantic_attempt + 1,
-                    semantic_limit,
-                    .inspect_uncertain_tool,
                     types.ModelFailureDiagnostic.init("UnexpectedToolCallDuringReconciliation"),
                 );
                 return;
@@ -8617,7 +8369,7 @@ fn processQueuedPromptLoop(
                     &completed_tool_names,
                 );
             }
-            const settled_attempts = semantic_attempt + 1;
+            const settled_attempts: usize = request_recovery.attempt();
             if (job.provider == .gateway or
                 response_failure == null or response_failure.?.kind != .unauthorized)
             {
@@ -8629,8 +8381,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.interruption_source_or(response_completion.content orelse ""),
                     gateway_model,
                     selected_fast_mode,
-                    route_fast_mode,
-                    semantic_limit,
+                    attempt_fast_mode,
                     settled_attempts,
                     false,
                     recovery_cause,
@@ -8641,6 +8392,7 @@ fn processQueuedPromptLoop(
                         &stream_ctx,
                     ),
                     step_ctx,
+                    request_recovery.responseRecord(response_failure == null),
                 );
             }
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.reconcileTokenRequest(response_completion.usage, response_completion.delivery_ambiguous)) catch |progress_err| {
@@ -8649,11 +8401,12 @@ fn processQueuedPromptLoop(
             const gateway_wait_finished_ms = io_mod.milliTimestamp();
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
 
+            // `assistant_prefill_recovery_used` caps this repair at one resend
+            // per step; it does not go through the recovery module.
             const prefill_tool_name: ?[]const u8 = if (!assistant_prefill_recovery_used and
-                semantic_attempt + 1 < semantic_limit and
                 streamReplaySafe(&stream_ctx))
                 postToolAssistantPrefillRejection(
-                    if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
+                    if (response_failure) |failure| failureStatus(failure) else .ok,
                     if (response_failure) |failure| failure.detail orelse "" else "",
                     request_messages,
                 )
@@ -8664,8 +8417,8 @@ fn processQueuedPromptLoop(
                     "gateway",
                     "assistant_prefill_recovery",
                     step_ctx,
-                    "tool_name={s} provider_attempt={d}/{d}",
-                    .{ tool_name, semantic_attempt + 1, semantic_limit },
+                    "tool_name={s} attempt={d}",
+                    .{ tool_name, request_recovery.attempt() },
                 );
                 try within_turn_suffix.append(arena, .{
                     .role = .user,
@@ -8674,182 +8427,77 @@ fn processQueuedPromptLoop(
                 stream_result.deinit(arena);
                 stream_result_set = false;
                 assistant_prefill_recovery_used = true;
-                semantic_attempt += 1;
-                retry_pacing = .idle;
                 reset_stream_for_next_attempt = true;
                 continue;
             }
 
             if (response_failure) |failure| if (isRetryableModelFailure(failure.kind)) {
-                const cause: model_response_recovery.FailureCause = if (failure.kind == .rate_limited)
+                // 429 and 5xx wait and resend through the recovery module,
+                // which honors the server's Retry-After. Esc during the wait
+                // falls through to the cancel path below.
+                const cause: types.ModelRecoveryCause = if (failure.kind == .rate_limited)
                     .rate_limited
                 else
                     .provider_unavailable;
-                const diagnostic = try httpFailureDiagnostic(
-                    arena,
-                    failureHttpStatus(failure.kind),
-                    failure.detail orelse "",
+                const failure_tool_evidence = effectiveRecoveryToolEvidence(
+                    preserved_tool_evidence,
+                    response_completion,
+                    &stream_ctx,
                 );
-                latest_recovery_diagnostic = diagnostic;
-                const route_changed = disableFastRouteAfterFailure(
-                    &route_fast_mode,
-                    &gateway_model,
-                    job.model,
-                    cause,
-                    streamReplaySafe(&stream_ctx),
-                    step_ctx,
-                );
-                // HTTP-status failures (5xx, 429) carry no stream progress, so
-                // they are exempt from the no-progress detector and keep
-                // retrying patiently. The billable retry window still applies:
-                // past it, the cadence throttles instead of hammering.
-                if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
-                const recovery_elapsed_ns: u64 = recoveryElapsedNs(recovery_started_at_ms) orelse 0;
-                const decision = model_response_recovery.decide(.{
-                    .cause = cause,
-                    .delivery = .possibly_sent,
-                    .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
-                    .pacing = retry_pacing,
-                    .output = if (stream_ctx.interruption_source_or("").len > 0) .partial else .none,
-                    .tool = effectiveRecoveryToolEvidence(
-                        preserved_tool_evidence,
-                        response_completion,
-                        &stream_ctx,
-                    ),
-                    .retry_after_seconds = failure.retry_after_seconds,
-                    .cancelled = config.cancel_flag.load(.seq_cst),
-                    .recovery_elapsed_ns = recovery_elapsed_ns,
-                });
-                if (decision.strategy == .pause) {
-                    try persistRecoveryCheckpoint(
-                        deps,
-                        finalization,
-                        job,
-                        within_turn_suffix.items,
-                        stream_ctx.interruption_source_or(""),
-                        gateway_model,
-                        selected_fast_mode,
-                        route_fast_mode,
-                        semantic_limit,
-                        semantic_attempt + 1,
-                        false,
-                        cause,
-                        .pause,
-                        effectiveRecoveryToolEvidence(
-                            preserved_tool_evidence,
-                            response_completion,
-                            &stream_ctx,
-                        ),
-                        step_ctx,
-                    );
-                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                    try finishRecoveryPaused(
-                        deps,
-                        finalization,
-                        &stream_ctx,
-                        arena,
-                        &finish_trace,
-                        cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
-                        recoveryRequiredAction(decision.required_action),
-                        diagnostic,
-                    );
-                    return;
-                }
-                if (decision.reserve_provider_attempt) {
-                    if (route_changed) {
-                        try persistRecoveryCheckpoint(
-                            deps,
-                            finalization,
-                            job,
-                            within_turn_suffix.items,
-                            stream_ctx.interruption_source_or(""),
-                            gateway_model,
-                            selected_fast_mode,
-                            route_fast_mode,
-                            semantic_limit,
-                            semantic_attempt + 1,
-                            false,
-                            cause,
-                            decision.strategy,
-                            effectiveRecoveryToolEvidence(
-                                preserved_tool_evidence,
-                                response_completion,
-                                &stream_ctx,
-                            ),
-                            step_ctx,
-                        );
-                    }
-                    const retry_deadline = try pushAutoRetryStatus(
-                        deps,
-                        semantic_attempt + 1,
-                        semantic_limit,
-                        cause,
-                        decision,
-                        diagnostic,
-                    );
-                    if (wait_for_recovery_deadline(config.cancel_flag, retry_deadline)) {
-                        std.debug.assert(pending_auto_retry_status == null);
-                        pending_auto_retry_status = auto_retry_status(
-                            semantic_attempt + 2,
-                            semantic_limit,
-                            cause,
-                            decision.strategy,
-                            inFlightDelaySeconds(decision.delay_ns),
-                            null,
-                            diagnostic,
-                        );
-                        preserved_tool_evidence = effectiveRecoveryToolEvidence(
-                            preserved_tool_evidence,
-                            response_completion,
-                            &stream_ctx,
-                        );
+                if (!config.cancel_flag.load(.seq_cst)) {
+                    _ = try request_recovery.failed(.{
+                        // Both causes above are transient.
+                        .kind = runtime_request_recovery.failureKind(cause).?,
+                        .retry_after_ms = retryAfterMs(failure.retry_after_seconds),
+                    });
+                    if (try request_recovery.waitForSend() != null) {
+                        preserved_tool_evidence = failure_tool_evidence;
                         stream_result.deinit(arena);
                         stream_result_set = false;
-                        semantic_attempt += 1;
-                        recovery_strategy = decision.strategy;
+                        recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
                         recovery_cause = cause;
-                        retry_pacing = decision.next_pacing;
                         reset_stream_for_next_attempt = true;
                         continue;
                     }
-                    if (config.cancel_flag.load(.seq_cst)) {
-                        runtime_telemetry.traceCancelObserved(step_ctx, false);
-                        try clearAutoRetryStatusIfNeeded(deps, true);
-                        try finishPendingCancelledCalls(
-                            deps,
-                            &stream_ctx.provisional_statuses,
-                            stream_ctx.alloc,
-                            arena,
-                            config,
-                            turn_id,
-                            response_completion.tool_calls,
-                            advertised_dynamic_tool_names,
-                        );
-                        const interruption_source = stream_ctx.interruption_source_or("");
-                        if (try append_immediate_steering_after_cancel(
-                            deps,
-                            arena,
-                            &within_turn_suffix,
-                            turn_id,
-                            interruption_source,
-                        )) {
-                            reset_recovery_after_immediate_steering(
-                                &latest_recovery_diagnostic,
-                                &recovery_strategy,
-                                &recovery_cause,
-                                &retry_pacing,
-                                &preserved_tool_evidence,
-                            );
-                            if (interruption_source.len > 0) {
-                                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
-                            }
-                            continue :agent_steps_loop;
-                        }
-                        try persistCancelledTurn(deps, finalization, job, interruption_source, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
-                        finish_trace.finish("interrupted");
-                        return;
+                }
+            };
+
+            // On a host that can ask, an error that resending alone cannot fix
+            // waits for the user: Enter or a picker choice resends the
+            // request unchanged, and Esc ends the turn through the cancel
+            // path below. Cancelling the out-of-credits picker, or choosing
+            // another model, ends it on the error.
+            if (response_failure) |failure| if (request_recovery.canAskUser() and
+                !config.cancel_flag.load(.seq_cst))
+            {
+                if (needsUserFailureKind(arena, failure, job.credential_source)) |kind| {
+                    // The provider's reason stays visible while fx waits, and
+                    // after Esc, so the user knows what to change. A sign-in
+                    // needs no reason: fx opens it.
+                    if (kind != .sign_in) {
+                        try pushWaitingHttpFailureReason(deps, arena, failure, job, request_capabilities);
+                        http_failure_notice_shown = true;
+                    }
+                    switch (try waitForUser(&request_recovery, deps, kind)) {
+                        .resend => {
+                            stream_result.deinit(arena);
+                            stream_result_set = false;
+                            http_failure_notice_shown = false;
+                            // The resend uses the credential the sign-in stored.
+                            if (kind == .sign_in) credential_reload_pending = true;
+                            recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
+                            reset_stream_for_next_attempt = true;
+                            continue;
+                        },
+                        .switch_model => {
+                            // The prompt goes back to the composer before the
+                            // picker opens, so the picker keeps it as the
+                            // draft and the user can send it again on the new
+                            // model.
+                            restorePromptAfterTerminalFailure(deps, job, config);
+                            try deps.push_event(deps.ctx, .open_model_picker);
+                        },
+                        .cancelled => {},
                     }
                 }
             };
@@ -8867,7 +8515,7 @@ fn processQueuedPromptLoop(
 
             if (config.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, false);
-                try clearAutoRetryStatusIfNeeded(deps, recovery_strategy != null);
+                try request_recovery.cancel();
                 try finishPendingCancelledCalls(
                     deps,
                     &stream_ctx.provisional_statuses,
@@ -8889,10 +8537,8 @@ fn processQueuedPromptLoop(
                     interruption_source,
                 )) {
                     reset_recovery_after_immediate_steering(
-                        &latest_recovery_diagnostic,
                         &recovery_strategy,
                         &recovery_cause,
-                        &retry_pacing,
                         &preserved_tool_evidence,
                     );
                     if (interruption_source.len > 0) {
@@ -8929,32 +8575,31 @@ fn processQueuedPromptLoop(
                             "agent",
                             "response_language_mismatch",
                             step_ctx,
-                            "expected={s} observed={s} model={s} attempt={d}/{d} retry=false tool_calls=true prose_discarded=true",
+                            "expected={s} observed={s} model={s} attempt={d} retry=false tool_calls=true prose_discarded=true",
                             .{
                                 @tagName(response_language_expectation.?),
                                 @tagName(candidate_language.script.?),
                                 gateway_model,
-                                semantic_attempt + 1,
-                                semantic_limit,
+                                request_recovery.attempt(),
                             },
                         );
                         stream_ctx.drop_staged_response_language_candidate();
                     },
                     .retry_once, .fail_without_commit => {
                         const observed = candidate_language.script.?;
-                        const can_retry = language_decision == .retry_once and
-                            semantic_attempt + 1 < semantic_limit;
+                        // `retry_once` is the cap: one correction per turn,
+                        // outside the recovery module.
+                        const can_retry = language_decision == .retry_once;
                         debug_trace.eventf(
                             "agent",
                             "response_language_mismatch",
                             step_ctx,
-                            "expected={s} observed={s} model={s} attempt={d}/{d} retry={s}",
+                            "expected={s} observed={s} model={s} attempt={d} retry={s}",
                             .{
                                 @tagName(response_language_expectation.?),
                                 @tagName(observed),
                                 gateway_model,
-                                semantic_attempt + 1,
-                                semantic_limit,
+                                request_recovery.attempt(),
                                 if (can_retry) "true" else "false",
                             },
                         );
@@ -8969,7 +8614,6 @@ fn processQueuedPromptLoop(
                             stream_ctx.drop_staged_response_language_candidate();
                             stream_result.deinit(arena);
                             stream_result_set = false;
-                            semantic_attempt += 1;
                             response_language_correction_attempted = true;
                             reset_stream_for_next_attempt = true;
                             continue;
@@ -8997,239 +8641,100 @@ fn processQueuedPromptLoop(
                 (attempt_disposition == .interrupted or
                     attempt_disposition == .provider_failure))
             {
+                // A response cut short or ended by a provider error waits and
+                // resends through the recovery module. Content-filter and
+                // non-retryable endings keep their terminal path below.
                 const finish_reason = attempt_completion.finish_reason;
-                const cause: model_response_recovery.FailureCause = if (attempt_completion.provider_failure_cause == .gateway_stream_timeout)
+                const failure_cause = attempt_completion.provider_failure_cause;
+                const content_filtered = attempt_disposition == .provider_failure and
+                    finish_reason.? == .content_filter;
+                const cause: types.ModelRecoveryCause = if (failure_cause == .gateway_stream_timeout)
                     .provider_stream_timeout
-                else if (attempt_completion.provider_failure_cause == .rate_limited)
+                else if (failure_cause == .rate_limited)
                     .rate_limited
                 else if (attempt_disposition == .interrupted)
                     .response_interrupted
-                else if (finish_reason.? == .content_filter)
-                    .content_filter
                 else
                     .provider_unavailable;
                 const diagnostic = try providerCompletionDiagnostic(
                     arena,
                     attempt_completion,
-                    defaultRecoveryDiagnosticText(cause),
+                    if (content_filtered) "content_filter" else types.ModelFailureDiagnostic.defaultTextForCause(cause),
                 );
                 attempt_failure_diagnostic = diagnostic;
-                latest_recovery_diagnostic = diagnostic;
-                const non_retryable = attempt_completion.provider_failure_cause == .non_retryable;
-                // Interrupted streams and provider-error completions carry
-                // progress evidence; bare HTTP status failures (5xx, 429) and
-                // gateway timeout metadata are exempt from the stall detector.
-                const failure_progress = stream_ctx.streamed_output_bytes;
-                const track_progress = cause == .response_interrupted or
-                    (attempt_disposition == .provider_failure and cause == .provider_unavailable);
-                if (track_progress) {
-                    if (recovery_started_at_ms == null) recovery_started_at_ms = io_mod.milliTimestamp();
-                    if (recovery_last_progress != null and recovery_last_progress.? == failure_progress) {
-                        recovery_no_progress_streak += 1;
-                    } else {
-                        recovery_no_progress_streak = 0;
-                    }
-                    recovery_last_progress = failure_progress;
-                }
-                const decision = if (non_retryable)
-                    model_response_recovery.Decision{ .strategy = .stop, .required_action = .change_request }
+                // A content filter waits for the user on a host that can ask,
+                // and ends the turn elsewhere, as other non-retryable endings do.
+                const failure_kind: ?runtime_request_recovery.Failure.Kind = if (content_filtered)
+                    (if (request_recovery.canAskUser()) .content_filter else null)
+                else if (failure_cause == .non_retryable)
+                    null
                 else
-                    model_response_recovery.decide(.{
-                        .cause = cause,
-                        .delivery = .possibly_sent,
-                        .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
-                        .pacing = retry_pacing,
-                        .output = if (partial_assistant.len > 0) .partial else .none,
-                        .tool = effectiveRecoveryToolEvidence(
-                            preserved_tool_evidence,
-                            attempt_completion,
-                            &stream_ctx,
-                        ),
-                        .cancelled = config.cancel_flag.load(.seq_cst),
-                        .progress = if (track_progress and recovery_no_progress_streak >= 2)
-                            .stalled
-                        else
-                            .unknown,
-                        .recovery_elapsed_ns = recoveryElapsedNs(recovery_started_at_ms),
-                    });
+                    runtime_request_recovery.failureKind(cause);
+                const retryable = failure_kind != null and !config.cancel_flag.load(.seq_cst);
+                const retries = retryable;
                 if (attempt_disposition == .provider_failure or
-                    attempt_completion.provider_failure_cause == .gateway_stream_timeout)
+                    failure_cause == .gateway_stream_timeout)
                 {
                     traceRouteFailure(
                         step_ctx,
                         job.model,
                         gateway_model,
-                        route_fast_mode,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        attempt_fast_mode,
+                        request_recovery.attempt(),
                         attempt_completion,
                         &stream_ctx,
-                        decision.reserve_provider_attempt,
+                        retries,
                     );
                 }
-                const route_changed = !non_retryable and disableFastRouteAfterFailure(
-                    &route_fast_mode,
-                    &gateway_model,
-                    job.model,
-                    cause,
-                    providerFailureReplaySafe(attempt_completion, &stream_ctx),
-                    step_ctx,
-                );
-                if (decision.strategy == .pause) {
-                    try persistRecoveryCheckpoint(
-                        deps,
-                        finalization,
-                        job,
-                        within_turn_suffix.items,
-                        partial_assistant,
-                        gateway_model,
-                        selected_fast_mode,
-                        route_fast_mode,
-                        semantic_limit,
-                        semantic_attempt + 1,
-                        false,
-                        cause,
-                        .pause,
-                        effectiveRecoveryToolEvidence(
-                            preserved_tool_evidence,
-                            attempt_completion,
-                            &stream_ctx,
-                        ),
-                        step_ctx,
-                    );
-                    try finishRecoveryPaused(
-                        deps,
-                        finalization,
+                if (retries) {
+                    const failure_tool_evidence = effectiveRecoveryToolEvidence(
+                        preserved_tool_evidence,
+                        attempt_completion,
                         &stream_ctx,
-                        arena,
-                        &finish_trace,
-                        cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
-                        recoveryRequiredAction(decision.required_action),
-                        diagnostic,
                     );
-                    return;
-                }
-                if (decision.required_action == .surface_stall) {
-                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                    try finishRecoveryStalled(
-                        deps,
-                        finalization,
-                        &stream_ctx,
-                        arena,
-                        &finish_trace,
-                        cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
-                        diagnostic,
-                        job,
-                        config,
-                        within_turn_suffix.items,
-                        partial_assistant,
-                        &interrupted_persisted,
-                        &stop_state.terminal_materializing,
-                        step_ctx,
-                    );
-                    return;
-                }
-                const decision_auto_recovers = decision.autoRecovers();
-                if (decision_auto_recovers) {
-                    if (route_changed and decision.reserve_provider_attempt) {
-                        try persistRecoveryCheckpoint(
-                            deps,
-                            finalization,
-                            job,
-                            within_turn_suffix.items,
-                            partial_assistant,
-                            gateway_model,
-                            selected_fast_mode,
-                            route_fast_mode,
-                            semantic_limit,
-                            semantic_attempt + 1,
-                            false,
-                            cause,
-                            decision.strategy,
-                            effectiveRecoveryToolEvidence(
-                                preserved_tool_evidence,
-                                attempt_completion,
-                                &stream_ctx,
-                            ),
-                            step_ctx,
-                        );
-                    }
-                    const retry_deadline = try pushAutoRetryStatus(
-                        deps,
-                        semantic_attempt + 1,
-                        semantic_limit,
-                        cause,
-                        decision,
-                        diagnostic,
-                    );
-                    if (wait_for_recovery_deadline(config.cancel_flag, retry_deadline)) {
-                        std.debug.assert(pending_auto_retry_status == null);
-                        pending_auto_retry_status = auto_retry_status(
-                            semantic_attempt + 2,
-                            semantic_limit,
-                            cause,
-                            decision.strategy,
-                            inFlightDelaySeconds(decision.delay_ns),
-                            null,
-                            diagnostic,
-                        );
-                        preserved_tool_evidence = effectiveRecoveryToolEvidence(
-                            preserved_tool_evidence,
-                            attempt_completion,
-                            &stream_ctx,
-                        );
-                        // Probes and connectivity waits are not provider
-                        // attempts: nothing billable was sent.
-                        if (decision.reserve_provider_attempt) semantic_attempt += 1;
-                        recovery_strategy = decision.strategy;
+                    _ = try request_recovery.failed(.{ .kind = failure_kind.? });
+                    if (try request_recovery.waitForSend() != null) {
+                        preserved_tool_evidence = failure_tool_evidence;
+                        recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
                         recovery_cause = cause;
-                        retry_pacing = decision.next_pacing;
-                        if (decision.strategy == .regenerate_tool) {
+                        if (recovery_strategy == .regenerate_tool) {
                             recovery_has_unexecuted_tool_start = true;
                         }
                         reset_stream_for_next_attempt = true;
                         continue;
                     }
-                    if (config.cancel_flag.load(.seq_cst)) {
-                        runtime_telemetry.traceCancelObserved(step_ctx, false);
-                        try clearAutoRetryStatusIfNeeded(deps, true);
-                        try finishPendingCancelledCalls(
-                            deps,
-                            &stream_ctx.provisional_statuses,
-                            stream_ctx.alloc,
-                            arena,
-                            config,
-                            turn_id,
-                            attempt_completion.tool_calls,
-                            advertised_dynamic_tool_names,
+                    runtime_telemetry.traceCancelObserved(step_ctx, false);
+                    try request_recovery.cancel();
+                    try finishPendingCancelledCalls(
+                        deps,
+                        &stream_ctx.provisional_statuses,
+                        stream_ctx.alloc,
+                        arena,
+                        config,
+                        turn_id,
+                        attempt_completion.tool_calls,
+                        advertised_dynamic_tool_names,
+                    );
+                    if (try append_immediate_steering_after_cancel(
+                        deps,
+                        arena,
+                        &within_turn_suffix,
+                        turn_id,
+                        partial_assistant,
+                    )) {
+                        reset_recovery_after_immediate_steering(
+                            &recovery_strategy,
+                            &recovery_cause,
+                            &preserved_tool_evidence,
                         );
-                        if (try append_immediate_steering_after_cancel(
-                            deps,
-                            arena,
-                            &within_turn_suffix,
-                            turn_id,
-                            partial_assistant,
-                        )) {
-                            reset_recovery_after_immediate_steering(
-                                &latest_recovery_diagnostic,
-                                &recovery_strategy,
-                                &recovery_cause,
-                                &retry_pacing,
-                                &preserved_tool_evidence,
-                            );
-                            if (partial_assistant.len > 0) {
-                                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
-                            }
-                            continue :agent_steps_loop;
+                        if (partial_assistant.len > 0) {
+                            try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                         }
-                        try persistCancelledTurn(deps, finalization, job, partial_assistant, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
-                        finish_trace.finish("interrupted");
-                        return;
+                        continue :agent_steps_loop;
                     }
+                    try persistCancelledTurn(deps, finalization, job, partial_assistant, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                    finish_trace.finish("interrupted");
+                    return;
                 }
             }
             if (streamSucceeded(stream_result) and attempt_disposition == .provider_failure) {
@@ -9263,15 +8768,13 @@ fn processQueuedPromptLoop(
                 } else if (finish_reason == .provider_error) {
                     if (replay_safe) {
                         try pushTerminalProviderFailureStatus(
-                            deps,
-                            semantic_attempt + 1,
-                            semantic_limit,
+                            &request_recovery,
                             attempt_completion,
                             diagnostic,
                         );
                     } else {
                         try pushUnsafeNoRetryStatus(
-                            deps,
+                            &request_recovery,
                             unsafeNoRetryReason(attempt_completion, &stream_ctx),
                             diagnostic,
                         );
@@ -9281,36 +8784,22 @@ fn processQueuedPromptLoop(
 
                 if (finish_reason == .content_filter) {
                     try pushTerminalProviderFailureStatus(
-                        deps,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        &request_recovery,
                         attempt_completion,
                         diagnostic,
                     );
-                    if (deps.request_route_recovery) |recover| {
-                        const decision = try recover(deps.ctx, arena, .{
-                            .selected_model = job.model,
-                            .route_model = gateway_model,
-                            .fast_mode = route_fast_mode,
-                            .replay_safe = false,
-                            .finish_reason = finish_reason,
-                            .semantic_attempts = semantic_attempt + 1,
-                            .provider_failure_detail = attempt_completion.provider_failure_detail,
-                        });
-                        debug_trace.eventf("agent", "route_recovery_decision", step_ctx, "decision={s} replay_safe=false", .{@tagName(decision)});
-                        switch (decision) {
-                            .switch_model, .cancel => {
-                                finish_trace.finish("route_recovery_stopped");
-                                return error.RouteRecoveryStopped;
-                            },
-                            .disable_fast => {},
-                        }
-                    }
                 }
                 finish_trace.finish(if (finish_reason == .provider_error) "provider_error" else "content_filter");
                 return error.ModelError;
             }
 
+            // Only a complete response finishes the request; the terminal
+            // outcomes after the loop keep fx's handling.
+            if (streamSucceeded(stream_result) and
+                (settled_disposition == .completed or settled_disposition == .length_limited))
+            {
+                try request_recovery.succeeded();
+            }
             successful_gateway_model = gateway_model;
             successful_request_cost = request_cost_for_attempt;
             successful_vision_route = vision_route;
@@ -9366,16 +8855,9 @@ fn processQueuedPromptLoop(
                 ).len > 0;
                 if (!has_novel_content) {
                     try stream_ctx.start_response();
-                    if (successful_recovery_strategy != null) {
-                        try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
-                    }
-                    latest_recovery_diagnostic = null;
                     recovery_strategy = null;
-                    recovery_cause = .transport_interrupted;
+                    recovery_cause = .network_interrupted;
                     preserved_tool_evidence = .none;
-                    recovery_started_at_ms = null;
-                    recovery_last_progress = null;
-                    recovery_no_progress_streak = 0;
                     continue;
                 }
                 completion.finish_reason = .stop;
@@ -9390,16 +8872,13 @@ fn processQueuedPromptLoop(
         const partial_assistant = current_partial_assistant;
 
         if (streamFailure(stream_result)) |failure| {
-            const detail = if (failure.detail) |body| std.mem.trim(u8, body, " \r\n\t") else "";
-            const clipped = detail[0..@min(detail.len, http_error_detail_max_bytes)];
-            const http_detail = try runtime_gateway_step.gatewayHttpErrorDetail(
-                arena,
-                failureHttpStatus(failure.kind),
-                clipped,
-                job.model,
-                request_capabilities,
-            );
-            try deps.push_http_error(deps.ctx, failureHttpStatus(failure.kind), http_detail, job.credential_source);
+            // Every exit below returns normally, so the request reports its
+            // end here rather than through the step's errdefer.
+            request_recovery.endWithError();
+            if (!http_failure_notice_shown) {
+                const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
+                try deps.push_http_error(deps.ctx, failureStatus(failure), http_detail, job.credential_source);
+            }
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;
                 const assistant_text = try runtime_finalization.stopTerminalText(
@@ -9462,10 +8941,8 @@ fn processQueuedPromptLoop(
             .completed, .length_limited => {},
             .interrupted => {
                 try pushTerminalAutoRetryStatusIfNeeded(
-                    deps,
+                    &request_recovery,
                     successful_recovery_strategy != null,
-                    semantic_attempt,
-                    semantic_limit,
                     types.ModelFailureDiagnostic.init("StreamInterrupted"),
                 );
                 debug_trace.eventf("agent", "provider_finish_missing", step_ctx, "content_bytes={d} tool_call_count={d}", .{
@@ -9487,10 +8964,8 @@ fn processQueuedPromptLoop(
             },
             .invalid_completion => {
                 try pushTerminalAutoRetryStatusIfNeeded(
-                    deps,
+                    &request_recovery,
                     successful_recovery_strategy != null,
-                    semantic_attempt,
-                    semantic_limit,
                     types.ModelFailureDiagnostic.init("InvalidProviderCompletion"),
                 );
                 const finish_reason = completion.finish_reason.?;
@@ -9508,10 +8983,8 @@ fn processQueuedPromptLoop(
         }
         if (successful_vision_mode == .required and completion.tool_calls.len == 0) {
             try pushTerminalAutoRetryStatusIfNeeded(
-                deps,
+                &request_recovery,
                 successful_recovery_strategy != null,
-                semantic_attempt,
-                semantic_limit,
                 types.ModelFailureDiagnostic.init("RequiredVisionToolCallMissing"),
             );
             debug_trace.eventf(
@@ -9535,17 +9008,9 @@ fn processQueuedPromptLoop(
             recovery_has_unexecuted_tool_start = false;
         }
         const finish_reason = completion.finish_reason.?;
-        if (successful_recovery_strategy != null) {
-            try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
-        }
-        latest_recovery_diagnostic = null;
         recovery_strategy = null;
-        recovery_cause = .transport_interrupted;
-        retry_pacing = .idle;
+        recovery_cause = .network_interrupted;
         preserved_tool_evidence = .none;
-        recovery_started_at_ms = null;
-        recovery_last_progress = null;
-        recovery_no_progress_streak = 0;
 
         if (deps.report_usage) |report_fn| {
             if (completion.usage.input_tokens != null or completion.usage.output_tokens != null) {
@@ -9655,32 +9120,50 @@ fn processQueuedPromptLoop(
             "agent",
             "assistant_completion",
             step_ctx,
-            "content_bytes={d} tool_call_count={d} finish_reason={s}",
+            "content_bytes={d} tool_call_count={d} finish_reason={s} provider_finish_reason={s}",
             .{
                 if (completion.content) |content| content.len else 0,
                 completion.tool_calls.len,
                 finish_reason.label(),
+                completion.finish_reason_raw.slice(),
             },
         );
         try runtime_telemetry.traceReturnedToolCalls(arena, step_ctx, completion.tool_calls);
-        // A reply the provider cut short before any text or tool call, from a
-        // request that named no output limit, ran out of the provider's own
-        // default. A provider that takes fx's limit gets the request once more
-        // with one.
-        const empty_length_retry: ?u32 = if (disposition == .length_limited and
-            completion.tool_calls.len == 0 and
+        // A reply the provider cut short before any text, such as reasoning
+        // that never reached an answer followed at most by tool calls cut off
+        // mid-arguments, is dropped and asked once more when the resend can
+        // differ: with fx's limit when the request named none and the
+        // provider takes one, since the provider's own default ran out, and at
+        // `low` effort when that reasons less. A resend's own reply, visible
+        // text, tool calls the provider already ran, and a resend that would
+        // repeat the request end the turn as before.
+        const may_resend = disposition == .length_limited and
+            resend_effort == null and
             std.mem.trim(u8, partial_assistant, " \t\r\n").len == 0 and
+            !hasProviderExecutedCall(completion.tool_calls) and
+            agent_steps.allowsStep(config.agent_step_limit, step + 1);
+        const raised_limit: ?u32 = if (may_resend and
             length_retry_output_tokens == null and
             config.provider_capabilities.sends_output_limit and
-            model_capabilities.requestOutputTokens(request_capabilities) == null and
-            agent_steps.allowsStep(config.agent_step_limit, step + 1))
+            model_capabilities.requestOutputTokens(request_capabilities) == null)
             model_capabilities.emptyLengthRetryOutputTokens(request_capabilities)
         else
             null;
-        if (empty_length_retry) |limit| {
-            length_retry_output_tokens = limit;
-            debug_trace.eventf("agent", "empty_length_limited_retry", step_ctx, "max_output_tokens={d}", .{limit});
-            try deps.push_text(deps.ctx, .{ .operational = empty_length_retry_notice });
+        const lowered_effort = if (may_resend)
+            model_capabilities.lengthResendEffort(request_capabilities, step_effort)
+        else
+            null;
+        if (raised_limit != null or lowered_effort != null) {
+            if (raised_limit) |limit| length_retry_output_tokens = limit;
+            const effort = lowered_effort orelse step_effort;
+            length_resend_effort = effort;
+            try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+            debug_trace.eventf("agent", "length_limited_resend", step_ctx, "dropped_tool_calls={d} max_output_tokens={any} effort={s}", .{
+                completion.tool_calls.len,
+                raised_limit,
+                effort.label(),
+            });
+            try deps.push_text(deps.ctx, .{ .operational = lengthResendNotice(raised_limit != null, lowered_effort != null) });
             try deps.push_text(deps.ctx, .{ .operational = "\n" });
             continue;
         }
@@ -9698,16 +9181,7 @@ fn processQueuedPromptLoop(
                 completion.tool_calls.len,
             });
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(
-                    deps,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    assistant_text,
-                    provider_replay,
-                    config.origin,
-                    .finalizing,
-                ))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, assistant_text, provider_replay, .finalizing))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue :agent_steps_loop;
@@ -9738,7 +9212,7 @@ fn processQueuedPromptLoop(
             const finish_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items);
             const completed_summary = summary_accumulator.finish();
             var turn: HistoryTurn = .{ .assistant = .{
-                .user = .{ .text = job.prompt, .images = job.images },
+                .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.persistedExecution(arena, finish_execution),
             } };
@@ -9755,8 +9229,11 @@ fn processQueuedPromptLoop(
         if (completion.tool_calls.len == 0) {
             const has_content =
                 std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
+            const empty_other = finish_reason == .other and !has_content;
+            if (!empty_other) empty_reply_nudged = false;
             const needs_continuation =
                 disposition == .completed and
+                !empty_other and
                 !continuation_injected and
                 silent_tool_steps >= 2 and
                 !has_content;
@@ -9769,42 +9246,62 @@ fn processQueuedPromptLoop(
                     if (completion.content) |content| content.len else 0,
                     if (completion.provider_state_json != null) "true" else "false",
                 });
-                if (provider_replay) |state| {
-                    try within_turn_suffix.append(arena, .{
-                        .role = .assistant,
-                        .content = completion.content,
-                        .provider_replay = state,
-                    });
-                }
-                try within_turn_suffix.append(arena, .{ .role = .user, .content = continuation_prompt });
+                try appendContinuationPrompt(arena, &within_turn_suffix, completion.content, provider_replay, continuation_prompt);
                 continue;
             }
 
             const empty_final: []const u8 = if (disposition == .length_limited) empty_length_limited_reply else "Done.";
-            const raw_final = if (has_content) partial_assistant else empty_final;
+            // A stalled reply keeps no stand-in text, so steering or a subagent's
+            // report that continues the turn below never saves "Done." for it
+            // (`tests/e2e/gateway-stream-lifecycle.test.ts` "an empty reply that
+            // stops for another reason gives way to a subagent's report, with no
+            // Done.").
+            const raw_final = if (has_content) partial_assistant else if (empty_other) "" else empty_final;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else empty_final;
             const history_text = try arena.dupe(u8, raw_final);
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(
-                    deps,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    history_text,
-                    history_replay,
-                    config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
-                ))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
             }
 
-            if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
+            if (empty_other) {
+                const provider_reason = completion.finish_reason_raw.slice();
+                // One nudge per stall, and never past the step limit
+                // (`tests/tla/agent_runtime/EmptyReply.tla` NoDoubleNudge, StepsBounded).
+                const nudge = !empty_reply_nudged and agent_steps.allowsStep(config.agent_step_limit, step + 1);
+                debug_trace.eventf("agent", if (nudge) "empty_reply_nudge" else "empty_reply_failed", step_ctx, "provider_finish_reason={s} after_nudge={s}", .{
+                    provider_reason,
+                    if (empty_reply_nudged) "true" else "false",
+                });
+                if (nudge) {
+                    empty_reply_nudged = true;
+                    try deps.push_text(deps.ctx, .{ .operational = try emptyReplyNotice(arena, provider_reason, empty_reply_asking) });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                    try appendContinuationPrompt(arena, &within_turn_suffix, completion.content, provider_replay, empty_reply_nudge_prompt);
+                    continue;
+                }
+                // A second empty reply in a row, or one with no step left:
+                // the turn failed, and the notice says why instead of "Done."
+                // (`tests/tla/agent_runtime/EmptyReply.tla` NoPlaceholder).
+                try finishFailedTurnWithNotice(
+                    deps,
+                    finalization,
+                    arena,
+                    job,
+                    within_turn_suffix.items,
+                    &summary_accumulator,
+                    stop_state,
+                    &finish_trace,
+                    try emptyReplyNotice(arena, provider_reason, empty_reply_follow_up),
+                    "empty_reply",
+                );
+                return;
+            }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
@@ -9828,8 +9325,7 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt + 1,
+                    request_recovery.attempt(),
                     recovery_cause,
                     step_ctx,
                 );
@@ -9913,7 +9409,7 @@ fn processQueuedPromptLoop(
             switch (stop_outcome) {
                 .allow => {
                     if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, stop_state))
                         continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
@@ -10314,6 +9810,7 @@ fn processQueuedPromptLoop(
         try appendRunningToolCalls(deps, finalization, job, within_turn_suffix.items, effective_tool_calls);
 
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
+        empty_reply_nudged = false;
         if (step_has_content) {
             const first_tool_is_ask = effective_tool_calls.len > 0 and
                 runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
@@ -10744,6 +10241,7 @@ fn processQueuedPromptLoop(
                         .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                         .max_tool_result_bytes = config.max_tool_result_bytes,
                         .classification_complete = executable_classification_complete.items,
+                        .presentation_group_id = stream_ctx.provisional_statuses.presentation_group_id,
                     };
                     var completion_publisher = ParallelSubagentCompletionPublisher{
                         .deps = deps,
@@ -12105,6 +11603,7 @@ fn processQueuedPromptLoop(
                 else
                     false,
                 .lifecycle_id = execution_lifecycle_id,
+                .presentation_group_id = stream_ctx.provisional_statuses.presentation_group_id,
             }) catch |err| blk: {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
@@ -12504,15 +12003,7 @@ fn processQueuedPromptLoop(
         );
         if (malformed_arguments_retry.finishBatch()) {
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                const terminal_action = try observe_steering_boundary(
-                    deps,
-                    arena,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    config.origin,
-                    .finalizing,
-                );
+                const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
                     // The turn is already ending; an ineligible prompt runs as
                     // the next turn after the normal terminal finish.
@@ -12543,15 +12034,7 @@ fn processQueuedPromptLoop(
         }
         if (terminal_validation_retry.finishBatch()) {
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                const terminal_action = try observe_steering_boundary(
-                    deps,
-                    arena,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    config.origin,
-                    .finalizing,
-                );
+                const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
                     .handoff, .none => {},
                     .continued => continue :agent_steps_loop,
@@ -12586,17 +12069,9 @@ fn processQueuedPromptLoop(
             );
             return;
         }
-        if (shell_execution_failure_retry.finishBatch()) {
+        if (shell_execution_failure_retry.finishBatch(step_batch.step_changed_files)) {
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                const terminal_action = try observe_steering_boundary(
-                    deps,
-                    arena,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    config.origin,
-                    .finalizing,
-                );
+                const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
                     .handoff, .none => {},
                     .continued => continue :agent_steps_loop,
@@ -12629,23 +12104,11 @@ fn processQueuedPromptLoop(
             const rendered = if (final_text.len > 0) final_text else "Done.";
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(
-                    deps,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    raw_final,
-                    final_provider_replay,
-                    config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
-                ))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, raw_final, final_provider_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
             }
-
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -12667,8 +12130,7 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt + 1,
+                    request_recovery.attempt(),
                     recovery_cause,
                     step_ctx,
                 );
@@ -12747,7 +12209,7 @@ fn processQueuedPromptLoop(
             switch (stop_outcome) {
                 .allow => {
                     if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, stop_state))
                         continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
@@ -12847,7 +12309,7 @@ fn finishFailedTurnWithNotice(
     );
     const completed_summary = summary_accumulator.finish();
     var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images },
+        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
         .assistant = @constCast(notice),
         .execution = try finalization.persistedExecution(arena, execution_memory),
     } };

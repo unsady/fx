@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import tempfile
+import types
 import unittest
 
 from scripts.pgso import macos
@@ -27,11 +28,10 @@ from scripts.pgso.macos import (
 )
 from scripts.pgso.pipeline import (
     BENCHMARK_USE_FLAGS,
-    FX_MACHINE_OUTLINER_FLAGS,
+    FX_CODEGEN_FLAGS,
     GENERATION_FLAGS,
     IR_OUTLINER_FLAGS,
     OUTLINE_CLEANUP_FLAGS,
-    OUTLINE_PARTITIONS,
     PROFILE_PREPARATION_PASSES,
     USE_FLAGS,
     ArtifactSpec,
@@ -40,19 +40,21 @@ from scripts.pgso.pipeline import (
     cleanup_outlined_ir_argv,
     candidate_object_argv,
     emit_bitcode,
+    executed_functions,
+    exempt_cold_startup_functions,
     instrumentation_argv,
     instrumented_run_argv,
-    link_outlined_ir_argv,
     link_candidate,
+    keep_startup_profile,
     merge_profile_batch,
     parse_compiler_runtime,
     outline_ir_argv,
     profile_use_argv,
     reject_profile_outputs,
+    remove_profile_records,
     validate_archive_unchanged,
     validate_bitcode_hash,
     validate_candidate_size,
-    split_ir_argv,
     verify_release_safe_ir,
     zig_build_argv,
     zig_build_env,
@@ -253,8 +255,6 @@ class PgsoPipelineTests(unittest.TestCase):
             "llvm_profdata": tool_root / "llvm-profdata",
             "llvm_ar": tool_root / "llvm-ar",
             "llvm_nm": tool_root / "llvm-nm",
-            "llvm_link": tool_root / "llvm-link",
-            "llvm_split": tool_root / "llvm-split",
             "clang": tool_root / "clang",
             "libllvm": self.root / "libLLVM.dylib",
             "ir_size": tool_root / "ir_size.py",
@@ -400,7 +400,7 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
 
         self.assertEqual(paths.profile_use_bitcode, result)
         lines = actions.read_text().splitlines()
-        self.assertEqual(7, len(lines))
+        self.assertEqual(10, len(lines))
         self.assertIn(f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc ", lines[0])
         self.assertTrue(lines[0].endswith(f"-o {paths.profile_use_base_bitcode}"))
         base = paths.profile_use_base_bitcode
@@ -411,7 +411,14 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
         self.assertIn(f"-passes=iroutliner {swapped} -o {paths.profile_use_bitcode}", lines[3])
         self.assertTrue(lines[4].endswith(f"check-outlined {paths.profile_use_bitcode}"))
         self.assertIn(f"sparse-constants {paths.profile_use_bitcode} ", lines[5])
-        self.assertIn("-passes=globaldce,verify", lines[6])
+        sparse = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".sparse")
+        overlaid = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".overlaid")
+        zero_filled = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".zero-filled")
+        compacted = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".compacted")
+        self.assertIn(f"overlay-constants {sparse} {overlaid}", lines[6])
+        self.assertIn(f"zero-fill-globals {overlaid} {zero_filled}", lines[7])
+        self.assertIn(f"compact-error-names {zero_filled} {compacted}", lines[8])
+        self.assertIn(f"-passes=globaldce,verify {compacted} -o {paths.profile_use_bitcode}", lines[9])
 
     def test_profile_use_stops_when_the_outliner_folds_a_nested_constant(self) -> None:
         actions = self.root / "folded-actions"
@@ -472,7 +479,6 @@ print('{{}}')""",
             ("-internalize-public-api-list=main,_mh_execute_header",),
             macos.public_api_flags(self.toolchain, self.paths),
         )
-        self.assertEqual(2, OUTLINE_PARTITIONS)
         self.assertEqual(
             (
                 "--disable-vp",
@@ -486,8 +492,9 @@ print('{{}}')""",
         self.assertEqual(
             (
                 "-machine-outliner-reruns=1",
+                "-homogeneous-prolog-epilog",
             ),
-            FX_MACHINE_OUTLINER_FLAGS,
+            FX_CODEGEN_FLAGS,
         )
         self.assertEqual(
             (
@@ -535,54 +542,28 @@ print('{{}}')""",
                 mapped_profile,
             )[len(USE_FLAGS) + 1],
         )
+        source = self.paths.profile_use_base_bitcode
         self.assertEqual(
             (
-                str(self.toolchain.llvm_split),
-                "-j",
-                "2",
+                str(self.toolchain.opt),
+                *IR_OUTLINER_FLAGS,
+                str(source),
                 "-o",
-                str(self.paths.outline_split_prefix),
-                str(self.paths.profile_use_base_bitcode),
+                str(self.paths.outlined_bitcode),
             ),
-            split_ir_argv(self.toolchain, self.paths),
-        )
-        for index, (split, outlined) in enumerate(
-            zip(self.paths.outline_split_bitcodes, self.paths.outlined_bitcodes)
-        ):
-            with self.subTest(index=index):
-                self.assertEqual(
-                    (
-                        str(self.toolchain.opt),
-                        *IR_OUTLINER_FLAGS,
-                        str(split),
-                        "-o",
-                        str(outlined),
-                    ),
-                    outline_ir_argv(self.toolchain, split, outlined),
-                )
-        self.assertEqual(
-            (
-                str(self.toolchain.llvm_link),
-                *map(str, self.paths.outlined_bitcodes),
-                "-o",
-                str(self.paths.linked_outlined_bitcode),
-            ),
-            link_outlined_ir_argv(self.toolchain, self.paths),
+            outline_ir_argv(self.toolchain, source, self.paths.outlined_bitcode),
         )
         self.assertEqual(
             (
                 str(self.toolchain.opt),
                 "-passes=internalize,constmerge,globaldce,mergefunc,verify",
                 "-internalize-public-api-list=main,_mh_execute_header",
-                str(self.paths.linked_outlined_bitcode),
+                str(self.paths.outlined_bitcode),
                 "-o",
                 str(self.paths.profile_use_bitcode),
             ),
             cleanup_outlined_ir_argv(self.toolchain, self.paths),
         )
-        split_command = split_ir_argv(self.toolchain, self.paths)
-        self.assertNotIn("--round-robin", split_command)
-        self.assertNotIn("--preserve-locals", split_command)
         self.assertEqual(
             (str(self.paths.instrumented_binary), "help"),
             instrumented_run_argv(self.paths, ("help",)),
@@ -702,7 +683,7 @@ print('{{}}')""",
             ),
             candidate,
         )
-        for flag in FX_MACHINE_OUTLINER_FLAGS:
+        for flag in FX_CODEGEN_FLAGS:
             self.assertIn(flag, candidate_object)
             self.assertNotIn(flag, benchmark_object)
 
@@ -805,7 +786,7 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_ir}",
                 "artifact -filetype=obj -O=2 "
-                "-machine-outliner-reruns=1 "
+                "-machine-outliner-reruns=1 -homogeneous-prolog-epilog "
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_object}",
                 "probe cc -### -target aarch64-macos -O2 -Wl,-dead_strip -s "
@@ -842,6 +823,34 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
             sha256_file(runtime),
             (self.paths.logs / "candidate-layout.json").read_text(),
         )
+
+    def test_the_platform_prepares_the_bitcode_before_code_generation(self) -> None:
+        actions = self.root / "prepare-actions.txt"
+        tool = self.write_executable(
+            "prepare-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('tool ' + ('-S' if '-S' in sys.argv else '-filetype=obj') + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')""",
+        )
+
+        def record(step: str):
+            def hook(_toolchain, _paths) -> None:
+                with actions.open("a") as stream:
+                    stream.write(step + "\n")
+            return hook
+
+        platform = types.SimpleNamespace(
+            prepare_candidate_bitcode=record("prepare"),
+            candidate_object_flags=lambda _paths: (),
+            link_candidate_binary=record("link"),
+        )
+        toolchain = self.replace_toolchain(opt=tool, llc=tool, platform=platform)
+        self.paths.profile_use_bitcode.write_bytes(b"bitcode")
+
+        link_candidate(toolchain, self.paths, require_release_safe_evidence=False)
+
+        self.assertEqual(["prepare", "tool -S", "tool -filetype=obj", "link"], actions.read_text().splitlines())
 
     def test_benchmark_candidate_keeps_the_zig_linker(self) -> None:
         paths = PipelinePaths.create(self.root / "benchmark-link", selector="ui_activity")
@@ -929,6 +938,192 @@ output.write_bytes(b'merged profile')""",
         self.assertEqual(b"merged profile", self.paths.merged_profile.read_bytes())
         self.assertFalse(any(raw.exists() for raw in raw_profiles))
 
+    def test_startup_profile_keeps_the_raw_profiles_for_the_shared_merge(self) -> None:
+        profdata = self.write_executable(
+            "startup-profdata",
+            """import pathlib,sys
+output = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])
+output.write_bytes(b'startup profile')""",
+        )
+        toolchain = dataclasses.replace(self.toolchain, llvm_profdata=profdata)
+        raw = self.paths.raw_profiles / "direct-help.profraw"
+        raw.write_bytes(b"raw")
+        output = self.paths.startup_profiles / "direct-help.profdata"
+
+        keep_startup_profile(toolchain, (raw,), output, self.paths.logs / "startup.json")
+
+        self.assertEqual(b"startup profile", output.read_bytes())
+        self.assertTrue(raw.exists())
+        with self.assertRaisesRegex(PgsoError, "startup profile already exists"):
+            keep_startup_profile(toolchain, (raw,), output, self.paths.logs / "again.json")
+
+    def test_executed_functions_are_those_with_a_nonzero_count(self) -> None:
+        shown = (
+            "Counters:\n"
+            "  fx;core.app.help:\n"
+            "    Hash: 0x01\n"
+            "    Counters: 2\n"
+            "    Block counts: [0, 3]\n"
+            "  fx;core.app.never:\n"
+            "    Hash: 0x02\n"
+            "    Counters: 1\n"
+            "    Block counts: [0]\n"
+            "  main:\n"
+            "    Hash: 0x03\n"
+            "    Counters: 1\n"
+            "    Block counts: [1]\n"
+            "Instrumentation level: IR  entry_first = 0\n"
+            "Functions shown: 3\n"
+        )
+
+        self.assertEqual({"core.app.help", "main"}, executed_functions(shown))
+
+    def test_removing_profile_records_keeps_headers_traces_and_other_records(self) -> None:
+        text = (
+            "# IR level Instrumentation Flag\n"
+            ":ir\n"
+            ":temporal_prof_traces\n"
+            "# Num Temporal Profile Traces:\n"
+            "1\n"
+            "# Temporal Profile Trace Stream Size:\n"
+            "2\n"
+            "# Weight:\n"
+            "1\n"
+            "fx;core.cold,fx;core.hot\n"
+            "\n"
+            "fx;core.cold\n"
+            "# Func Hash:\n"
+            "10\n"
+            "# Num Counters:\n"
+            "1\n"
+            "# Counter Values:\n"
+            "1\n"
+            "\n"
+            "fx;core.hot\n"
+            "# Func Hash:\n"
+            "11\n"
+            "# Num Counters:\n"
+            "1\n"
+            "# Counter Values:\n"
+            "900\n"
+            "\n"
+        )
+
+        filtered, removed = remove_profile_records(text, {"core.cold", "core.absent"})
+
+        self.assertEqual({"core.cold"}, removed)
+        self.assertNotIn("fx;core.cold\n# Func Hash", filtered)
+        self.assertIn("fx;core.hot\n# Func Hash:\n11\n", filtered)
+        self.assertIn(":temporal_prof_traces\n", filtered)
+        self.assertIn("fx;core.cold,fx;core.hot\n", filtered)
+
+    def test_startup_exemption_removes_only_the_cold_startup_functions(self) -> None:
+        actions = self.root / "actions.log"
+        text_profile = (
+            ":ir\n\n"
+            "fx;startup.cold\n# Func Hash:\n1\n# Num Counters:\n1\n# Counter Values:\n1\n\n"
+            "fx;startup.hot\n# Func Hash:\n2\n# Num Counters:\n1\n# Counter Values:\n900\n\n"
+            "fx;startup.shared\n# Func Hash:\n4\n# Num Counters:\n1\n# Counter Values:\n3\n\n"
+            "fx;other.cold\n# Func Hash:\n3\n# Num Counters:\n1\n# Counter Values:\n0\n\n"
+        )
+
+        def show(module: str, counts: tuple[tuple[str, int], ...]) -> str:
+            return "".join(
+                f"  {module};{name}:\n    Hash: 0x1\n    Counters: 1\n    Block counts: [{count}]\n"
+                for name, count in counts
+            )
+
+        shown = show("fx", (("startup.cold", 1), ("startup.hot", 5), ("startup.inlined", 2), ("startup.shared", 3), ("other.cold", 0)))
+        # A heavy benchmark runs startup.shared, so it keeps its record.
+        benchmark_shown = show("bench", (("startup.shared", 7000), ("startup.cold", 0)))
+        profdata = self.write_executable(
+            "exemption-profdata",
+            f"""import pathlib,sys
+args = sys.argv[1:]
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('profdata ' + ' '.join(args) + '\\n')
+output = pathlib.Path(args[args.index('-o') + 1])
+if args[0] == 'show':
+    output.write_text({shown!r} if args[3].endswith('startup.profdata') else {benchmark_shown!r})
+elif args[0] == 'order':
+    output.write_text('# Ordered 1 functions\\nstartup.cold\\n')
+elif '--text' in args:
+    output.write_text({text_profile!r})
+else:
+    inputs = [pathlib.Path(arg) for arg in args if arg not in ('merge', '-o', str(output))]
+    output.write_bytes(b'merged:' + b'|'.join(path.read_bytes() for path in inputs))""",
+        )
+        opt = self.write_executable(
+            "exemption-opt",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'BC\\xc0\\xdeprobe')""",
+        )
+        ir_size = self.write_executable(
+            "exemption-ir-size",
+            f"""import json,pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('ir_size ' + ' '.join(sys.argv[3:]) + '\\n')
+pathlib.Path(sys.argv[-1]).write_text(json.dumps({{
+    'defined': ['other.cold', 'startup.cold', 'startup.hot', 'startup.shared'],
+    'minsize': ['other.cold', 'startup.cold', 'startup.shared'],
+}}))
+print('{{}}')""",
+        )
+        toolchain = dataclasses.replace(self.toolchain, llvm_profdata=profdata, opt=opt, ir_size=ir_size)
+        self.paths.bitcode.write_bytes(b"same bitcode")
+        self.paths.merged_profile.write_bytes(b"production profile")
+        self.paths.startup_profiles.mkdir(parents=True)
+        for name in ("direct-help", "direct-version"):
+            (self.paths.startup_profiles / f"{name}.profdata").write_bytes(name.encode())
+        benchmark_profile = self.root / "bench" / "merged.profdata"
+        benchmark_profile.parent.mkdir()
+        benchmark_profile.write_bytes(b"benchmark profile")
+
+        evidence = exempt_cold_startup_functions(
+            toolchain,
+            self.paths,
+            sha256_file(self.paths.bitcode),
+            ("direct-help", "direct-version"),
+            benchmark_profiles=(benchmark_profile,),
+        )
+
+        self.assertEqual(4, evidence["startup_functions"])
+        self.assertEqual(1, evidence["exempt_functions"])
+        self.assertEqual(1, evidence["kept_for_benchmarks"])
+        self.assertEqual(1, evidence["kept_hot_functions"])
+        self.assertEqual(1, evidence["not_defined_functions"])
+        self.assertEqual(1, evidence["records_removed"])
+        exempt_text = (self.paths.logs / "production-startup-exempt.proftext").read_text()
+        self.assertNotIn("fx;startup.cold\n", exempt_text)
+        self.assertIn("fx;startup.hot\n", exempt_text)
+        self.assertIn("fx;startup.shared\n", exempt_text)
+        self.assertIn("fx;other.cold\n", exempt_text)
+        self.assertEqual(b"merged:" + exempt_text.encode(), self.paths.merged_profile.read_bytes())
+        self.assertEqual(
+            b"production profile",
+            (self.paths.profiles / "merged-before-startup-exemption.profdata").read_bytes(),
+        )
+        self.assertEqual("startup.cold\nstartup.hot\nstartup.inlined\nstartup.shared\n", self.paths.startup_order.read_text())
+        probe = self.paths.candidate / f"{self.paths.binary_name}.startup-probe.bc"
+        opt_line = next(line for line in actions.read_text().splitlines() if line.startswith("opt "))
+        self.assertIn(f"-profile-file={self.paths.merged_profile}", opt_line.split())
+        self.assertEqual(str(probe), opt_line.split()[-1])
+        self.assertFalse(self.paths.profile_use_base_bitcode.exists())
+
+    def test_startup_exemption_fails_when_a_startup_profile_is_missing(self) -> None:
+        self.paths.bitcode.write_bytes(b"same bitcode")
+        self.paths.merged_profile.write_bytes(b"production profile")
+
+        with self.assertRaisesRegex(PgsoError, "startup profile"):
+            exempt_cold_startup_functions(
+                self.toolchain,
+                self.paths,
+                sha256_file(self.paths.bitcode),
+                ("direct-help",),
+            )
+
     def test_profile_use_rejects_hash_drift_before_running_opt(self) -> None:
         self.paths.bitcode.write_bytes(b"changed bitcode")
         self.paths.merged_profile.write_bytes(b"profile")
@@ -940,30 +1135,14 @@ output.write_bytes(b'merged profile')""",
                 "0" * 64,
             )
 
-    def test_fx_profile_use_outlines_two_name_hashed_partitions_in_sequence(self) -> None:
-        actions = self.root / "profile-actions"
+    def profile_use_toolchain(self, actions: pathlib.Path) -> Toolchain:
+        """`self.toolchain` with fake profile-use tools that log to `actions`."""
         opt = self.write_executable(
             "profile-opt",
             f"""import pathlib,sys
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
 pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
-        )
-        split = self.write_executable(
-            "llvm-split",
-            f"""import pathlib,sys
-with pathlib.Path({str(actions)!r}).open('a') as stream:
-    stream.write('split ' + ' '.join(sys.argv[1:]) + '\\n')
-prefix = sys.argv[sys.argv.index('-o') + 1]
-pathlib.Path(prefix + '0').write_bytes(b'part zero')
-pathlib.Path(prefix + '1').write_bytes(b'part one')""",
-        )
-        link = self.write_executable(
-            "llvm-link",
-            f"""import pathlib,sys
-with pathlib.Path({str(actions)!r}).open('a') as stream:
-    stream.write('link ' + ' '.join(sys.argv[1:]) + '\\n')
-pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'linked')""",
         )
         nm = self.write_executable(
             "public-nm",
@@ -973,14 +1152,46 @@ with pathlib.Path({str(actions)!r}).open('a') as stream:
 print('__mh_execute_header W ---------------- 0')
 print('_main T ---------------- 0')""",
         )
-        toolchain = dataclasses.replace(
+        return dataclasses.replace(
             self.toolchain,
             opt=opt,
-            llvm_split=split,
-            llvm_link=link,
             llvm_nm=nm,
             ir_size=self.write_ir_size(actions),
         )
+
+    def test_listed_functions_are_marked_nooutline_before_outlining(self) -> None:
+        actions = self.root / "profile-actions"
+        toolchain = self.profile_use_toolchain(actions)
+        self.paths.bitcode.write_bytes(b"same bitcode")
+        self.paths.merged_profile.write_bytes(b"profile")
+        functions = self.paths.startup_order
+        functions.write_text("core.app.help\nmain.main\n")
+
+        apply_profile(
+            toolchain,
+            self.paths,
+            sha256_file(self.paths.bitcode),
+            no_outline_functions=functions,
+        )
+
+        lines = actions.read_text().splitlines()
+        self.assertEqual(14, len(lines))
+        self.assertTrue(lines[0].startswith("opt "))
+        marked = self.paths.profile_use_base_bitcode.with_name(
+            self.paths.profile_use_base_bitcode.name + ".no-outline.bc"
+        )
+        self.assertTrue(
+            lines[1].endswith(
+                f"--functions {functions} no-outline {self.paths.profile_use_base_bitcode} {marked}"
+            )
+        )
+        self.assertIn(f"expand-constant-exprs {self.paths.profile_use_base_bitcode} ", lines[3])
+        self.assertFalse(marked.exists())
+        self.assertTrue(self.paths.profile_use_base_bitcode.read_bytes().startswith(b"BC\xc0\xde"))
+
+    def test_fx_profile_use_outlines_the_whole_program_once(self) -> None:
+        actions = self.root / "profile-actions"
+        toolchain = self.profile_use_toolchain(actions)
         self.paths.bitcode.write_bytes(b"same bitcode")
         self.paths.merged_profile.write_bytes(b"profile")
 
@@ -993,34 +1204,36 @@ print('_main T ---------------- 0')""",
         self.assertEqual(self.paths.profile_use_bitcode, result)
         self.assertEqual(b"bitcode", result.read_bytes())
         lines = actions.read_text().splitlines()
-        self.assertEqual(16, len(lines))
+        self.assertEqual(13, len(lines))
         self.assertIn("-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc", lines[0])
         self.assertNotIn("iroutliner", lines[0])
         self.assertEqual("nm", lines[1])
-        self.assertTrue(lines[2].startswith("split -j 2 -o "))
-        for index, first in ((0, 3), (1, 7)):
-            split = self.paths.outline_split_bitcodes[index]
-            outlined = self.paths.outlined_bitcodes[index]
-            expanded = split.with_name(split.name + ".expanded.bc")
-            swapped = split.with_name(split.name + ".swapped.bc")
-            self.assertIn(f"expand-constant-exprs {split} {expanded}", lines[first])
-            self.assertIn(f"swap-compares {expanded} {swapped}", lines[first + 1])
-            self.assertIn(f"-passes=iroutliner {swapped} -o {outlined}", lines[first + 2])
-            self.assertTrue(lines[first + 3].endswith(f"check-outlined {outlined}"))
-            self.assertTrue((self.paths.logs / f"swap-compares-profile-use-{index}.json").is_file())
-            self.assertTrue((self.paths.logs / f"check-outlined-profile-use-{index}.json").is_file())
-        self.assertTrue(lines[11].startswith("link "))
-        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[12])
-        self.assertTrue(lines[13].startswith("ir_size --libllvm "))
-        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[13])
-        self.assertIn("-passes=globaldce,verify", lines[14])
-        self.assertTrue(lines[14].endswith(f"-o {self.paths.profile_use_bitcode}"))
-        self.assertEqual("nm", lines[15])
-        self.assertFalse(
-            self.paths.profile_use_bitcode.with_name(
-                self.paths.profile_use_bitcode.name + ".sparse"
-            ).exists()
-        )
+        source = self.paths.profile_use_base_bitcode
+        outlined = self.paths.outlined_bitcode
+        expanded = source.with_name(source.name + ".expanded.bc")
+        swapped = source.with_name(source.name + ".swapped.bc")
+        self.assertIn(f"expand-constant-exprs {source} {expanded}", lines[2])
+        self.assertIn(f"swap-compares {expanded} {swapped}", lines[3])
+        self.assertIn(f"-passes=iroutliner {swapped} -o {outlined}", lines[4])
+        self.assertTrue(lines[5].endswith(f"check-outlined {outlined}"))
+        self.assertTrue((self.paths.logs / "swap-compares-profile-use.json").is_file())
+        self.assertTrue((self.paths.logs / "check-outlined-profile-use.json").is_file())
+        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[6])
+        self.assertIn(f"{outlined} -o {self.paths.profile_use_bitcode}", lines[6])
+        self.assertTrue(lines[7].startswith("ir_size --libllvm "))
+        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[7])
+        self.assertIn("overlay-constants ", lines[8])
+        self.assertIn("zero-fill-globals ", lines[9])
+        self.assertIn("compact-error-names ", lines[10])
+        self.assertIn("-passes=globaldce,verify", lines[11])
+        self.assertTrue(lines[11].endswith(f"-o {self.paths.profile_use_bitcode}"))
+        self.assertEqual("nm", lines[12])
+        for suffix in (".sparse", ".overlaid", ".zero-filled", ".compacted"):
+            self.assertFalse(
+                self.paths.profile_use_bitcode.with_name(
+                    self.paths.profile_use_bitcode.name + suffix
+                ).exists()
+            )
         self.assertTrue((self.paths.logs / "public-symbols-before.json").is_file())
         self.assertTrue((self.paths.logs / "public-symbols-after.json").is_file())
 
@@ -1231,14 +1444,15 @@ sys.stderr.write('optimizer warning')""",
                         expected_contract=self.good_link_contract(),
                     )
 
-    def test_candidate_size_rejects_more_than_7_000_mib(self) -> None:
+    def test_candidate_size_rejects_more_than_the_platform_ceiling(self) -> None:
         candidate = self.root / "candidate"
         candidate.write_bytes(b"")
         with candidate.open("r+b") as stream:
             stream.truncate(7_340_033)
 
         with self.assertRaisesRegex(PgsoError, "exceeds 7.000 MiB"):
-            validate_candidate_size(candidate)
+            validate_candidate_size(candidate, 7.000)
+        self.assertEqual(8.000, validate_candidate_size(candidate, 8.000).ceiling_mib)
 
     def test_candidate_must_not_create_an_adversarial_profile_file(self) -> None:
         before: set[pathlib.Path] = set()

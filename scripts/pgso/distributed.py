@@ -494,6 +494,16 @@ def _validate_toolchain(identity: BuildIdentity, toolchain: Toolchain) -> None:
     verify_identity(identity, actual)
 
 
+def _require_distributed_support(toolchain: Toolchain) -> None:
+    # Training shards don't hand the startup scenarios' profiles to the
+    # candidate, so a platform with a startup exemption can't build this way.
+    if toolchain.platform.STARTUP_SCENARIOS:
+        raise PgsoError(
+            "distributed builds do not carry the startup profiles that "
+            f"{toolchain.platform.DISPLAY_NAME} candidates need"
+        )
+
+
 def _require_version(
     command: str,
     expected: str,
@@ -784,6 +794,7 @@ def run_training_shard(arguments: argparse.Namespace) -> pathlib.Path:
     seed_paths, seed_evidence, identity = _load_seed(arguments.seed_dir, corpus, log_dir)
     toolchain = Toolchain.discover(arguments.zig, arguments.llvm_bin, identity.target)
     _validate_toolchain(identity, toolchain)
+    _require_distributed_support(toolchain)
     bun = _require_version(
         arguments.bun,
         REQUIRED_BUN_VERSION,
@@ -848,6 +859,7 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
     )
     toolchain = Toolchain.discover(arguments.zig, arguments.llvm_bin, identity.target)
     _validate_toolchain(identity, toolchain)
+    _require_distributed_support(toolchain)
     manifest_paths = _artifact_document_paths(arguments.shards_dir)
     documents = tuple(_read_json(path, "shard manifest") for path in manifest_paths)
     instrumented = _mapping(
@@ -1215,7 +1227,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run distributed macOS arm64 PGSO qualification")
+    parser = argparse.ArgumentParser(description="Run distributed PGSO qualification")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     plan = subparsers.add_parser("plan")

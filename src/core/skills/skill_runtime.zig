@@ -1,7 +1,9 @@
 const std = @import("std");
+const profile_paths = @import("../shared/profile_paths.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
@@ -1146,7 +1148,7 @@ pub fn skillSourceLabel(source: SkillSource) []const u8 {
         .workspace_claude => "workspace .claude/skills",
         .workspace_agents => "workspace .agents/skills",
         .workspace_claw => "workspace .claw/skills",
-        .global_fx => "global ~/.fx/skills",
+        .global_fx => profile_paths.displayText("global ~/.fx/skills"),
         .global_opencode => "global ~/.config/opencode/skills",
         .global_codex => "global ~/.codex/skills",
         .global_claude => "global ~/.claude/skills",
@@ -1327,69 +1329,72 @@ pub const SkillMenuIndex = struct {
     }
 };
 
-const SkillMenuView = struct {
+/// How the skills menus match a skill: by name, and by the words of its
+/// description, source, and path.
+fn skillMatch(skill: Skill, query: []const u8) ?fuzzy_match.Match {
+    return fuzzy_match.match(query, &.{
+        .{ .text = skill.name },
+        .{ .text = skill.description, .kind = .text },
+        .{ .text = skillSourceShortLabel(skill.source), .kind = .text },
+        .{ .text = skill.path, .kind = .text },
+    });
+}
+
+/// Whether a `$` mention menu stays open for `query`. Sending a prompt ends
+/// a mention at the first byte that cannot continue a skill name
+/// (`matchesSigilSkillAt`), so `$fx-commit.` is a finished mention and Enter
+/// must send it. A query holding such a byte keeps the menu open only for a
+/// skill whose name contains the query as typed, as `$my.sk` does for
+/// `my.skill`.
+fn mentionMenuOpen(skills: []const Skill, query: []const u8) bool {
+    for (query) |byte| {
+        if (!isSkillNameContinuation(byte)) break;
+    } else return skillMenuFilterQueryCount(skills, .all, query) > 0;
+    for (skills) |skill| {
+        const found = fuzzy_match.match(query, &.{.{ .text = skill.name }}) orelse continue;
+        if (found.tier.isAsTyped()) return true;
+    }
+    return false;
+}
+
+/// The skills menu's base order is source group, then catalog order, so
+/// base position `group * skills.len + index` holds skill `index` only when
+/// it is in source group `group`.
+const SkillMenuMatches = struct {
     skills: []const Skill,
     filter: SkillMenuSourceFilter,
     query: []const u8,
-    match_rank: usize = 0,
-    source_rank: usize = 0,
-    next_actual_index: usize = 0,
-    next_display_index: usize = 0,
 
-    fn init(skills: []const Skill, filter: SkillMenuSourceFilter, query: []const u8) SkillMenuView {
-        return .{
-            .skills = skills,
-            .filter = filter,
-            .query = query,
-        };
-    }
-
-    fn next(self: *SkillMenuView) ?SkillMenuViewEntry {
-        while (self.match_rank < skill_match_rank_count) {
-            while (self.next_actual_index < self.skills.len) {
-                const actual_index = self.next_actual_index;
-                self.next_actual_index += 1;
-
-                const skill = self.skills[actual_index];
-                if (skillMatchRank(skill, self.query) != self.match_rank) continue;
-                if (skillGroupRank(skill.source) != self.source_rank) continue;
-                if (!skillSourceMatchesFilter(skill.source, self.filter)) continue;
-
-                const display_index = self.next_display_index;
-                self.next_display_index += 1;
-                return .{
-                    .display_index = display_index,
-                    .actual_index = actual_index,
-                };
-            }
-
-            self.source_rank += 1;
-            if (self.source_rank == skill_group_count) {
-                self.source_rank = 0;
-                self.match_rank += 1;
-            }
-            self.next_actual_index = 0;
-        }
-
-        return null;
+    pub fn matchAt(self: SkillMenuMatches, position: usize) ?fuzzy_match.Match {
+        const skill = self.skills[position % self.skills.len];
+        if (skillGroupRank(skill.source) != position / self.skills.len) return null;
+        if (!skillSourceMatchesFilter(skill.source, self.filter)) return null;
+        return skillMatch(skill, self.query);
     }
 };
 
-const skill_match_rank_count: usize = 3;
+/// The skills that match, best first (`fuzzy_match.Ranking`), and otherwise
+/// by source group and catalog order.
+const SkillMenuView = struct {
+    skills: []const Skill,
+    matches: fuzzy_match.Ranking(SkillMenuMatches).Iterator,
+    next_display_index: usize = 0,
 
-fn skillMatchRank(skill: Skill, query: []const u8) ?usize {
-    const trimmed = std.mem.trim(u8, query, " \t\r\n/");
-    if (trimmed.len == 0) return 0;
-    if (std.ascii.startsWithIgnoreCase(skill.name, trimmed)) return 0;
-    if (asciiContainsIgnoreCase(skill.name, trimmed)) return 1;
-    if (asciiContainsIgnoreCase(skill.description, trimmed) or
-        asciiContainsIgnoreCase(skillSourceShortLabel(skill.source), trimmed) or
-        asciiContainsIgnoreCase(skill.path, trimmed))
-    {
-        return 2;
+    fn init(skills: []const Skill, filter: SkillMenuSourceFilter, query: []const u8) SkillMenuView {
+        const ranking: fuzzy_match.Ranking(SkillMenuMatches) = .{
+            .context = .{ .skills = skills, .filter = filter, .query = query },
+            .len = skills.len * skill_group_count,
+        };
+        return .{ .skills = skills, .matches = ranking.iterator() };
     }
-    return null;
-}
+
+    fn next(self: *SkillMenuView) ?SkillMenuViewEntry {
+        const position = self.matches.next() orelse return null;
+        const display_index = self.next_display_index;
+        self.next_display_index += 1;
+        return .{ .display_index = display_index, .actual_index = position % self.skills.len };
+    }
+};
 
 pub const SkillNameCompletion = struct {
     skill: Skill,
@@ -1407,20 +1412,6 @@ pub fn firstSkillNameCompletion(skills: []const Skill, query: []const u8) ?Skill
         };
     }
     return null;
-}
-
-fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var start: usize = 0;
-    while (start + needle.len <= haystack.len) : (start += 1) {
-        var i: usize = 0;
-        while (i < needle.len) : (i += 1) {
-            if (std.ascii.toLower(haystack[start + i]) != std.ascii.toLower(needle[i])) break;
-        }
-        if (i == needle.len) return true;
-    }
-    return false;
 }
 
 pub const SkillMenu = struct {
@@ -2641,7 +2632,7 @@ pub const Runtime = struct {
     pub fn menuVisible(self: Runtime) bool {
         if (!self.menu.active) return false;
         if (!self.menu.origin.isMention()) return true;
-        return skillMenuFilterQueryCount(self.items, .all, self.menu.query()) > 0;
+        return mentionMenuOpen(self.items, self.menu.query());
     }
 };
 
@@ -3957,6 +3948,29 @@ test "skill menu visibility hides only zero-result mention queries" {
 
     runtime.closeMenu();
     try std.testing.expect(!runtime.menuVisible());
+}
+
+test "a mention menu closes once its query holds a byte that ends the mention" {
+    const skills = [_]Skill{
+        staticSkill("status-second", "Status fixture", .workspace_shared),
+        staticSkill("my.skill", "Dotted name", .global_fx),
+    };
+    var runtime = Runtime{ .items = @constCast(&skills) };
+    runtime.openMenuWithQuery(.dollar, .{ .start = 4, .end = 5 }, "");
+
+    runtime.menu.setQuery("statsec");
+    try std.testing.expect(runtime.menuVisible());
+    runtime.menu.setQuery("status-second");
+    try std.testing.expect(runtime.menuVisible());
+    runtime.menu.setQuery("status-second.");
+    try std.testing.expect(!runtime.menuVisible());
+    runtime.menu.setQuery("my.sk");
+    try std.testing.expect(runtime.menuVisible());
+    runtime.menu.setQuery("my.skill,");
+    try std.testing.expect(!runtime.menuVisible());
+
+    runtime.openMenuWithQuery(.command, null, "status-second.");
+    try std.testing.expect(runtime.menuVisible());
 }
 
 test "skill menu movement uses rendered visible rows before scrolling" {

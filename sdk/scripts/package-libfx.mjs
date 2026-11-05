@@ -132,7 +132,7 @@ for (const { path, platform } of nativeAddons) {
     'export default new URL("./libfx.node", import.meta.url);',
     "",
   ].join("\n"));
-  await writeFile(resolve(dir, "README.md"), `# ${name}\n\nThe libfx native addon for ${label}. libfx installs and loads it, so install [libfx](https://www.npmjs.com/package/libfx) instead.\n`);
+  await writeFile(resolve(dir, "README.md"), `# ${name}\n\nThe libfx native addon for ${label}. libfx installs it for you, so install [libfx](https://www.npmjs.com/package/libfx) instead of this package.\n\nFor requirements and what to do when it's missing, see [libfx on Node.js](https://fx.sh/docs/lib/node).\n`);
   await writeFile(resolve(dir, "package.json"), `${JSON.stringify({
     name,
     version,

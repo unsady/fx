@@ -166,6 +166,45 @@ pub fn effortMenuProjection(menu: *const effort_menu.State) EffortMenuProjection
     };
 }
 
+/// One row of the agent list: an open instance or one of its subagents, and
+/// how it is doing.
+pub const AgentsMenuRow = struct {
+    /// An instance's place among the open instances, from 1, as in "fx 3".
+    /// Unused for a subagent.
+    number: usize,
+    /// A subagent's name, such as "reviewer"; empty for an instance.
+    subagent_name: []const u8 = "",
+    /// Its session's title, or empty before it has one.
+    title: []const u8,
+    /// The agent profile it runs in.
+    profile: []const u8,
+    /// What it is doing, such as "needs approval".
+    state: []const u8,
+    /// The agent the list opened on, where Esc goes back to.
+    on_screen: bool,
+    /// The model its turns use, as the agent's settings name it, such as
+    /// "anthropic/claude-opus-4-7"; empty when unknown.
+    model: []const u8 = "",
+    /// Its reasoning effort, such as "high", when the model takes one and
+    /// it is not the default; else empty.
+    effort: []const u8 = "",
+};
+
+/// The agent list ↓ and Ctrl+X open: every open agent in switch order.
+pub const AgentsMenuProjection = struct {
+    rows: []const AgentsMenuRow = &.{},
+    selected: usize = 0,
+    window_start: usize = 0,
+    /// The selected row is a subagent's, which x closes.
+    selected_closable: bool = false,
+    /// The first x armed the selected subagent's close.
+    close_armed: bool = false,
+
+    pub fn active(self: AgentsMenuProjection) bool {
+        return self.rows.len > 0;
+    }
+};
+
 pub const HelpMenuProjection = struct {
     active: bool = false,
     category: ?command_specs.SlashPresentationCategory = null,
@@ -391,6 +430,9 @@ pub const RenderContext = struct {
     file_completions_loading: bool = false,
     file_completions_failed: bool = false,
     inline_completion_suffix: []const u8 = "",
+    /// A request waits for the sign-in fx opened for it, so the auth picker
+    /// shows while the turn is active.
+    auth_picker_during_turn: bool = false,
     auth_picker: auth_runtime.PickerView = .{
         .active = false,
         .available_sources = .empty,
@@ -406,13 +448,23 @@ pub const RenderContext = struct {
     session_menu: SessionMenuProjection = .{},
     fork_menu: ForkMenuProjection = .{},
     effort_menu: EffortMenuProjection = .{},
+    agents_menu: AgentsMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
     info_panel: InfoPanelProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
     upgrade_status: []const u8 = "",
-    /// What MCP has to say, after everything else on the right.
+    /// The agent indicator on the footer's right, such as "fx 2/3 ↓": the
+    /// agent on screen and the key that opens the agent list. Empty with a
+    /// single agent.
+    agent_label: []const u8 = "",
+    /// A hidden agent waiting on an answer, shown on the right.
+    waiting_note: []const u8 = "",
+    /// What MCP has to say, after the notes above on the right.
     mcp_status: []const u8 = "",
+    /// Hidden subagents working, such as "1 subagent working", shown on the
+    /// right only when nothing else is.
+    working_note: []const u8 = "",
     danger_status: []const u8 = "",
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,
@@ -658,12 +710,40 @@ pub fn frameOwnedActivityProjection(
     switch (ctx.activity) {
         .tool_slot => {},
         .turn_thinking => |thinking| {
-            if (thinking.tone != .thinking) return ctx.activity;
+            if (thinking.tone != .thinking) return fitStatusLabel(thinking, shell.layout.cols);
         },
         .none => {},
     }
     if (compaction != .none) return compaction;
     return turnActivityProjection(buf, shell, ctx);
+}
+
+/// A status with a short form shows it when the full label is wider than the
+/// row, so the action at the end of a "needs you" line is never clipped.
+fn fitStatusLabel(thinking: ActivityProjection.TurnThinking, cols: u16) ActivityProjection {
+    const short = thinking.short_label orelse return .{ .turn_thinking = thinking };
+    if (cols == 0 or display_width.visibleWidthIgnoringAnsi(thinking.label) <= cols) {
+        return .{ .turn_thinking = thinking };
+    }
+    return .{ .turn_thinking = .{ .label = short, .tone = thinking.tone } };
+}
+
+test "a status shows its short form only when the row is narrower than its text" {
+    const thinking: ActivityProjection.TurnThinking = .{
+        .label = "⚠ Blocked by the content filter · press Esc and rephrase",
+        .short_label = "⚠ Blocked by content filter · Esc, then rephrase",
+        .tone = .danger,
+    };
+    try std.testing.expectEqualStrings(thinking.label, fitStatusLabel(thinking, 80).turn_thinking.label);
+    const width: u16 = @intCast(display_width.visibleWidthIgnoringAnsi(thinking.label));
+    try std.testing.expectEqualStrings(thinking.label, fitStatusLabel(thinking, width).turn_thinking.label);
+    const narrow = fitStatusLabel(thinking, width - 1).turn_thinking;
+    try std.testing.expectEqualStrings(thinking.short_label.?, narrow.label);
+    try std.testing.expectEqual(ActivityProjection.Tone.danger, narrow.tone);
+
+    var no_short = thinking;
+    no_short.short_label = null;
+    try std.testing.expectEqualStrings(thinking.label, fitStatusLabel(no_short, 20).turn_thinking.label);
 }
 
 pub fn frameActivityBlink(ctx: RenderContext) ?bool {
@@ -1088,6 +1168,32 @@ test "minimal connected tool label clips with an ellipsis" {
     try std.testing.expect(std.mem.find(u8, label.items, "…") != null);
     try std.testing.expect(std.mem.findScalar(u8, label.items, '\n') == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(label.items) <= 24);
+}
+
+test "frame-owned activity keeps a live retrying status in place of the thinking row" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    const ctx: RenderContext = .{
+        .stream = .{ .active = true },
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .activity = .{ .turn_thinking = .{
+            .label = "• Gateway error · retrying · attempt 4 · 1m 20s",
+            .tone = .live,
+        } },
+        .input = &input,
+    };
+
+    var active_buf: [256]u8 = undefined;
+    switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
+        .turn_thinking => |thinking| {
+            try std.testing.expectEqual(ActivityProjection.Tone.live, thinking.tone);
+            try std.testing.expectEqualStrings("• Gateway error · retrying · attempt 4 · 1m 20s", thinking.label);
+        },
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
 }
 
 test "frame-owned activity preserves route recovery status tone" {
