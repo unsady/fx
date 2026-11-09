@@ -277,7 +277,9 @@ test "clear language mismatch is absent from cancelled history" {
     var job = fixture.job();
     job.prompt = @constCast("The lockfile is broken again.");
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    var config = fixture.config();
+    config.reject_response_language_mismatch = true;
+    try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
     try std.testing.expect(hooks.history_turns.items[0] == .interrupted);

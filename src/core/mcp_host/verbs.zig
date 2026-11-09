@@ -481,8 +481,19 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
     };
 }
 
+// How fx says an MCP file is unusable, after a subject such as "it" or
+// "~/.fx/mcp.json".
+const not_plain_words = "isn't a plain file; replace it with one";
+const link_loop_words = "is a link that loops or passes through too many links; replace it with a plain file";
+const too_large_words = std.fmt.comptimePrint("is over {d} MB, the most fx reads; make it smaller", .{config_file.max_read_bytes / (1024 * 1024)});
+
 /// Why a write to `path` failed; a link says what it points to.
 fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
+    switch (err) {
+        error.SymLinkLoop => return "it " ++ link_loop_words,
+        error.StreamTooLong => return "it " ++ too_large_words,
+        else => {},
+    }
     // The profile's replace refuses a link itself (DurablePathUnsafe).
     if (err != error.Linked and err != error.DurablePathUnsafe) return describe(err);
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -490,7 +501,7 @@ fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
         // Not a link: a regular file with another hard link, or a special
         // file such as a fifo.
         const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return describe(err);
-        if (stat.kind != .file) return "it isn't a plain file; replace it with one";
+        if (stat.kind != .file) return "it " ++ not_plain_words;
         return "it has another hard link, and fx edits only a plain file; edit it by hand";
     };
     const target = try safe(arena, buffer[0..n]);
@@ -507,12 +518,27 @@ pub fn describe(err: anyerror) []const u8 {
         error.NotAnObject => "the file's servers aren't a JSON object; fix it by hand first",
         error.HomeNotSet => io_mod.no_home_dir_reason,
         error.AccessDenied => "permission denied",
-        error.DurablePathUnsafe => "an MCP config file isn't a plain file; replace it with one",
+        error.DurablePathUnsafe => "an MCP config file " ++ not_plain_words,
+        error.SymLinkLoop => "an MCP config file " ++ link_loop_words,
+        error.StreamTooLong => "an MCP config file " ++ too_large_words,
         error.Timeout, error.LockTimeout => "another fx is changing the MCP config; try again",
         error.McpConfigInvalidJson => profile_paths.displayText("~/.fx/mcp.json isn't valid JSON"),
+        error.McpConfigNotPlainFile => profile_paths.displayText("~/.fx/mcp.json " ++ not_plain_words),
+        error.McpConfigLinkLoop => profile_paths.displayText("~/.fx/mcp.json " ++ link_loop_words),
+        error.McpConfigTooLarge => profile_paths.displayText("~/.fx/mcp.json " ++ too_large_words),
         error.McpConfigInvalidHeaders, error.McpConfigAuthorizationHeader => profile_paths.displayText("a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login"),
-        else => if (std.mem.startsWith(u8, @errorName(err), "McpConfig")) profile_paths.displayText("~/.fx/mcp.json has a server entry fx can't read") else "something went wrong",
+        else => if (isProfileConfigError(err)) profile_paths.displayText("~/.fx/mcp.json has a server entry fx can't read") else "something went wrong",
     };
+}
+
+/// fx's words for an error in ~/.fx/mcp.json itself, for a caller that would
+/// otherwise print the error's name; null for any other error.
+pub fn profileConfigNotice(err: anyerror) ?[]const u8 {
+    return if (isProfileConfigError(err)) describe(err) else null;
+}
+
+fn isProfileConfigError(err: anyerror) bool {
+    return std.mem.startsWith(u8, @errorName(err), "McpConfig");
 }
 
 const Paths = struct { profile: []const u8, project: []const u8 };
@@ -847,9 +873,31 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
     };
     defer if (url) |u| c.gpa.free(u);
     var forgot = false;
-    // A `.mcp.json` server's login is its workspace's own.
-    if (url) |u| forgot = credentials.Store.detect(arena, c.home).remove(arena, .{ .name = name, .url = u, .workspace = if (file == .project) c.workspace_root else null }) catch false;
+    var kept: ?struct { store: credentials.Store, err: anyerror } = null;
+    // A `.mcp.json` server's login is its workspace's own. A server with no
+    // URL has none, so the store isn't looked for.
+    if (url) |u| {
+        const store = credentials.Store.detect(arena, c.home);
+        forgot = store.remove(arena, .{ .name = name, .url = u, .workspace = if (file == .project) c.workspace_root else null }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => no: {
+                debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ name, @errorName(err) });
+                kept = .{ .store = store, .err = err };
+                break :no false;
+            },
+        };
+    }
     c.hosts.changed(c.hosts.context);
+    // The server is gone from the config, but every fx that adds it back
+    // would sign in with the login still saved.
+    if (kept) |k| {
+        var buffer: [320]u8 = undefined;
+        const shown = try safe(arena, name);
+        try c.err.print("Removed {s} from {s}, but couldn't delete its saved login: {s}. Once that's fixed, add it back and run {s} logout {s} to delete it.\n", .{
+            shown, fileLabel(file), k.store.writeFailure(&buffer, k.err), c.surface.prog(), shown,
+        });
+        return 1;
+    }
     try c.out.print("Removed {s} from {s}{s}.\n", .{ name, fileLabel(file), if (forgot) ", and deleted its login" else "" });
     return 0;
 }
@@ -912,6 +960,13 @@ fn unreadableLogins(c: Context, arena: Allocator, doing: []const u8, name: []con
     return 1;
 }
 
+/// A sign-out that changed nothing, since the saved sign-ins couldn't be changed.
+fn notSignedOut(c: Context, arena: Allocator, name: []const u8, store: credentials.Store, err: anyerror) !u8 {
+    var buffer: [320]u8 = undefined;
+    try c.err.print("Couldn't sign out of {s}: {s}. Try again once that's fixed.\n", .{ try safe(arena, name), store.writeFailure(&buffer, err) });
+    return 1;
+}
+
 fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
     const host = (try c.hosts.get(c.hosts.context, null)) orelse return missing(c, arena, name);
     defer c.hosts.release(c.hosts.context, host);
@@ -921,19 +976,36 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
         return 1;
     }
     const was = findStatus(try host.runtime.statuses(arena), name) orelse return missing(c, arena, name);
+    const store = credentials.Store.detect(arena, c.home);
     // There's a login to sign out of when one is saved, by this fx or
     // another, or this session holds one. A running server needn't have one.
-    const saved = try credentials.Store.detect(arena, c.home).get(arena, server.credentialKey());
+    const saved = store.get(arena, server.credentialKey()) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return notSignedOut(c, arena, name, store, err),
+    };
     defer if (saved) |v| secret.zeroAndFree(arena, v);
-    host.runtime.logout(name) catch |err| switch (err) {
-        // A held server isn't in the engine; its saved login still goes.
-        error.UnknownServer => _ = credentials.Store.detect(arena, c.home).remove(arena, server.credentialKey()) catch |e| switch (e) {
-            error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
-            else => false,
+    const kept: ?anyerror = host.runtime.logout(name) catch |err| switch (err) {
+        // A held server isn't in the engine; its saved login still goes, and
+        // when it can't, nothing changed.
+        error.UnknownServer => held: {
+            _ = store.remove(arena, server.credentialKey()) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
+                else => return notSignedOut(c, arena, name, store, e),
+            };
+            break :held null;
         },
         error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
         else => return err,
     };
+    if (kept) |err| {
+        if (saved == null and !was.signed_in) return notSignedOut(c, arena, name, store, err);
+        var buffer: [320]u8 = undefined;
+        try c.err.print("Signed out of {s} here, but couldn't remove its saved login: {s}. Sign out again once that's fixed.\n", .{
+            try safe(arena, name), store.writeFailure(&buffer, err),
+        });
+        return 1;
+    }
     if (saved != null or was.signed_in) {
         try c.out.print("Signed out of {s}.\n", .{try safe(arena, name)});
     } else {
@@ -1325,4 +1397,31 @@ test "list lines up its columns and keeps hostile names inert" {
         \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools":2}]}
         \\
     , json.written());
+}
+
+test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors name it" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file"),
+        profileConfigNotice(error.McpConfigLinkLoop).?,
+    );
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json is over 1 MB, the most fx reads; make it smaller"),
+        profileConfigNotice(error.McpConfigTooLarge).?,
+    );
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json isn't a plain file; replace it with one"),
+        profileConfigNotice(error.McpConfigNotPlainFile).?,
+    );
+    try testing.expectEqualStrings(profile_paths.displayText("~/.fx/mcp.json isn't valid JSON"), profileConfigNotice(error.McpConfigInvalidJson).?);
+    // The same failures from a file this can't name, such as the project's
+    // .mcp.json, keep their own words.
+    try testing.expect(profileConfigNotice(error.SymLinkLoop) == null);
+    try testing.expect(profileConfigNotice(error.AccessDenied) == null);
+    try testing.expectEqualStrings("an MCP config file is a link that loops or passes through too many links; replace it with a plain file", describe(error.SymLinkLoop));
+    try testing.expectEqualStrings("an MCP config file is over 1 MB, the most fx reads; make it smaller", describe(error.StreamTooLong));
+    try testing.expectEqualStrings("it is a link that loops or passes through too many links; replace it with a plain file", try whyNot(a, error.SymLinkLoop, "/example/.mcp.json"));
+    try testing.expectEqualStrings("it is over 1 MB, the most fx reads; make it smaller", try whyNot(a, error.StreamTooLong, "/example/.mcp.json"));
 }

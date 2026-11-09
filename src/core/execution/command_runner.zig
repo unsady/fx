@@ -6271,9 +6271,13 @@ test "natural completion keeps its exit when the deadline passes during the outp
     const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "drain-deadline.pid" });
     defer alloc.free(pid_path);
     const timeout_ms: usize = 3_000;
-    // The command exits about 800 ms before its deadline while a detached
-    // daemon keeps the output open, so the deadline lands inside the drain.
-    // Its last line has no newline, so only the final flush delivers it live.
+    // The command exits 500 ms before its deadline while a detached daemon
+    // keeps the output open, so the deadline lands inside the drain, which
+    // waits up to natural_completion_wait_ms. It times its exit by the wall
+    // clock, so a slow Python start on a busy machine cannot push the exit
+    // past the deadline. Its last line has no newline, so only the final
+    // flush delivers it live.
+    const exit_at_ms = io_mod.milliTimestamp() + @as(i64, @intCast(timeout_ms)) - 500;
     const command = try alloc.print(
         "python3 -c 'import os,sys,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
@@ -6289,9 +6293,9 @@ test "natural completion keeps its exit when the deadline passes during the outp
             " os._exit(0)\n" ++
             "os.close(ready_w)\n" ++
             "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
-            "time.sleep(2.2)\n" ++
+            "time.sleep(max(0.0, {d}/1000.0 - time.time()))\n" ++
             "sys.stdout.write(\"FINISHED-BEFORE-DEADLINE\"); sys.stdout.flush()'",
-        .{pid_path},
+        .{ pid_path, exit_at_ms },
     );
     defer alloc.free(command);
 
@@ -6580,11 +6584,12 @@ test "natural completion marks output incomplete when the deadline cuts leftover
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
     // The command exits at once, but delivering its 200 lines takes about
-    // four seconds, so the deadline lands while its output is still unread.
-    var consumer = SlowOutputConsumer{ .delay_ms = 20 };
+    // eight seconds, so the deadline lands while its output is still unread.
+    // The 3 s give a slow Python start on a busy machine time to exit first.
+    var consumer = SlowOutputConsumer{ .delay_ms = 40 };
     const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 1_000,
+        .timeout_ms = 3_000,
         .output_chunk_ctx = @ptrCast(&consumer),
         .on_output_chunk = SlowOutputConsumer.onChunk,
     }, alloc, "python3 -c 'import sys; sys.stdout.write((\"y\"*99+\"\\n\")*200)'", workspace);
