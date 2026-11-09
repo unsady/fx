@@ -9,6 +9,7 @@ const compactor = @import("../compactor/compactor.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
+const configured_provider = @import("configured_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -125,6 +126,8 @@ pub const UserSettingsPatch = struct {
     provider_strict: ?bool = null,
     context: ?bool = null,
     cache_warming: ?bool = null,
+    /// Adds a provider under "providers" unless one has that name already.
+    configured_provider: ?ConfiguredProviderPatch = null,
     /// Removes a plain setting, such as `fast_mode` or `statusLine.context`,
     /// so it falls back to its default. Distinct from the fields above, where
     /// null means "leave unchanged".
@@ -158,8 +161,16 @@ pub const UserSettingsPatch = struct {
             self.provider_strict == null and
             self.context == null and
             self.cache_warming == null and
+            self.configured_provider == null and
             self.remove == null;
     }
+};
+
+pub const ConfiguredProviderPatch = struct {
+    name: []const u8,
+    /// The provider's definition as a JSON object, checked like any
+    /// definition in settings.json before it is written.
+    definition_json: []const u8,
 };
 
 pub const ModelPreferencePatch = struct {
@@ -1306,6 +1317,7 @@ fn applyUserPatchToRoot(
     if (patch.provider_strict) |value| application.changed = try putBool(arena, &root.object, "provider_strict", value) or application.changed;
     if (patch.context) |value| application.changed = try putBool(arena, &root.object, "context", value) or application.changed;
     if (patch.cache_warming) |value| application.changed = try putBool(arena, &root.object, "cache_warming", value) or application.changed;
+    if (patch.configured_provider) |provider| application.changed = try addConfiguredProvider(arena, &root.object, provider) or application.changed;
     if (patch.remove) |path| application.changed = removePath(&root.object, path) or application.changed;
     try cleanupLegacyWorkspacePreferences(arena, root, patch, &application);
     return application;
@@ -1809,6 +1821,25 @@ fn workspaceObject(
         break :blk workspaces.object.getPtr(owned_root).?;
     };
     return &workspace.object;
+}
+
+fn addConfiguredProvider(arena: Allocator, root: *std.json.ObjectMap, patch: ConfiguredProviderPatch) !bool {
+    const providers = if (root.getPtr("providers")) |value| blk: {
+        if (value.* != .object) return error.InvalidSettingsFormat;
+        break :blk value;
+    } else blk: {
+        try root.put(arena, "providers", .{ .object = .empty });
+        break :blk root.getPtr("providers").?;
+    };
+    if (providers.object.contains(patch.name)) return false;
+
+    const definition = std.json.parseFromSliceLeaky(std.json.Value, arena, patch.definition_json, .{}) catch return error.InvalidSettingsFormat;
+    var single: std.json.ObjectMap = .empty;
+    try single.put(arena, patch.name, definition);
+    var checked = configured_provider.Registry.parse(arena, .{ .object = single }) catch return error.InvalidSettingsFormat;
+    checked.deinit(arena);
+    try providers.object.put(arena, try arena.dupe(u8, patch.name), definition);
+    return true;
 }
 
 fn putString(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !bool {
@@ -2525,6 +2556,38 @@ test "user patch writes user preferences at top level" {
     try std.testing.expect(std.mem.find(u8, bytes, "notifications") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"future\":{\"nested\":7}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"workspaces\"") == null);
+}
+
+test "user patch adds a configured provider once and refuses an invalid one" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"providers\":{\"kept\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://kept.example/v1\",\"auth\":{\"type\":\"none\"}}}}\n");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    const definition =
+        \\{"protocol":"openai-chat-completions","base_url":"https://fresh.example/v1","auth":{"type":"bearer","env":"FRESH_KEY"},"models_dev":"fresh"}
+    ;
+    var added = try store.applyUserPatch(alloc, .{ .configured_provider = .{ .name = "fresh", .definition_json = definition } });
+    defer added.deinit(alloc);
+    try std.testing.expect(added == .committed);
+    // A name already in use keeps its definition.
+    var again = try store.applyUserPatch(alloc, .{ .configured_provider = .{ .name = "kept", .definition_json = definition } });
+    defer again.deinit(alloc);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"fresh\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://fresh.example/v1\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "https://kept.example/v1") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"kept\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://fresh") == null);
+
+    try std.testing.expectError(error.InvalidSettingsFormat, store.applyUserPatch(alloc, .{
+        .configured_provider = .{ .name = "broken", .definition_json = "{\"protocol\":\"openai-chat-completions\"}" },
+    }));
 }
 
 test "user patch retires presentation settings without rejecting their values" {

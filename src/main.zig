@@ -5400,6 +5400,7 @@ test {
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/chatgpt_oauth.zig");
     _ = @import("core/auth/provider_catalog.zig");
+    _ = @import("core/auth/provider_keys.zig");
     _ = @import("gateway/openai_codex_models.zig");
     _ = @import("gateway/openai_codex.zig");
     _ = @import("gateway/responses_protocol.zig");

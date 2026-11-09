@@ -14,11 +14,31 @@ const ModelMetadata = configured_provider.ModelMetadata;
 
 pub const Error = Allocator.Error || error{InvalidModelsDevCatalog};
 
-/// Returns the `models` object of `provider` from a models.dev api.json
-/// document, serialized as JSON, or null when the catalog has no such
-/// provider. Other providers are skipped without being parsed into values.
-/// Caller owns the result.
-pub fn extract(alloc: Allocator, api_json: []const u8, provider: []const u8) Error!?[]u8 {
+/// One provider's entry in a models.dev api.json document. Every field is
+/// owned; free them with `deinit`.
+pub const Provider = struct {
+    /// The provider's `models` object, serialized as JSON.
+    models_json: []u8,
+    /// The display name, or the id when the catalog gives none.
+    name: []u8,
+    /// The Chat Completions base URL, when the provider has one.
+    api: ?[]u8,
+    /// The environment variable the provider's key usually lives in.
+    env: ?[]u8,
+
+    pub fn deinit(self: *Provider, alloc: Allocator) void {
+        alloc.free(self.models_json);
+        alloc.free(self.name);
+        if (self.api) |value| alloc.free(value);
+        if (self.env) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+/// Returns `provider`'s entry from a models.dev api.json document, or null
+/// when the catalog has no such provider. Other providers are skipped without
+/// being parsed into values. Caller owns the result.
+pub fn extract(alloc: Allocator, api_json: []const u8, provider: []const u8) Error!?Provider {
     var arena: std.heap.ArenaAllocator = .init(alloc);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -47,8 +67,27 @@ pub fn extract(alloc: Allocator, api_json: []const u8, provider: []const u8) Err
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
         std.json.Stringify.value(models, .{}, &out.writer) catch return error.OutOfMemory;
-        return try out.toOwnedSlice();
+
+        const name = try alloc.dupe(u8, string(value, "name") orelse provider);
+        errdefer alloc.free(name);
+        const api = if (string(value, "api")) |text| try alloc.dupe(u8, text) else null;
+        errdefer if (api) |text| alloc.free(text);
+        const env = if (firstEnv(value)) |text| try alloc.dupe(u8, text) else null;
+        errdefer if (env) |text| alloc.free(text);
+        return .{ .models_json = try out.toOwnedSlice(), .name = name, .api = api, .env = env };
     }
+}
+
+fn string(object: std.json.Value, field: []const u8) ?[]const u8 {
+    const value = object.object.get(field) orelse return null;
+    return if (value == .string and value.string.len > 0) value.string else null;
+}
+
+fn firstEnv(object: std.json.Value) ?[]const u8 {
+    const value = object.object.get("env") orelse return null;
+    if (value != .array or value.array.items.len == 0) return null;
+    const first = value.array.items[0];
+    return if (first == .string and first.string.len > 0) first.string else null;
 }
 
 fn mapScanError(err: anyerror) Error {
@@ -232,7 +271,7 @@ fn dupe(alloc: Allocator, metadata: ModelMetadata) Allocator.Error!ModelMetadata
 
 const test_catalog =
     \\{"other":{"id":"other","models":{"skipped":{"id":"skipped"}}},
-    \\"opencode-go":{"id":"opencode-go","env":["OPENCODE_API_KEY"],"api":"https://opencode.ai/inference/go/openai/v1","models":{
+    \\"opencode-go":{"id":"opencode-go","name":"OpenCode Go","env":["OPENCODE_API_KEY"],"api":"https://opencode.ai/inference/go/openai/v1","models":{
     \\"deepseek-v4.1-flash":{"id":"deepseek-v4.1-flash","tool_call":true,"reasoning":true,
     \\  "reasoning_options":[{"type":"effort","values":["low","high","max","high","auto"]}],
     \\  "modalities":{"input":["text","image"],"output":["text"]},"limit":{"context":1000000,"output":384000}},
@@ -246,9 +285,16 @@ const test_catalog =
 test "models.dev extracts one provider and leaves out deprecated models" {
     const alloc = std.testing.allocator;
     try std.testing.expect(try extract(alloc, test_catalog, "missing") == null);
-    const models_json = (try extract(alloc, test_catalog, "opencode-go")).?;
-    defer alloc.free(models_json);
-    const models = try parse(alloc, models_json);
+    var provider = (try extract(alloc, test_catalog, "opencode-go")).?;
+    defer provider.deinit(alloc);
+    try std.testing.expectEqualStrings("OpenCode Go", provider.name);
+    try std.testing.expectEqualStrings("https://opencode.ai/inference/go/openai/v1", provider.api.?);
+    try std.testing.expectEqualStrings("OPENCODE_API_KEY", provider.env.?);
+    var other = (try extract(alloc, test_catalog, "other")).?;
+    defer other.deinit(alloc);
+    try std.testing.expectEqualStrings("other", other.name);
+    try std.testing.expect(other.api == null and other.env == null);
+    const models = try parse(alloc, provider.models_json);
     defer configured_provider.freeModelMetadata(alloc, models);
 
     try std.testing.expectEqual(@as(usize, 5), models.len);
@@ -292,9 +338,9 @@ test "models.dev merge lets declared metadata override and add models" {
         \\"private":{"supports_tool_use":true}}}}
     );
     defer declared_registry.deinit(alloc);
-    const models_json = (try extract(alloc, test_catalog, "opencode-go")).?;
-    defer alloc.free(models_json);
-    const catalog = try parse(alloc, models_json);
+    var provider = (try extract(alloc, test_catalog, "opencode-go")).?;
+    defer provider.deinit(alloc);
+    const catalog = try parse(alloc, provider.models_json);
     defer configured_provider.freeModelMetadata(alloc, catalog);
 
     const merged = try merge(alloc, catalog, declared_registry.get("local").?.model_metadata);
@@ -315,9 +361,9 @@ test "models.dev merge lets declared metadata override and add models" {
 test "models.dev parse and merge release memory on allocation failure" {
     const Check = struct {
         fn run(alloc: Allocator) !void {
-            const models_json = (try extract(alloc, test_catalog, "opencode-go")).?;
-            defer alloc.free(models_json);
-            const catalog = try parse(alloc, models_json);
+            var provider = (try extract(alloc, test_catalog, "opencode-go")).?;
+            defer provider.deinit(alloc);
+            const catalog = try parse(alloc, provider.models_json);
             defer configured_provider.freeModelMetadata(alloc, catalog);
             const merged = try merge(alloc, catalog, catalog[3..4]);
             configured_provider.freeModelMetadata(alloc, merged);

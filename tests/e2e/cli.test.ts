@@ -365,7 +365,7 @@ describe("cli: help", () => {
       expect(stdout).toContain("Choose the active model provider");
       // `fx setup` is deprecated and hidden; `fx login --api-key` replaces it.
       expect(stdout).not.toContain("Configure a Vercel AI Gateway API key");
-      expect(stdout).toContain("login [vercel|codex|grok] [--api-key]");
+      expect(stdout).toContain("login [vercel|codex|grok|NAME] [--api-key]");
       expect(stdout).toContain("Choose a Vercel AI Gateway team");
       expect(stdout).toContain("Show Vercel AI Gateway credits");
       expect(stdout).not.toContain("Sign in to Vercel or a selected provider");
@@ -2758,7 +2758,7 @@ describe("cli: setup", () => {
       expect(noTerminal.code).toBe(1);
       expect(noTerminal.stderr).toBe("fx login: an interactive terminal is required to paste an API key\n");
 
-      const usage = "usage: fx login [vercel|codex|grok] [--api-key]\n";
+      const usage = "usage: fx login [vercel|codex|grok] [--api-key] | fx login NAME [--model <id>]\n";
       const cases: [string[], string][] = [
         [["login", "codex", "--api-key"], "fx login: --api-key works only with vercel\n"],
         [["login", "--bogus"], "fx login: unknown flag --bogus\n" + usage],

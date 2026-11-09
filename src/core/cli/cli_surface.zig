@@ -40,6 +40,9 @@ const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
+const provider_keys = @import("../auth/provider_keys.zig");
+const configured_provider = @import("../config/configured_provider.zig");
+const models_dev = @import("../config/models_dev.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -292,15 +295,21 @@ fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
 
 const LoginArgs = struct {
     provider: ?model_provider.ProviderId = null,
+    /// A provider under "providers" in settings.json, or a models.dev provider
+    /// id to add there. Borrowed from the arguments.
+    configured: ?[]const u8 = null,
+    /// The model to select with a configured provider. Borrowed.
+    model: ?[]const u8 = null,
     /// Paste an AI Gateway API key instead of signing in through the browser.
     api_key: bool = false,
 };
 
-const LoginFlag = enum { api_key };
+const LoginFlag = enum { api_key, model };
 const login_flag_ids = cli_flags.idTable(LoginFlag, &builtin_commands.login_options);
 
-/// `fx login [vercel|codex|grok] [--api-key]`, in either order.
-fn parseLoginArgs(rest: []const [:0]const u8) error{ InvalidLoginProviderArgs, ApiKeyNeedsVercel }!LoginArgs {
+/// `fx login [vercel|codex|grok] [--api-key]` or `fx login NAME [--model <id>]`,
+/// in either order.
+fn parseLoginArgs(rest: []const [:0]const u8) error{ InvalidLoginProviderArgs, ApiKeyNeedsVercel, ModelNeedsConfiguredProvider }!LoginArgs {
     var parsed: LoginArgs = .{};
     var provider_arg: ?[]const u8 = null;
     var parser: cli_flags.Parser = .init(&builtin_commands.login_options, rest);
@@ -311,13 +320,260 @@ fn parseLoginArgs(rest: []const [:0]const u8) error{ InvalidLoginProviderArgs, A
         },
         .option => |match| switch (login_flag_ids[match.index].?) {
             .api_key => parsed.api_key = true,
+            .model => {
+                const model = match.value orelse return error.InvalidLoginProviderArgs;
+                configured_provider.validate_model_id(model) catch return error.InvalidLoginProviderArgs;
+                parsed.model = model;
+            },
         },
     };
     if (provider_arg) |name| {
-        parsed.provider = provider_catalog.parse(name) orelse return error.InvalidLoginProviderArgs;
+        if (provider_catalog.parse(name)) |provider| {
+            parsed.provider = provider;
+        } else {
+            configured_provider.validate_id(name) catch return error.InvalidLoginProviderArgs;
+            parsed.configured = name;
+        }
     }
-    if (parsed.api_key and (parsed.provider orelse .gateway) != .gateway) return error.ApiKeyNeedsVercel;
+    if (parsed.api_key and (parsed.configured != null or (parsed.provider orelse .gateway) != .gateway)) return error.ApiKeyNeedsVercel;
+    if (parsed.model != null and parsed.configured == null) return error.ModelNeedsConfiguredProvider;
     return parsed;
+}
+
+/// The configured provider `fx logout NAME` names, or null for a built-in
+/// provider or a usage error, which `parseLoginProvider` reports.
+fn parseLogoutConfigured(rest: []const [:0]const u8) ?[]const u8 {
+    if (rest.len != 1 or provider_catalog.parse(rest[0]) != null) return null;
+    configured_provider.validate_id(rest[0]) catch return null;
+    return rest[0];
+}
+
+/// `fx login NAME`: saves an API key for a configured provider. A name that
+/// settings.json does not list is looked up on models.dev, and the provider is
+/// added with the base URL models.dev gives at this moment; later catalog
+/// changes describe its models but never move its requests elsewhere.
+fn runConfiguredLogin(alloc: Allocator, cfg: Config, deps: RunDeps, name: []const u8, model: ?[]const u8) !bool {
+    var registry = config_runtime.loadConfiguredProviders(alloc) catch |err| {
+        debug_trace.logf("auth", "configured login settings load failed err={s}", .{@errorName(err)});
+        try writeStderr(deps, "fx login: could not read the providers in settings.json\n");
+        return false;
+    };
+    defer registry.deinit(alloc);
+
+    var catalog_entry: ?models_dev.Provider = null;
+    defer if (catalog_entry) |*entry| entry.deinit(alloc);
+    var env_name: []const u8 = undefined;
+    var env_buffer: [configured_provider.max_id_bytes + "_API_KEY".len]u8 = undefined;
+    if (registry.get(name)) |definition| {
+        switch (definition.auth) {
+            .none => {
+                try writeLoginProblem(alloc, deps, "{s} uses no API key: its auth type in settings.json is none", .{name});
+                return false;
+            },
+            .bearer => |env| env_name = env,
+        }
+    } else {
+        configured_provider.validate_catalog_id(name) catch {
+            try writeLoginProblem(alloc, deps, "{s} is neither a provider in settings.json nor a models.dev provider id", .{name});
+            return false;
+        };
+        const lookup = cfg.provider_set.lookup_models_dev_fn orelse {
+            try writeLoginProblem(alloc, deps, "this host cannot look up models.dev providers", .{});
+            return false;
+        };
+        catalog_entry = lookup(alloc, name) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            if (err == error.UnknownModelsDevProvider) {
+                try writeLoginProblem(alloc, deps, "{s} is neither a provider in settings.json nor a provider on models.dev", .{name});
+            } else {
+                try writeLoginProblem(alloc, deps, "could not read models.dev ({s})", .{@errorName(err)});
+            }
+            return false;
+        };
+        const entry = &catalog_entry.?;
+        const api = entry.api orelse {
+            try writeLoginProblem(alloc, deps, "models.dev lists no Chat Completions address for {s}; add it to settings.json by hand", .{name});
+            return false;
+        };
+        if (!acceptableBaseUrl(api)) {
+            try writeLoginProblem(alloc, deps, "models.dev gives {s} an address fx does not use: {f}", .{ name, text_utils.terminalSafe(api) });
+            return false;
+        }
+        env_name = entry.env orelse keyEnvName(&env_buffer, name);
+    }
+    const label = if (catalog_entry) |entry| entry.name else name;
+
+    const key = readProviderKey(alloc, deps, label) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        try writeStderr(deps, "\n");
+        try writeLoginProblem(alloc, deps, "the API key was not read", .{});
+        return false;
+    };
+    defer secret.zeroAndFree(alloc, key);
+    provider_keys.validateKey(key) catch {
+        try writeLoginProblem(alloc, deps, "an API key is one line without spaces; nothing was saved", .{});
+        return false;
+    };
+    provider_keys.store(alloc, name, key) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        try writeLoginProblem(alloc, deps, "the API key was not saved", .{});
+        return false;
+    };
+
+    if (catalog_entry) |entry| {
+        const definition_json = try std.json.Stringify.valueAlloc(alloc, .{
+            .protocol = "openai-chat-completions",
+            .base_url = entry.api.?,
+            .auth = .{ .type = "bearer", .env = env_name },
+            .models_dev = name,
+        }, .{});
+        defer alloc.free(definition_json);
+        var attempt = config_runtime.attemptUserPreferences(alloc, .{
+            .configured_provider = .{ .name = name, .definition_json = definition_json },
+        });
+        defer attempt.deinit(alloc);
+        switch (attempt) {
+            .failure => |failure| {
+                debug_trace.logf("auth", "configured login settings write failed err={s}", .{@errorName(failure.err)});
+                try writeLoginProblem(alloc, deps, "the key was saved, but settings.json was not updated", .{});
+                return false;
+            },
+            .outcome => {},
+        }
+        const added = try alloc.print("Added {s} to settings.json: {f}\n", .{ name, text_utils.terminalSafe(entry.api.?) });
+        defer alloc.free(added);
+        try writeStdout(deps, added);
+    }
+    const saved = try alloc.print("Saved the {f} API key.\n", .{text_utils.terminalSafe(label)});
+    defer alloc.free(saved);
+    try writeStdout(deps, saved);
+    if (io_mod.getenv(env_name)) |value| if (value.len > 0) {
+        const notice = try alloc.print("{s} is set, and fx uses it instead of the saved key.\n", .{env_name});
+        defer alloc.free(notice);
+        try writeStderr(deps, notice);
+    };
+
+    const target = model_provider.parse(name).?;
+    if (model) |id| {
+        var attempt = config_runtime.attemptUserPreferences(alloc, .{
+            .model_preference = .{ .provider = target, .model = id },
+        });
+        defer attempt.deinit(alloc);
+        switch (attempt) {
+            .failure => {
+                try writeLoginProblem(alloc, deps, "the key was saved, but the model was not", .{});
+                return false;
+            },
+            .outcome => {},
+        }
+    }
+    const activated = activateProviderSelection(alloc, cfg, deps, target, .provider_login, null) catch |err| switch (err) {
+        error.ConfiguredModelNotSelected => {
+            try writeModelHint(alloc, deps, name, if (catalog_entry) |entry| entry.models_json else null);
+            return true;
+        },
+        else => return err,
+    };
+    if (!activated) return false;
+    const selected = try alloc.print("Provider set to {s}.\n", .{name});
+    defer alloc.free(selected);
+    try writeStdout(deps, selected);
+    return true;
+}
+
+/// Says how to pick a model for a provider that has none selected, listing
+/// the catalog's models when the login just read them.
+fn writeModelHint(alloc: Allocator, deps: RunDeps, name: []const u8, models_json: ?[]const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print("No model is selected for {s}. Choose one with: fx login {s} --model <id>\n", .{ name, name });
+    if (models_json) |json| listed: {
+        const models = models_dev.parse(alloc, json) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            break :listed;
+        };
+        defer configured_provider.freeModelMetadata(alloc, models);
+        if (models.len == 0) break :listed;
+        try out.writer.writeAll("Models:");
+        for (models) |metadata| try out.writer.print(" {s}", .{metadata.id});
+        try out.writer.writeAll("\n");
+    }
+    try writeStdout(deps, out.written());
+}
+
+fn writeLoginProblem(alloc: Allocator, deps: RunDeps, comptime fmt: []const u8, args: anytype) !void {
+    const message = try alloc.print("fx login: " ++ fmt ++ "\n", args);
+    defer alloc.free(message);
+    try writeStderr(deps, message);
+}
+
+/// An https address, or an http one on this machine, where nothing crosses
+/// the network in the clear.
+fn acceptableBaseUrl(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return uri.host != null;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
+    const host_component = uri.host orelse return false;
+    const host_name = switch (host_component) {
+        .raw, .percent_encoded => |text| text,
+    };
+    for ([_][]const u8{ "localhost", "127.0.0.1", "[::1]", "::1" }) |loopback| {
+        if (std.ascii.eqlIgnoreCase(host_name, loopback)) return true;
+    }
+    return false;
+}
+
+/// `<ID>_API_KEY` for a provider models.dev names no variable for.
+fn keyEnvName(buffer: []u8, id: []const u8) []const u8 {
+    var len: usize = 0;
+    if (!std.ascii.isAlphabetic(id[0])) {
+        @memcpy(buffer[0..3], "FX_");
+        len = 3;
+    }
+    for (id) |byte| {
+        if (len == buffer.len - "_API_KEY".len) break;
+        buffer[len] = if (std.ascii.isAlphanumeric(byte)) std.ascii.toUpper(byte) else '_';
+        len += 1;
+    }
+    @memcpy(buffer[len..][0.."_API_KEY".len], "_API_KEY");
+    return buffer[0 .. len + "_API_KEY".len];
+}
+
+test "fx login accepts https and loopback http addresses and names a missing key variable" {
+    try std.testing.expect(acceptableBaseUrl("https://api.deepseek.com"));
+    try std.testing.expect(acceptableBaseUrl("http://127.0.0.1:1234/v1"));
+    try std.testing.expect(acceptableBaseUrl("http://localhost/v1"));
+    try std.testing.expect(!acceptableBaseUrl("http://api.example.com/v1"));
+    try std.testing.expect(!acceptableBaseUrl("file:///etc/passwd"));
+    try std.testing.expect(!acceptableBaseUrl("not a url"));
+
+    var buffer: [configured_provider.max_id_bytes + "_API_KEY".len]u8 = undefined;
+    try std.testing.expectEqualStrings("OPENCODE_GO_API_KEY", keyEnvName(&buffer, "opencode-go"));
+    try std.testing.expectEqualStrings("FX_302_AI_API_KEY", keyEnvName(&buffer, "302.ai"));
+    const long = text_utils.repeat("a", configured_provider.max_id_bytes);
+    try std.testing.expect(std.mem.endsWith(u8, keyEnvName(&buffer, long), "_API_KEY"));
+}
+
+/// Reads the key hidden from a terminal, else as the first line of stdin, so
+/// `fx login NAME < key-file` works where no terminal is attached. Caller
+/// owns the result and frees it with `secret.zeroAndFree`.
+fn readProviderKey(alloc: Allocator, deps: RunDeps, label: []const u8) ![]u8 {
+    if (deps.setup_terminal_available(deps.setup_ctx)) {
+        const prompt = try alloc.print("Paste the {f} API key (input hidden): ", .{text_utils.terminalSafe(label)});
+        defer alloc.free(prompt);
+        try writeStderr(deps, prompt);
+        const key = try deps.read_masked_key(deps.setup_ctx, alloc, deps.write_stderr, deps.stderr_ctx);
+        try writeStderr(deps, "\n");
+        return key;
+    }
+    var buffer: [512]u8 = undefined;
+    var reader = std.Io.File.stdin().reader(io_mod.getIo(), &buffer);
+    const input = reader.interface.allocRemaining(alloc, .limited(provider_keys.max_key_bytes + 2)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ProviderKeyUnreadable,
+    };
+    defer secret.zeroAndFree(alloc, input);
+    return alloc.dupe(u8, std.mem.trim(u8, input, " \t\r\n"));
 }
 
 fn selectCatalogModel(
@@ -1321,7 +1577,7 @@ fn activateProviderSelectionFallible(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
-                .configured => "configure the provider auth environment variable first",
+                .configured => "save a key with fx login first",
             },
         );
         return false;
@@ -1591,9 +1847,10 @@ fn runNonInteractiveWithDeps(
             const login_args = parseLoginArgs(rest) catch |err| {
                 switch (err) {
                     error.ApiKeyNeedsVercel => try writeStderr(deps, "fx login: --api-key works only with vercel\n"),
+                    error.ModelNeedsConfiguredProvider => try writeStderr(deps, "fx login: --model works only with a configured provider's name\n"),
                     error.InvalidLoginProviderArgs => {
                         try writeFlagFailure(alloc, deps, .login, rest);
-                        try writeStderr(deps, "usage: fx login [vercel|codex|grok] [--api-key]\n");
+                        try writeStderr(deps, "usage: fx login [vercel|codex|grok] [--api-key] | fx login NAME [--model <id>]\n");
                     },
                 }
                 return usage_failure;
@@ -1601,6 +1858,9 @@ fn runNonInteractiveWithDeps(
             if (cfg.auth_mode == .host_managed) {
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
+            }
+            if (login_args.configured) |name| {
+                return if (try runConfiguredLogin(alloc, cfg, deps, name, login_args.model)) .handled_success else .handled_failure;
             }
             if (login_args.api_key) {
                 return if (try runPasteSetup(alloc, cfg.secret_store, deps, "fx login")) .handled_success else .handled_failure;
@@ -1628,8 +1888,21 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .logout => |rest| {
+            if (parseLogoutConfigured(rest)) |name| {
+                const outcome = provider_keys.delete(name) catch {
+                    try writeStderr(deps, "fx logout: failed to remove the saved API key\n");
+                    return .handled_failure;
+                };
+                const message = try alloc.print("{s} {s}.\n", .{
+                    if (outcome == .deleted) "Removed the saved API key for" else "No saved API key for",
+                    name,
+                });
+                defer alloc.free(message);
+                try writeStdout(deps, message);
+                return .handled_success;
+            }
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|NAME]\n");
                 return usage_failure;
             };
             if (cfg.auth_mode == .host_managed) {
@@ -5699,6 +5972,12 @@ test "login arguments take one provider and --api-key only for vercel" {
     try std.testing.expectError(error.ApiKeyNeedsVercel, parseLoginArgs(&.{ "codex", "--api-key" }));
     try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginArgs(&.{ "vercel", "codex" }));
     try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginArgs(&.{"--bogus"}));
+    try std.testing.expectEqualDeep(LoginArgs{ .configured = "opencode-go", .model = "deepseek-v4.1-flash" }, try parseLoginArgs(&.{ "opencode-go", "--model", "deepseek-v4.1-flash" }));
+    try std.testing.expectError(error.ApiKeyNeedsVercel, parseLoginArgs(&.{ "opencode-go", "--api-key" }));
+    try std.testing.expectError(error.ModelNeedsConfiguredProvider, parseLoginArgs(&.{ "codex", "--model", "gpt" }));
+    try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginArgs(&.{"../keys"}));
+    try std.testing.expectEqualStrings("opencode", parseLogoutConfigured(&.{"opencode"}).?);
+    try std.testing.expect(parseLogoutConfigured(&.{"vercel"}) == null);
 }
 
 test "workspace indeterminate errors report the reconciled durable state" {

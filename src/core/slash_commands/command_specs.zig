@@ -1721,7 +1721,7 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "Choose the active model provider") != null);
     // `fx setup` is deprecated and hidden; `fx login --api-key` replaces it.
     try std.testing.expect(std.mem.find(u8, text, "Configure a Vercel AI Gateway API key") == null);
-    try std.testing.expect(std.mem.find(u8, text, "login [vercel|codex|grok] [--api-key]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "login [vercel|codex|grok|NAME] [--api-key]") != null);
     try std.testing.expect(std.mem.find(u8, text, "Choose a Vercel AI Gateway team") != null);
     try std.testing.expect(std.mem.find(u8, text, "Show Vercel AI Gateway credits") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign in to Vercel or a selected provider") == null);

@@ -27,10 +27,23 @@ const login_providers = [_]command_specs.SubcommandDoc{
     .{ .usage = "vercel", .description = "Vercel AI Gateway (the default)", .options = &login_options },
     .{ .usage = "codex", .description = "ChatGPT subscription" },
     .{ .usage = "grok", .description = "Grok subscription" },
+    .{ .usage = "NAME", .description = "Save an API key for a provider in settings.json, or add a models.dev provider by its id", .options = &login_name_options },
+};
+
+pub const login_name_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--model <id>", .description = "Select this model of the provider, so fx uses it from now on" },
+};
+
+const logout_providers = [_]command_specs.SubcommandDoc{
+    login_providers[0],
+    login_providers[1],
+    login_providers[2],
+    .{ .usage = "NAME", .description = "Delete the API key fx login saved for a configured provider" },
 };
 
 pub const login_options = [_]command_specs.OptionDoc{
     .{ .flag = "--api-key", .description = "Paste a Vercel AI Gateway API key instead of signing in through the browser" },
+    login_name_options[0],
 };
 
 pub const sessions_options = [_]command_specs.OptionDoc{
@@ -271,7 +284,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login [vercel|codex|grok] [--api-key]",
+        .usage = "login [vercel|codex|grok] [--api-key] | login NAME [--model <id>]",
         .summary = "Sign in to Vercel or a selected provider",
         .subcommands = &login_providers,
         .options = &login_options,
@@ -279,9 +292,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .logout,
         .token = "logout",
-        .usage = "logout [vercel|codex|grok]",
+        .usage = "logout [vercel|codex|grok|NAME]",
         .summary = "Sign out of Vercel or a selected provider session",
-        .subcommands = &login_providers,
+        .subcommands = &logout_providers,
     },
     .{
         .kind = .setup,
@@ -479,8 +492,8 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [vercel|codex|grok] [--api-key]", .summary = "Sign in to a model provider" },
-        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "Sign out of a model provider" },
+        .{ .kind = .login, .usage = "login [vercel|codex|grok|NAME] [--api-key]", .summary = "Sign in to a model provider" },
+        .{ .kind = .logout, .usage = "logout [vercel|codex|grok|NAME]", .summary = "Sign out of a model provider" },
         .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
         .{ .kind = .models, .usage = "models" },
     } },

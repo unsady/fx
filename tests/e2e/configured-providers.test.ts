@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createServer as createTlsServer } from "node:tls";
@@ -300,6 +300,101 @@ describe("configured providers", () => {
       f.close();
     }
   }, 30000);
+
+  test("fx login saves a configured provider's key, which its environment variable overrides", async () => {
+    const f = fixture();
+    try {
+      const env = { ...f.env, FX_TEST_PROVIDER_TOKEN: undefined };
+      const login = await runFx(["login", "remote"], { cwd: f.workspace, env, stdin: "saved-key\n" });
+      if (login.code !== 0) throw new Error(`fx login failed: ${login.stdout} ${login.stderr}`);
+      expect(login.stdout).toContain("Saved the remote API key.");
+      expect(login.stdout).toContain("Provider set to remote.");
+      const keyFile = join(f.home, ".fx", "provider-keys", "remote");
+      expect(readFileSync(keyFile, "utf8")).toBe("saved-key");
+      expect(statSync(keyFile).mode & 0o777).toBe(0o600);
+
+      const saved = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (saved.code !== 0) throw new Error(`fx ask failed: ${saved.stdout} ${saved.stderr}`);
+      expect(f.requests.at(-1)!.authorization).toBe("Bearer saved-key");
+
+      const overridden = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(overridden.code).toBe(0);
+      expect(f.requests.at(-1)!.authorization).toBe("Bearer own-provider-token");
+
+      const logout = await runFx(["logout", "remote"], { cwd: f.workspace, env });
+      expect(logout.stdout).toBe("Removed the saved API key for remote.\n");
+      expect(existsSync(keyFile)).toBe(false);
+      const signedOut = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      expect(signedOut.code).not.toBe(0);
+      expect(f.requests).toHaveLength(2);
+
+      const keyless = await runFx(["login", "local"], { cwd: f.workspace, env, stdin: "key\n" });
+      expect(keyless.code).toBe(1);
+      expect(keyless.stderr).toContain("local uses no API key");
+      const spaced = await runFx(["login", "remote"], { cwd: f.workspace, env, stdin: "two words\n" });
+      expect(spaced.code).toBe(1);
+      expect(existsSync(keyFile)).toBe(false);
+    } finally { f.close(); }
+  }, 60000);
+
+  test("fx login adds a models.dev provider with the base URL the catalog gives", async () => {
+    const f = fixture();
+    const catalogServer = Bun.serve({
+      hostname: "127.0.0.1", port: 0,
+      fetch() {
+        return Response.json({
+          fresh: { id: "fresh", name: "Fresh AI", env: ["FX_TEST_FRESH_KEY"], api: f.settings.providers.local.base_url, models: {
+            "fresh-model": { id: "fresh-model", tool_call: true, limit: { context: 131072, output: 4096 } },
+          } },
+          native: { id: "native", name: "Native", env: ["NATIVE_KEY"], models: {} },
+        });
+      },
+    });
+    try {
+      const env = { ...f.env, FX_TEST_MODELS_DEV_URL: `http://127.0.0.1:${catalogServer.port}/api.json` };
+      const login = await runFx(["login", "fresh"], { cwd: f.workspace, env, stdin: "fresh-key" });
+      if (login.code !== 0) throw new Error(`fx login failed: ${login.stdout} ${login.stderr}`);
+      expect(login.stdout).toBe([
+        `Added fresh to settings.json: ${f.settings.providers.local.base_url}`,
+        "Saved the Fresh AI API key.",
+        "No model is selected for fresh. Choose one with: fx login fresh --model <id>",
+        "Models: fresh-model",
+        "",
+      ].join("\n"));
+      const settings = JSON.parse(readFileSync(f.settingsPath, "utf8"));
+      expect(settings.providers.fresh).toEqual({
+        protocol: "openai-chat-completions",
+        base_url: f.settings.providers.local.base_url,
+        auth: { type: "bearer", env: "FX_TEST_FRESH_KEY" },
+        models_dev: "fresh",
+      });
+      expect(settings.provider).toBe("local");
+
+      const chosen = await runFx(["login", "fresh", "--model", "fresh-model"], { cwd: f.workspace, env, stdin: "fresh-key\n" });
+      if (chosen.code !== 0) throw new Error(`fx login --model failed: ${chosen.stdout} ${chosen.stderr}`);
+      expect(chosen.stdout).toBe("Saved the fresh API key.\nProvider set to fresh.\n");
+      expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).models.fresh).toBe("fresh-model");
+
+      const listed = await runFx(["models", "--json"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (listed.code !== 0) throw new Error(`fx models failed: ${listed.stdout} ${listed.stderr}`);
+      expect(JSON.parse(listed.stdout).ids).toEqual(["fresh-model"]);
+
+      const asked = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (asked.code !== 0) throw new Error(`fx ask failed: ${asked.stdout} ${asked.stderr}`);
+      expect(f.requests.at(-1)!.authorization).toBe("Bearer fresh-key");
+      expect(f.requests.at(-1)!.body.model).toBe("fresh-model");
+
+      const native = await runFx(["login", "native"], { cwd: f.workspace, env, stdin: "key" });
+      expect(native.code).toBe(1);
+      expect(native.stderr).toContain("models.dev lists no Chat Completions address for native");
+      const missing = await runFx(["login", "missing"], { cwd: f.workspace, env, stdin: "key" });
+      expect(missing.code).toBe(1);
+      expect(missing.stderr).toContain("missing is neither a provider in settings.json nor a provider on models.dev");
+    } finally {
+      catalogServer.stop(true);
+      f.close();
+    }
+  }, 60000);
 
   test("terminal usage may repeat an empty matching finished choice", async () => {
     const f = fixture(async body => {

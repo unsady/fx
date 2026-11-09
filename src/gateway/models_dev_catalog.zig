@@ -89,6 +89,27 @@ fn load(alloc: Allocator, id: []const u8, cancel_flag: ?*std.atomic.Value(bool))
 
 /// The provider's `models` object from a fresh download. Caller owns it.
 fn download(alloc: Allocator, id: []const u8, cancel_flag: ?*std.atomic.Value(bool)) ![]u8 {
+    const entry = try downloadProvider(alloc, id, cancel_flag);
+    alloc.free(entry.name);
+    if (entry.api) |api| alloc.free(api);
+    if (entry.env) |env| alloc.free(env);
+    return entry.models_json;
+}
+
+/// Downloads models.dev and returns provider `id`'s entry, saving its models
+/// to the cache as a refresh would. `fx login` reads the provider's name,
+/// base URL, and key variable from it. Caller owns the result.
+pub fn lookup(alloc: Allocator, id: []const u8) !models_dev.Provider {
+    if (comptime host_target.is_wasm) return error.ModelsDevUnavailable;
+    const entry = try downloadProvider(alloc, id, null);
+    writeCache(alloc, id, entry.models_json) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf("gateway", "models_dev cache not saved provider={s} error={s}", .{ id, @errorName(err) });
+    };
+    return entry;
+}
+
+fn downloadProvider(alloc: Allocator, id: []const u8, cancel_flag: ?*std.atomic.Value(bool)) !models_dev.Provider {
     const url = io_mod.getenv(test_url_env) orelse default_url;
     if (io_mod.getenv(test_url_env) != null and !gateway_client.isLoopbackHttpUrl(url)) return error.InvalidModelsDevTestUrl;
 
@@ -101,12 +122,10 @@ fn download(alloc: Allocator, id: []const u8, cancel_flag: ?*std.atomic.Value(bo
     var body = try gateway_client.runBoundedHttpOperation(Body, alloc, cancel_flag orelse &fallback_cancel, deadline, &operation);
     defer body.deinit(alloc);
 
-    const models_json = try models_dev.extract(alloc, body.bytes, id) orelse return error.UnknownModelsDevProvider;
-    if (models_json.len > max_cache_bytes) {
-        alloc.free(models_json);
-        return error.ModelsDevCatalogTooLarge;
-    }
-    return models_json;
+    var entry = try models_dev.extract(alloc, body.bytes, id) orelse return error.UnknownModelsDevProvider;
+    errdefer entry.deinit(alloc);
+    if (entry.models_json.len > max_cache_bytes) return error.ModelsDevCatalogTooLarge;
+    return entry;
 }
 
 const Body = struct {

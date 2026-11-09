@@ -131,6 +131,14 @@ fn addOptions(model: *Model, arena: Allocator, target: *Node, options: []const O
     }
 }
 
+fn isPlaceholder(word: []const u8) bool {
+    if (word.len == 0 or word[0] == '<') return true;
+    for (word) |byte| {
+        if (std.ascii.isLower(byte)) return false;
+    }
+    return true;
+}
+
 const help_flag: Entry = .{ .name = "--help", .description = "Show help for this command" };
 
 /// A word offers only the flags it declares, plus `--help`: a parent's flags
@@ -138,6 +146,8 @@ const help_flag: Entry = .{ .name = "--help", .description = "Show help for this
 fn addSubcommands(model: *Model, arena: Allocator, parent_path: []const u8, subcommands: []const SubcommandDoc) !void {
     for (subcommands) |sub| {
         const name = sub.name();
+        // A placeholder such as `NAME` stands for a word the user picks.
+        if (isPlaceholder(name)) continue;
         {
             const parent = try model.node(arena, parent_path);
             try addEntry(arena, &parent.words, .{ .name = name, .description = sub.description });

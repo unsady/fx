@@ -9,6 +9,7 @@ const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
+const provider_keys = @import("provider_keys.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
@@ -387,7 +388,14 @@ pub fn resolveForProvider(
         const definition = registry.get(bound.label()).?;
         return switch (definition.auth) {
             .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
-            .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
+            .bearer => |env| {
+                if (try loadEnvCredential(alloc, env, .configured)) |credential| return .{ .credential = credential };
+                const saved = provider_keys.load(alloc, bound.label()) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    return .{ .failure = .{ .source = .configured, .err = err } };
+                };
+                return .{ .credential = if (saved) |key| .{ .token = key, .source = .configured } else null };
+            },
         };
     }
     if (provider != .gateway) {

@@ -9,6 +9,7 @@ const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_rev
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 const chat_completions = @import("../gateway/chat_completions.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
+const models_dev_catalog = @import("../gateway/models_dev_catalog.zig");
 
 fn configuredBundle(_: ?*anyopaque, definition: *const configured_provider.Definition) provider_set.Bundle {
     return chat_completions.bundle(definition);
@@ -16,6 +17,7 @@ fn configuredBundle(_: ?*anyopaque, definition: *const configured_provider.Defin
 
 pub const native = provider_set.Set{
     .configured_fn = configuredBundle,
+    .lookup_models_dev_fn = models_dev_catalog.lookup,
     .gateway = gateway.provider_bundle,
     .codex = .{
         .capabilities = .{ .sends_output_limit = false },

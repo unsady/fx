@@ -184,7 +184,7 @@ pub fn Runtime(comptime App: type) type {
                         .gateway => credentials.missing_interactive_credential_message,
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,
-                        .configured => "Configured provider authentication is unavailable. Check settings.json and its environment variable.",
+                        .configured => "Configured provider authentication is unavailable. Save a key with fx login and the provider's name, or set its environment variable.",
                     },
                 }, true),
                 .failed => |failure| {
@@ -209,7 +209,7 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .warning,
                     .body = if (provider == .configured)
-                        "Configured provider authentication is unavailable. Check settings.json and its environment variable."
+                        "Configured provider authentication is unavailable. Save a key with fx login and the provider's name, or set its environment variable."
                     else if (provider == .grok)
                         credentials.missing_grok_interactive_credential_message
                     else

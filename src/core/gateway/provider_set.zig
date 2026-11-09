@@ -60,6 +60,9 @@ pub const Set = struct {
     /// Builds a configured provider's bundle; `configured_context` is passed through.
     configured_fn: ?*const fn (?*anyopaque, *const @import("../config/configured_provider.zig").Definition) Bundle = null,
     configured_context: ?*anyopaque = null,
+    /// Downloads one provider's models.dev entry for `fx login`. Null on hosts
+    /// without network access of their own.
+    lookup_models_dev_fn: ?*const fn (Allocator, []const u8) anyerror!@import("../config/models_dev.zig").Provider = null,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
