@@ -233,6 +233,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_MODELS_DEV_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_OPENAI_CODEX_MODELS_URL": {
       "job": "test",
       "stability": "internal"

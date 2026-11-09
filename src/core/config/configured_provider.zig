@@ -29,6 +29,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidToolChoiceMode,
     InvalidModelId,
     InvalidModelMetadata,
+    InvalidCatalogId,
 };
 
 pub const Protocol = enum { @"openai-chat-completions" };
@@ -64,6 +65,9 @@ pub const Definition = struct {
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
+    /// The provider's id in the models.dev catalog, which lists its models
+    /// and their capabilities. Declared model_metadata overrides it.
+    models_dev: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
@@ -105,13 +109,19 @@ pub const Definition = struct {
             .bearer => |env| alloc.free(env),
         }
         if (self.reviewer_model) |id| alloc.free(id);
-        for (self.model_metadata) |metadata| {
-            alloc.free(metadata.id);
-            alloc.free(metadata.reasoning_efforts);
-        }
-        alloc.free(self.model_metadata);
+        if (self.models_dev) |id| alloc.free(id);
+        freeModelMetadata(alloc, self.model_metadata);
     }
 };
+
+/// Frees metadata whose ids and reasoning levels the slice owns.
+pub fn freeModelMetadata(alloc: Allocator, models: []const ModelMetadata) void {
+    for (models) |metadata| {
+        alloc.free(metadata.id);
+        alloc.free(metadata.reasoning_efforts);
+    }
+    alloc.free(models);
+}
 
 pub const Registry = struct {
     definitions: []const Definition = &.{},
@@ -175,7 +185,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "models_dev", "model_metadata" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -193,6 +203,12 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         try validate_model_id(model_value.string);
         reviewer = model_value.string;
     }
+    var catalog_id: ?[]const u8 = null;
+    if (value.object.get("models_dev")) |catalog_value| {
+        if (catalog_value != .string) return error.InvalidCatalogId;
+        try validate_catalog_id(catalog_value.string);
+        catalog_id = catalog_value.string;
+    }
 
     const owned_id = try alloc.dupe(u8, id);
     errdefer alloc.free(owned_id);
@@ -208,6 +224,8 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     };
     const owned_reviewer = if (reviewer) |model_id| try alloc.dupe(u8, model_id) else null;
     errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
+    const owned_catalog = if (catalog_id) |catalog| try alloc.dupe(u8, catalog) else null;
+    errdefer if (owned_catalog) |catalog| alloc.free(catalog);
     return .{
         .id = owned_id,
         .protocol = .@"openai-chat-completions",
@@ -215,6 +233,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .auth = owned_auth,
         .tool_choice_mode = mode,
         .reviewer_model = owned_reviewer,
+        .models_dev = owned_catalog,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
     };
 }
@@ -336,6 +355,17 @@ pub fn validate_id(id: []const u8) error{ LimitExceeded, InvalidProviderId, Rese
     }
     for ([_][]const u8{ "gateway", "codex", "grok" }) |reserved| {
         if (std.ascii.eqlIgnoreCase(id, reserved)) return error.ReservedProviderId;
+    }
+}
+
+/// models.dev provider ids are lowercase ASCII such as `opencode-go`. The id
+/// also names a cache file, so it never contains a path separator or starts
+/// with a dot.
+pub fn validate_catalog_id(id: []const u8) error{ LimitExceeded, InvalidCatalogId }!void {
+    if (id.len > max_id_bytes) return error.LimitExceeded;
+    if (id.len == 0 or !(std.ascii.isLower(id[0]) or std.ascii.isDigit(id[0]))) return error.InvalidCatalogId;
+    for (id) |byte| {
+        if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and std.mem.findScalar(u8, "-_.", byte) == null) return error.InvalidCatalogId;
     }
 }
 
@@ -548,6 +578,11 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":null}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"\"}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"bad\\nmodel\"}}", .err = error.InvalidModelId },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"models_dev\":null}}", .err = error.InvalidCatalogId },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"models_dev\":\"\"}}", .err = error.InvalidCatalogId },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"models_dev\":\"OpenCode\"}}", .err = error.InvalidCatalogId },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"models_dev\":\"../auth\"}}", .err = error.InvalidCatalogId },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"models_dev\":\".hidden\"}}", .err = error.InvalidCatalogId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":null}}", .err = error.InvalidObject },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"\":{}}}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":[]}}}", .err = error.InvalidObject },
@@ -570,6 +605,19 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"\"]}}}}", .err = error.InvalidModelMetadata },
     };
     for (cases) |case| try std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, case.json));
+}
+
+test "configured provider keeps its models.dev id apart from its route" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc, "{\"local\":{" ++ test_required_fields ++ ",\"models_dev\":\"opencode-go\"}}");
+    defer registry.deinit(alloc);
+    var plain = try Registry.parse_json(alloc, "{\"local\":{" ++ test_required_fields ++ "}}");
+    defer plain.deinit(alloc);
+    const local = registry.get("local").?;
+    try std.testing.expectEqualStrings("opencode-go", local.models_dev.?);
+    try std.testing.expect(plain.get("local").?.models_dev == null);
+    // The catalog describes models; it never changes where requests go.
+    try std.testing.expectEqualSlices(u8, &plain.get("local").?.binding_identity(), &local.binding_identity());
 }
 
 test "configured provider keeps declared reasoning levels in declaration order" {

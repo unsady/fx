@@ -5312,6 +5312,7 @@ test {
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
+    _ = @import("core/config/models_dev.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/json_depth.zig");
     _ = provider_runtime;
@@ -5425,6 +5426,7 @@ test {
     _ = @import("core/gateway/model_catalog.zig");
     _ = @import("core/gateway/gateway_provider.zig");
     _ = @import("gateway/chat_completions.zig");
+    _ = @import("gateway/models_dev_catalog.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");

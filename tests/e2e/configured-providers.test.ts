@@ -258,6 +258,49 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 30000);
 
+  test("a models.dev catalog lists models and their reasoning levels, and is cached", async () => {
+    const f = fixture();
+    let catalogRequests = 0;
+    const catalogServer = Bun.serve({
+      hostname: "127.0.0.1", port: 0,
+      fetch() {
+        catalogRequests++;
+        return Response.json({
+          other: { id: "other", models: { "other-model": { id: "other-model" } } },
+          "test-provider": { id: "test-provider", models: {
+            "local-model": { id: "local-model", tool_call: true, reasoning: true, reasoning_options: [{ type: "effort", values: ["low", "high"] }], modalities: { input: ["text", "image"] }, limit: { context: 262144, output: 8192 } },
+            "catalog-model": { id: "catalog-model", tool_call: true, limit: { context: 131072, output: 4096 } },
+            "messages-model": { id: "messages-model", tool_call: true, provider: { npm: "@ai-sdk/anthropic" } },
+            "old-model": { id: "old-model", tool_call: true, status: "deprecated" },
+          } },
+        });
+      },
+    });
+    try {
+      const local = f.settings.providers.local as any;
+      local.models_dev = "test-provider";
+      local.model_metadata = { "own-model": { context_window: 32768, supports_tool_use: true } };
+      (f.settings as any).effort = "high";
+      f.save();
+      const env = { ...f.env, FX_TEST_MODELS_DEV_URL: `http://127.0.0.1:${catalogServer.port}/api.json` };
+
+      const listed = await runFx(["models", "--json"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (listed.code !== 0) throw new Error(`fx models failed: ${listed.stdout} ${listed.stderr}`);
+      expect(JSON.parse(listed.stdout).ids).toEqual(["catalog-model", "local-model", "messages-model", "own-model"]);
+      expect(catalogRequests).toBe(1);
+      expect(existsSync(join(f.home, ".fx", "model-catalogs", "test-provider.json"))).toBe(true);
+
+      const asked = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (asked.code !== 0) throw new Error(`fx ask failed: ${asked.stdout} ${asked.stderr}`);
+      expect(f.requests.at(-1)!.body.reasoning_effort).toBe("high");
+      // The second run reads the day-old-at-most cache instead of the network.
+      expect(catalogRequests).toBe(1);
+    } finally {
+      catalogServer.stop(true);
+      f.close();
+    }
+  }, 30000);
+
   test("terminal usage may repeat an empty matching finished choice", async () => {
     const f = fixture(async body => {
       const response = completion(body.model);

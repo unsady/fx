@@ -17,6 +17,7 @@ const types = @import("../core/shared/types.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const sse = @import("sse.zig");
+const models_dev_catalog = @import("models_dev_catalog.zig");
 const Allocator = std.mem.Allocator;
 
 /// Every callback borrows the immutable definition from the owning profile runtime.
@@ -24,14 +25,15 @@ pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     const context: *anyopaque = @ptrCast(@constCast(definition));
     return .{
         .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = project_replay },
-        .model_catalog = model_catalog_provider(definition),
+        .model_catalog = models_dev_catalog.provider(definition),
         .cli_model_catalog = .{ .context = context, .fetch_fn = fetch_cli_catalog },
         .permission_reviewer = .{ .context = context, .review_fn = review },
     };
 }
 
 /// The models the definition declares; there is no network request. Borrows
-/// the definition, which must outlive the provider.
+/// the definition, which must outlive the provider. The native bundle adds the
+/// models.dev catalog on top through `models_dev_catalog.provider`.
 pub fn model_catalog_provider(definition: *const definitions.Definition) catalog.Provider {
     const context: *anyopaque = @ptrCast(@constCast(definition));
     return .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = bound_identity(definition) };
@@ -293,10 +295,14 @@ fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.C
 
 fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
     if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
-    const definition = definition_at(raw);
+    return catalog_from_metadata(alloc, definition_at(raw).model_metadata);
+}
+
+/// Catalog entries for `models`, owned by the result.
+pub fn catalog_from_metadata(alloc: Allocator, models: []const definitions.ModelMetadata) Allocator.Error!catalog.ProviderResult {
     var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
     errdefer catalog.freeModelCatalog(alloc, &entries);
-    for (definition.model_metadata) |metadata| {
+    for (models) |metadata| {
         var entry = metadata_entry(metadata);
         entry.id = try alloc.dupe(u8, entry.id);
         errdefer alloc.free(entry.id);
@@ -343,7 +349,7 @@ test "configured capability lookup matches catalog projection and preserves unkn
 
 fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CliModelCatalogInput) gateway_provider.CliModelCatalogResult {
     const provenance = catalog.Provenance{ .access = catalog.AccessMetadata.init(input.access) };
-    const result = fetch_catalog(raw, alloc, .{ .access = input.access, .endpoint = input.endpoint, .cancel_flag = input.cancel_flag }) catch
+    const result = models_dev_catalog.provider(definition_at(raw)).fetch(alloc, .{ .access = input.access, .endpoint = input.endpoint, .cancel_flag = input.cancel_flag }) catch
         return .{ .failure = .{ .access = provenance.access, .anonymous_fallback_used = false, .failure = .{ .category = .resource_exhausted } } };
     switch (result) {
         .failure => |failure| return .{ .failure = .{ .access = provenance.access, .anonymous_fallback_used = false, .failure = failure } },
