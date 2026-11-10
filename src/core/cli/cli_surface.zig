@@ -151,6 +151,8 @@ pub const ResumeTarget = union(enum) {
 
 pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
+    /// `--tool-placement <tool>=<toolbox|direct>`, in order; never saved.
+    tool_placement_overrides: []config_runtime.tool_placement.Override = &.{},
     additional_directories: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
     provider_override: ?model_provider.ProviderId = null,
@@ -171,6 +173,7 @@ pub const LaunchModifiers = struct {
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
+        if (self.tool_placement_overrides.len > 0) alloc.free(self.tool_placement_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
         if (self.model_override) |model| alloc.free(model);
@@ -742,6 +745,7 @@ const LaunchFlag = enum {
     context_limit,
     add_dir,
     no_additional_dirs,
+    tool_placement,
     provider,
     provider_order,
     provider_strict,
@@ -784,6 +788,8 @@ const LaunchFlagMode = enum {
 fn parseLaunchFlags(alloc: Allocator, args: []const [:0]const u8, comptime mode: LaunchFlagMode) !GlobalLaunchArgs {
     var overrides: std.ArrayList(config_runtime.context_limits.Override) = .empty;
     errdefer overrides.deinit(alloc);
+    var placements: std.ArrayList(config_runtime.tool_placement.Override) = .empty;
+    errdefer placements.deinit(alloc);
     var directories: std.ArrayList([]u8) = .empty;
     errdefer {
         for (directories.items) |path| alloc.free(path);
@@ -814,6 +820,7 @@ fn parseLaunchFlags(alloc: Allocator, args: []const [:0]const u8, comptime mode:
         const value = match.value orelse "";
         switch (launch_flag_ids[match.index].?) {
             .context_limit => try overrides.append(alloc, try config_runtime.context_limits.parseOverride(value)),
+            .tool_placement => try placements.append(alloc, try config_runtime.tool_placement.parseOverride(value)),
             .add_dir => {
                 if (value.len == 0) return error.MissingAddDirectoryValue;
                 try directories.append(alloc, try alloc.dupe(u8, value));
@@ -866,6 +873,9 @@ fn parseLaunchFlags(alloc: Allocator, args: []const [:0]const u8, comptime mode:
     const override_slice = try overrides.toOwnedSlice(alloc);
     errdefer if (override_slice.len > 0) alloc.free(override_slice);
     modifiers.context_limit_overrides = override_slice;
+    const placement_slice = try placements.toOwnedSlice(alloc);
+    errdefer if (placement_slice.len > 0) alloc.free(placement_slice);
+    modifiers.tool_placement_overrides = placement_slice;
     modifiers.additional_directories = try directories.toOwnedSlice(alloc);
     return .{ .remaining = args[parser.index..], .modifiers = modifiers, .prompt = prompt };
 }
@@ -1829,6 +1839,7 @@ fn runNonInteractiveWithDeps(
                 .context_registry = cfg.context_registry,
                 .mode_registry = cfg.mode_registry,
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
+                .tool_placement_overrides = global_args.modifiers.tool_placement_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
                 .model_override = acp_opts.agent.model,
@@ -4078,6 +4089,7 @@ fn workflowConfigWithLaunchModifiers(
 ) @import("cli_ask.zig").Config {
     var result = workflowConfig(cfg);
     result.context_limit_overrides = modifiers.context_limit_overrides;
+    result.tool_placement_overrides = modifiers.tool_placement_overrides;
     result.additional_directories = modifiers.additional_directories;
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
     return result;
@@ -4141,6 +4153,9 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.InvalidProviderValue => "--provider accepts gateway, codex, grok, or a configured provider name",
         error.InvalidProviderOrderValue => "--provider-order accepts comma-separated provider slugs (letters, digits, '-')",
         error.InvalidPermissionModeValue => "--permission-mode accepts ask, auto, or full-access",
+        error.InvalidToolPlacementOverride => "--tool-placement takes <tool>=toolbox or <tool>=direct",
+        error.UnknownToolPlacementTool => "--tool-placement names a built-in tool that can move: " ++ config_runtime.tool_placement.movable_list,
+        error.InvalidToolPlacementValue => "--tool-placement puts a tool in toolbox or direct",
         else => null,
     };
 }
