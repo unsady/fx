@@ -2017,10 +2017,13 @@ fn maybeStartAskTitleTask(
     if (ctx.session.agent.history.items.len != 0) return null;
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const title_model = bundle.title_model orelse return null;
+    // A configured provider names sessions with the turn's model unless it
+    // names a model for titles, and may need no key at all.
+    const configured = ctx.provider == .configured;
+    const title_model = bundle.title_model orelse if (configured and ctx.model.len > 0) ctx.model else return null;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
-    if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
+    if (!configured and ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
     const task = session_title_generation.Task.create(.{
         .session_id = session_id,
         .model = title_model,

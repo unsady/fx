@@ -65,6 +65,9 @@ pub const Definition = struct {
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
+    /// Names new sessions. Without it, `fx ask` names them with the model of
+    /// the turn.
+    title_model: ?[]const u8 = null,
     /// The provider's id in the models.dev catalog, which lists its models
     /// and their capabilities. Declared model_metadata overrides it.
     models_dev: ?[]const u8 = null,
@@ -109,6 +112,7 @@ pub const Definition = struct {
             .bearer => |env| alloc.free(env),
         }
         if (self.reviewer_model) |id| alloc.free(id);
+        if (self.title_model) |id| alloc.free(id);
         if (self.models_dev) |id| alloc.free(id);
         freeModelMetadata(alloc, self.model_metadata);
     }
@@ -185,7 +189,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "models_dev", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "models_dev", "model_metadata" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -202,6 +206,12 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         if (model_value != .string) return error.InvalidModelId;
         try validate_model_id(model_value.string);
         reviewer = model_value.string;
+    }
+    var title: ?[]const u8 = null;
+    if (value.object.get("title_model")) |model_value| {
+        if (model_value != .string) return error.InvalidModelId;
+        try validate_model_id(model_value.string);
+        title = model_value.string;
     }
     var catalog_id: ?[]const u8 = null;
     if (value.object.get("models_dev")) |catalog_value| {
@@ -224,6 +234,8 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     };
     const owned_reviewer = if (reviewer) |model_id| try alloc.dupe(u8, model_id) else null;
     errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
+    const owned_title = if (title) |model_id| try alloc.dupe(u8, model_id) else null;
+    errdefer if (owned_title) |model_id| alloc.free(model_id);
     const owned_catalog = if (catalog_id) |catalog| try alloc.dupe(u8, catalog) else null;
     errdefer if (owned_catalog) |catalog| alloc.free(catalog);
     return .{
@@ -233,6 +245,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .auth = owned_auth,
         .tool_choice_mode = mode,
         .reviewer_model = owned_reviewer,
+        .title_model = owned_title,
         .models_dev = owned_catalog,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
     };
@@ -442,7 +455,7 @@ fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
 
 const test_json =
     \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1/","auth":{"type":"none"}},
-    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false,"supports_reasoning":true,"reasoning_efforts":["low","high","max"]},"unknown":{}}}}
+    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","title_model":"openai/title","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false,"supports_reasoning":true,"reasoning_efforts":["low","high","max"]},"unknown":{}}}}
 ;
 
 test "configured provider owns definitions and preserves unknown metadata" {
@@ -456,12 +469,14 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqual(Auth.none, local.auth);
     try std.testing.expectEqual(ToolChoiceMode.omit, local.tool_choice_mode);
     try std.testing.expect(local.reviewer_model == null);
+    try std.testing.expect(local.title_model == null);
     const chat = try local.chat_url(alloc);
     defer alloc.free(chat);
     try std.testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", chat);
     const router = registry.get("router").?;
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.auth.bearer);
     try std.testing.expectEqualStrings("openai/review", router.reviewer_model.?);
+    try std.testing.expectEqualStrings("openai/title", router.title_model.?);
     try std.testing.expectEqual(ToolChoiceMode.send, router.tool_choice_mode);
     const metadata = router.model("openai/gpt-4.1").?;
     try std.testing.expectEqual(@as(?u32, 8192), metadata.context_window);

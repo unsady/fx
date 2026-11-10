@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     const context: *anyopaque = @ptrCast(@constCast(definition));
     return .{
+        .title_model = definition.title_model,
         .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = project_replay },
         .model_catalog = models_dev_catalog.provider(definition),
         .cli_model_catalog = .{ .context = context, .fetch_fn = fetch_cli_catalog },
