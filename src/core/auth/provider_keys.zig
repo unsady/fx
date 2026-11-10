@@ -157,7 +157,7 @@ test "provider keys round trip, refuse a readable file, and delete" {
 
 test "provider keys accept one line of printable ASCII" {
     try validateKey("sk-abc_123.DEF");
-    for ([_][]const u8{ "", "sk abc", "sk-abc\n", "sk-\x00", "ключ" }) |key| {
+    for ([_][]const u8{ "", "sk abc", "sk-abc\n", "sk-\x00", "clé" }) |key| {
         try std.testing.expectError(error.InvalidProviderKey, validateKey(key));
     }
 }
