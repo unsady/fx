@@ -33,6 +33,7 @@ test {
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/fuzzy_match.zig");
     _ = @import("core/shared/types.zig");
+    _ = @import("core/workspace/network_metrics.zig");
     _ = @import("core/shell_command/command_classification.zig");
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/shell_command/command_lex.zig");
@@ -48,6 +49,7 @@ test {
     _ = @import("gateway/openai_codex.zig");
     _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/sse.zig");
+    _ = @import("main.zig");
     _ = @import("tools/agent/ask_user_question.zig");
     _ = @import("tools/capabilities/toolbox.zig");
     _ = @import("tools/web/http_fetch.zig");
