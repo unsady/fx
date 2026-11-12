@@ -856,6 +856,13 @@ pub const Reducer = struct {
         return try out.toOwnedSlice();
     }
 
+    /// value, or null for an empty string.
+    fn named(value: ?std.json.Value) ?std.json.Value {
+        const v = value orelse return null;
+        if (v == .string and v.string.len == 0) return null;
+        return v;
+    }
+
     fn accept_identity(self: *Reducer, destination: *?[]u8, value: ?std.json.Value, max_bytes: usize) Error!void {
         const text = try string(value orelse return);
         if (text.len == 0) return error.InvalidChunk;
@@ -879,7 +886,9 @@ pub const Reducer = struct {
             while (self.tools.items.len <= index) try self.tools.append(self.alloc, .{});
             const tool = &self.tools.items[index];
             if (non_null(delta, "type")) |kind| if (!std.mem.eql(u8, try string(kind), "function")) return error.InvalidChunk;
-            try self.accept_identity(&tool.id, non_null(delta, "id"), self.limits.identity_bytes);
+            // Qwen on OpenCode Go repeats `"id":""` in every chunk after a
+            // call's first, so an empty id names no call rather than a bad one.
+            try self.accept_identity(&tool.id, named(non_null(delta, "id")), self.limits.identity_bytes);
             if (tool.id) |id| for (self.tools.items, 0..) |other, other_index| {
                 if (other_index != index and other.id != null and std.mem.eql(u8, id, other.id.?)) return error.ConflictingIdentity;
             };
@@ -2202,6 +2211,22 @@ test "chat completions owns fragmented interleaved tools and results independent
     try std.testing.expectEqual(types.ToolExecutionProvenance.fx_local, completion.tool_calls[1].provenance);
 }
 
+test "chat completions takes an empty tool call id after the first chunk as none" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    var result: stream_provider.Result = undefined;
+    {
+        defer reducer.deinit();
+        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}");
+        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"function\",\"function\":{\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}]}");
+        result = try test_finish(&reducer, test_tools_finish);
+    }
+    defer result.deinit(alloc);
+    const call = result.completed.completion.tool_calls[0];
+    try std.testing.expectEqualStrings("call-1", call.id);
+    try std.testing.expectEqualStrings("{\"path\":\"a\"}", call.arguments_json);
+}
+
 test "chat completions returns unadvertised names and invalid arguments as sent" {
     // The tool loop and the permission reviewer decide what happens to these
     // calls, so the stream must not fail here.
@@ -2598,7 +2623,8 @@ test "chat completions missing tool fields sparse indexes and invalid identities
         .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"arguments\":\"{}\"}}", .failure = error.InvalidToolName, .at_finish = true },
         .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"read file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolName, .at_finish = true },
         .{ .delta = "{\"index\":1,\"id\":\"x\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolCallId, .at_finish = true },
-        .{ .delta = "{\"index\":0,\"id\":\"\"}", .failure = error.InvalidChunk },
+        // An empty id names no call, so a call with only that has no id.
+        .{ .delta = "{\"index\":0,\"id\":\"\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolCallId, .at_finish = true },
         .{ .delta = "{\"index\":0,\"id\":7}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"function\":{\"name\":3}}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"function\":{\"arguments\":{}}}", .failure = error.InvalidChunk },
