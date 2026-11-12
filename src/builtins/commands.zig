@@ -101,6 +101,7 @@ const session_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "last", .description = "Inspect the current workspace session" },
     .{ .usage = "resume [last|<id>]", .description = "Resume the latest workspace session or a session by id" },
     .{ .usage = "recover <id>", .description = "Copy a recoverable corrupt session into a new session" },
+    .{ .usage = "delete <id>", .description = "Delete a saved session and the subagent sessions it owns" },
 };
 
 pub const session_options = [_]command_specs.OptionDoc{
@@ -367,8 +368,8 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json]",
-        .summary = "Inspect, resume, or recover saved sessions",
+        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json] | session delete <id>|--id <id> [--json]",
+        .summary = "Inspect, resume, recover, or delete saved sessions",
         .subcommands = &session_subcommands,
         .options = &session_options,
         .details = &.{
@@ -499,6 +500,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .session, .usage = "session <last|id>" },
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
+        .{ .usage = "session delete <id>", .summary = "Delete a saved session" },
     } },
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login [vercel|codex|grok|NAME] [--api-key]", .summary = "Sign in to a model provider" },

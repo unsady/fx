@@ -2299,6 +2299,14 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .session => |rest| {
+            if (rest.len > 0 and std.mem.eql(u8, rest[0], "delete")) {
+                var deletion = parseSessionDeletionArgs(alloc, rest[1..]) catch |err| {
+                    try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", err, rest[1..]);
+                    return usage_failure;
+                };
+                defer deletion.deinit(alloc);
+                return runSessionDeletion(alloc, deps, deletion);
+            }
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "recover")) {
                 var recovery = parseSessionRecoveryArgs(
                     alloc,
@@ -3940,6 +3948,22 @@ fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecovery
     return writeSessionRecovery(alloc, deps, result, recovery.format);
 }
 
+fn runSessionDeletion(alloc: Allocator, deps: RunDeps, deletion: SessionRecoveryOptions) !RunResult {
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), deletion.format);
+        return .handled_failure;
+    };
+    defer store.deinit(alloc);
+    session_adapter.delete(&store, alloc, deletion.session_id) catch |err| {
+        try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), deletion.format);
+        return .handled_failure;
+    };
+    const text = try (output_contracts.SessionDeletionSnapshot{ .session_id = deletion.session_id }).render(alloc, deletion.format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, deletion.format);
+    return .handled_success;
+}
+
 fn writeLookupFailure(
     alloc: Allocator,
     deps: RunDeps,
@@ -4065,6 +4089,7 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
         error.InvalidSessionDetailArgs,
         error.InvalidSessionMigrationArgs,
         error.InvalidSessionRecoveryArgs,
+        error.InvalidSessionDeletionArgs,
         error.InvalidResumeArgs,
         error.InvalidUpgradeArgs,
         error.InvalidConfigArgs,
@@ -4799,6 +4824,21 @@ fn parseSessionRecoveryArgs(
     // A recovery copies the whole session; it shows no turns to tail.
     if (parsed.tail != null) return error.InvalidSessionRecoveryArgs;
     const target = parsed.target orelse return error.InvalidSessionRecoveryArgs;
+    return .{
+        .format = parsed.format,
+        .session_id = try alloc.dupe(u8, target),
+    };
+}
+
+/// `fx session delete <id>|--id <id> [--json]`, which takes the same target
+/// as `session recover`.
+fn parseSessionDeletionArgs(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+) !SessionRecoveryOptions {
+    const parsed = parseSessionTargetArgs(args) catch return error.InvalidSessionDeletionArgs;
+    if (parsed.tail != null) return error.InvalidSessionDeletionArgs;
+    const target = parsed.target orelse return error.InvalidSessionDeletionArgs;
     return .{
         .format = parsed.format,
         .session_id = try alloc.dupe(u8, target),

@@ -468,7 +468,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         const r = await runFx(args);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
-        expect(r.stdout).toContain("Inspect, resume, or recover saved sessions");
+        expect(r.stdout).toContain("Inspect, resume, recover, or delete saved sessions");
         expect(r.stdout).toContain("session <last|id|id/agent>|--id <id> [--tail <1-1000>]");
         expect(r.stdout).toContain("session resume [last|<id>]");
         expect(r.stdout).toContain("session recover <id>|--id <id>");

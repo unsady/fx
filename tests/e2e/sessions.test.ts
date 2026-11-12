@@ -3999,6 +3999,33 @@ test("fx session recover copies the good turns and side files of a damaged sessi
   }
 }, TIMEOUT * 4);
 
+test("fx session delete removes a saved session, which then cannot be read or resumed", async () => {
+  const fixture = createFixture("fx-v2-delete-");
+  const gateway = startFakeGateway([fakeGatewayFinalText("DELETE_ONE"), fakeGatewayFinalText("DELETE_KEPT")]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Delete me."])).stdout).session_id;
+    const kept = JSON.parse((await ask(fixture, gateway, ["Keep me."])).stdout).session_id;
+
+    const result = await command(fixture, gateway, ["session", "delete", id, "--json"]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({ kind: "session_deletion", id });
+    expect(existsSync(join(storeRoot(fixture.home), id))).toBe(false);
+
+    const listed = JSON.parse((await command(fixture, gateway, ["sessions", "--all", "--json"])).stdout);
+    expect(listed.count).toBe(1);
+    expect(JSON.stringify(listed)).toContain(kept);
+    expect((await command(fixture, gateway, ["session", id, "--json"])).code).toBe(1);
+
+    const again = await command(fixture, gateway, ["session", "delete", id]);
+    expect(again.code).toBe(1);
+    expect(again.stderr).toContain("record not found");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
 test("an older session moves off its side folder on its next open, and the model still reads an old handle (D47)", async () => {
   const fixture = createFixture("fx-v2-move-");
   const oldHandle = "result-shell-0011223344556677-8899aabbccddeeff.txt";

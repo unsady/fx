@@ -993,6 +993,23 @@ pub const Recovered = struct {
     }
 };
 
+/// `fx session delete`: deletes a saved root session, the subagent
+/// sessions it owns, and its folders outside the manager. Busy when an fx
+/// has any of them open. A subagent's own terminal folder waits for
+/// `fx doctor`, which removes any whose session is gone (D13).
+pub fn delete(store: *Store, alloc: Allocator, id: []const u8) !void {
+    var first = try store.manager.read(alloc, id, .start, .forward, 1);
+    defer first.deinit();
+    if (first.entries.len == 0) return error.SessionNotFound;
+    const created = switch (first.entries[0].body orelse return error.InvalidSessionFormat) {
+        .session_created => |value| value,
+        else => return error.InvalidSessionFormat,
+    };
+    if (created.role != .root) return error.SessionNotFound;
+    try store.manager.delete(id);
+    store.removeFiles(id, "deleted");
+}
+
 /// `fx session recover` (D15): a new root session copied from `id` up to
 /// its last turn that ended before any damage, with a copy of its side
 /// files. The source is never changed, and may be held by another process.
@@ -8340,6 +8357,36 @@ test "a session that never reached the disk takes its terminal folder, and a sav
     _ = try landed.handle.append(&.{ .turn_started, .turn_committed });
     landed.close();
     try testing.expect(pathExists(&t, &.{ ".fx", terminal_dir_name, landed_id }));
+}
+
+test "delete removes a root session and its terminal folder, and refuses one an fx has open" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const io = io_mod.getIo();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try testing.expectError(error.Busy, delete(&t.store, testing.allocator, id));
+    s.close();
+    {
+        var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(t.tmp.dir, ".fx");
+        defer fx.close();
+        var root = try io_mod.openOrCreateVerifiedPrivateDir(&fx, terminal_dir_name);
+        defer root.close();
+        var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, id);
+        defer owner.close();
+        try owner.dir.writeFile(io, .{ .sub_path = "top.txt", .data = "top", .flags = .{ .permissions = .fromMode(0o600) } });
+    }
+
+    try delete(&t.store, testing.allocator, id);
+    try testing.expectError(error.NotFound, t.store.manager.read(testing.allocator, id, .start, .forward, 1));
+    const folder = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", terminal_dir_name, id });
+    defer testing.allocator.free(folder);
+    try testing.expectError(error.FileNotFound, t.tmp.dir.statFile(io, folder, .{}));
+    try testing.expectError(error.NotFound, delete(&t.store, testing.allocator, id));
 }
 
 test "recover copies the folders outside the manager, never a link, and says when it left one out" {

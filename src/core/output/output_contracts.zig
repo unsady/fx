@@ -1919,6 +1919,36 @@ test "a live listing prints each subagent under the one that started it, and esc
     try std.testing.expectEqualStrings("{\"kind\":\"live_sessions\",\"count\":0,\"sessions\":[]}", empty);
 }
 
+pub const SessionDeletionSnapshot = struct {
+    session_id: []const u8,
+
+    pub fn render(self: SessionDeletionSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => alloc.print("Deleted session {s}\n", .{self.session_id}),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderJson(self: SessionDeletionSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"session_deletion\",\"id\":");
+        try std.json.Stringify.value(self.session_id, .{}, &out.writer);
+        try out.writer.writeAll("}");
+        return try out.toOwnedSlice();
+    }
+};
+
+test "session deletion renders text and JSON from one snapshot" {
+    const snapshot: SessionDeletionSnapshot = .{ .session_id = "abc" };
+    const text = try snapshot.render(std.testing.allocator, .text);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Deleted session abc\n", text);
+    const json = try snapshot.render(std.testing.allocator, .json);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings("{\"kind\":\"session_deletion\",\"id\":\"abc\"}", json);
+}
+
 pub const SessionRecoverySnapshot = struct {
     result: session_store.SessionRecoveryResult,
 
