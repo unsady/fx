@@ -2675,7 +2675,7 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.agent().worker.synced_model.?);
     try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
     try std.testing.expectEqualStrings(
-        "fx v" ++ build_options.app_version ++ " | workspace",
+        "fx v" ++ build_options.display_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
     try expectTranscriptContains(&app, "* Switched to anthropic/claude-sonnet-4-20250514");
@@ -2716,7 +2716,7 @@ test "session_commands handleModel falls back to raw query when model fetch fail
     try std.testing.expectEqualStrings("custom/provider-model", app.selected_model.items);
     try std.testing.expectEqualStrings("custom/provider-model", app.agent().worker.synced_model.?);
     try std.testing.expectEqualStrings(
-        "fx v" ++ build_options.app_version ++ " | workspace",
+        "fx v" ++ build_options.display_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
 }
@@ -3302,7 +3302,7 @@ test "session_commands model picker accepts the current selected model slice" {
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.agent().worker.synced_model.?);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.last_preference_model.items);
     try std.testing.expectEqualStrings(
-        "fx v" ++ build_options.app_version ++ " | workspace",
+        "fx v" ++ build_options.display_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.agent().effort);

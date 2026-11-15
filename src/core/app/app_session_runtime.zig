@@ -2546,11 +2546,11 @@ pub fn Runtime(comptime App: type) type {
             else
                 "";
             const folder = if (basename.len == 0) "workspace" else basename;
-            const prefix = "fx v" ++ build_options.app_version ++ " | ";
+            const prefix = "fx v" ++ build_options.display_version ++ " | ";
             var label_buffer: [prefix.len + std.Io.Dir.max_path_bytes]u8 = undefined;
             const label = std.mem.print(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
                 debug_trace.logf("session", "terminal title workspace omitted err={s}", .{@errorName(err)});
-                provider.set("fx v" ++ build_options.app_version);
+                provider.set("fx v" ++ build_options.display_version);
                 return;
             };
             provider.set(label);
@@ -11123,11 +11123,11 @@ test "terminal title shows the session title once cached and falls back to build
 
     try std.testing.expectEqualStrings("", app.terminalTitleLabelText());
     Runtime(TestApp).syncTerminalTitle(&app, (&app).agent());
-    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("fx v" ++ build_options.display_version ++ " | workspace", app.terminalTitleLabelText());
 
     try app.selected_model.appendSlice(alloc, "zai/glm-5.2");
     Runtime(TestApp).syncTerminalTitle(&app, (&app).agent());
-    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("fx v" ++ build_options.display_version ++ " | workspace", app.terminalTitleLabelText());
 
     try app.agent().session.appendHistoryEntry(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("wire the release notes generator") },
@@ -11148,7 +11148,7 @@ test "terminal title shows the session title once cached and falls back to build
 
     Runtime(TestApp).clearCachedSessionTitle(&app, (&app).agent());
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle((&app).agent()) == null);
-    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("fx v" ++ build_options.display_version ++ " | workspace", app.terminalTitleLabelText());
 }
 
 test "cached session title drops control bytes before they reach the terminal" {
@@ -11186,7 +11186,7 @@ test "terminal title uses the workspace basename and handles unnamed roots" {
         defer app.deinit();
         Runtime(TestApp).syncTerminalTitle(&app, (&app).agent());
         var expected_buffer: [128]u8 = undefined;
-        const expected = try std.mem.print(&expected_buffer, "fx v{s} | {s}", .{ build_options.app_version, case.folder });
+        const expected = try std.mem.print(&expected_buffer, "fx v{s} | {s}", .{ build_options.display_version, case.folder });
         try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
     }
 }

@@ -8,6 +8,10 @@ const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
 
 pub const version = "0.0.17";
+/// The fork's own build of `version`, shown beside it where a person reads
+/// the version, such as the welcome line. Comparisons and `--version` use
+/// `version` alone.
+pub const den_build = "den.1";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");

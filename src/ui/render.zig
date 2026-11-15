@@ -182,7 +182,7 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
     const build_label = try writeBuildLabel(
         &label_buf,
         build_channel,
-        build_options.app_version,
+        build_options.display_version,
         build_options.git_commit,
     );
     return alloc.print(
@@ -923,7 +923,7 @@ test "welcomeMessage keeps only the app name bright" {
     const build_label = try writeBuildLabel(
         &label_buf,
         build_channel,
-        build_options.app_version,
+        build_options.display_version,
         build_options.git_commit,
     );
     const expected = try std.testing.allocator.print(

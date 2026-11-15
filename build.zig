@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "git_commit", git_commit);
     build_options.addOption([]const u8, "app_version", app_version);
+    build_options.addOption([]const u8, "display_version", readDisplayVersion(b, app_version));
     build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     build_options.addOption(WasmSurface, "wasm_surface", .none);
     // Whether this is a libfx artifact, which leaves out what only the fx
@@ -385,6 +386,7 @@ fn addWasmArtifact(
     const wasm_options = b.addOptions();
     wasm_options.addOption([]const u8, "git_commit", git_commit);
     wasm_options.addOption([]const u8, "app_version", app_version);
+    wasm_options.addOption([]const u8, "display_version", readDisplayVersion(b, app_version));
     wasm_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
@@ -432,6 +434,7 @@ fn addNapiArtifact(
     const napi_options = b.addOptions();
     napi_options.addOption([]const u8, "git_commit", git_commit);
     napi_options.addOption([]const u8, "app_version", app_version);
+    napi_options.addOption([]const u8, "display_version", readDisplayVersion(b, app_version));
     napi_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     napi_options.addOption(NapiSurface, "napi_surface", surface);
     napi_options.addOption(bool, "libfx", true);
@@ -576,6 +579,21 @@ fn readAppVersion(b: *std.Build) []const u8 {
         @panic("could not parse pub const version in src/main.zig");
     return b.allocator.dupe(u8, bytes[start .. start + end_rel]) catch
         @panic("could not allocate app version");
+}
+
+/// The version a person reads: `app_version` with the fork's `den_build`
+/// from src/main.zig, such as "0.0.17 (den.1)".
+fn readDisplayVersion(b: *std.Build, app_version: []const u8) []const u8 {
+    const main_path = b.pathJoin(&.{ b.root.sub_path, "src/main.zig" });
+    const bytes = b.root.root_dir.handle.readFileAlloc(b.graph.io, main_path, b.allocator, .limited(1024 * 1024)) catch
+        @panic("could not read src/main.zig to resolve the den build");
+    defer b.allocator.free(bytes);
+
+    const prefix = "pub const den_build = \"";
+    const start = (std.mem.find(u8, bytes, prefix) orelse return app_version) + prefix.len;
+    const end_rel = std.mem.findScalar(u8, bytes[start..], '"') orelse
+        @panic("could not parse pub const den_build in src/main.zig");
+    return b.fmt("{s} ({s})", .{ app_version, bytes[start .. start + end_rel] });
 }
 
 const fuzz_registry_path = "tests/fuzz/targets.json";
