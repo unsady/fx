@@ -14,6 +14,28 @@ const ModelMetadata = configured_provider.ModelMetadata;
 
 pub const Error = Allocator.Error || error{InvalidModelsDevCatalog};
 
+/// What the catalog, or the catalog and the settings together, say about one
+/// model. Null and an empty list mean the catalog does not say.
+pub const Model = struct {
+    id: []const u8,
+    context_window: ?u32 = null,
+    max_output_tokens: ?u32 = null,
+    supports_tool_use: ?bool = null,
+    supports_vision: ?bool = null,
+    supports_reasoning: ?bool = null,
+    /// Each level sends its name as `reasoning_effort`.
+    reasoning_efforts: []const types.ReasoningEffort = &.{},
+};
+
+/// Frees models that `parse` or `merge` returned.
+pub fn free(alloc: Allocator, models: []const Model) void {
+    for (models) |model| {
+        alloc.free(model.id);
+        alloc.free(model.reasoning_efforts);
+    }
+    alloc.free(models);
+}
+
 /// One provider's entry in a models.dev api.json document. Every field is
 /// owned; free them with `deinit`.
 pub const Provider = struct {
@@ -99,17 +121,17 @@ fn mapScanError(err: anyerror) Error {
 /// catalog. A model's `provider.npm` names the SDK models.dev prefers, not the
 /// only API that serves it, so it does not filter: OpenCode, for one, serves
 /// models it lists under `@ai-sdk/anthropic` through Chat Completions too.
-/// Caller owns the result; free it with `configured_provider.freeModelMetadata`.
-pub fn parse(alloc: Allocator, models_json: []const u8) Error![]const ModelMetadata {
+/// Caller owns the result; free it with `free`.
+pub fn parse(alloc: Allocator, models_json: []const u8) Error![]const Model {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, models_json, .{}) catch |err| return mapScanError(err);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidModelsDevCatalog;
 
-    var models: std.ArrayList(ModelMetadata) = .empty;
+    var models: std.ArrayList(Model) = .empty;
     errdefer {
-        for (models.items) |metadata| {
-            alloc.free(metadata.id);
-            alloc.free(metadata.reasoning_efforts);
+        for (models.items) |model| {
+            alloc.free(model.id);
+            alloc.free(model.reasoning_efforts);
         }
         models.deinit(alloc);
     }
@@ -139,11 +161,11 @@ pub fn parse(alloc: Allocator, models_json: []const u8) Error![]const ModelMetad
     }
     // models.dev does not keep its order between downloads, so the model
     // menu would reshuffle after every refresh.
-    sort_utils.sort(ModelMetadata, models.items, {}, idBefore);
+    sort_utils.sort(Model, models.items, {}, idBefore);
     return models.toOwnedSlice(alloc);
 }
 
-fn idBefore(_: void, left: ModelMetadata, right: ModelMetadata) bool {
+fn idBefore(_: void, left: Model, right: Model) bool {
     return std.mem.lessThan(u8, left.id, right.id);
 }
 
@@ -213,60 +235,63 @@ fn reasoningEfforts(alloc: Allocator, model: std.json.Value) Allocator.Error![]c
 /// Combines catalog metadata with the provider's declared model_metadata. A
 /// declared field overrides the catalog's, a declared limit replaces both of
 /// the catalog's limits, and a declared model the catalog lacks is added after
-/// the catalog's models. Caller owns the result; free it
-/// with `configured_provider.freeModelMetadata`.
-pub fn merge(alloc: Allocator, catalog: []const ModelMetadata, declared: []const ModelMetadata) Allocator.Error![]const ModelMetadata {
-    var models: std.ArrayList(ModelMetadata) = .empty;
+/// the catalog's models. Caller owns the result; free it with `free`.
+pub fn merge(alloc: Allocator, catalog: []const Model, declared: []const ModelMetadata) Allocator.Error![]const Model {
+    var models: std.ArrayList(Model) = .empty;
     errdefer {
-        for (models.items) |metadata| {
-            alloc.free(metadata.id);
-            alloc.free(metadata.reasoning_efforts);
+        for (models.items) |model| {
+            alloc.free(model.id);
+            alloc.free(model.reasoning_efforts);
         }
         models.deinit(alloc);
     }
 
     for (catalog) |listed| {
-        var combined = listed;
-        for (declared) |own| {
-            if (!std.mem.eql(u8, own.id, listed.id)) continue;
-            combined = overlay(listed, own);
-            break;
-        }
         try models.ensureUnusedCapacity(alloc, 1);
-        models.appendAssumeCapacity(try dupe(alloc, combined));
+        const own = for (declared) |own| {
+            if (std.mem.eql(u8, own.id, listed.id)) break own;
+        } else null;
+        models.appendAssumeCapacity(try overlay(alloc, listed, own));
     }
     for (declared) |own| {
         for (catalog) |listed| {
             if (std.mem.eql(u8, own.id, listed.id)) break;
         } else {
             try models.ensureUnusedCapacity(alloc, 1);
-            models.appendAssumeCapacity(try dupe(alloc, own));
+            models.appendAssumeCapacity(try overlay(alloc, .{ .id = own.id }, own));
         }
     }
     return models.toOwnedSlice(alloc);
 }
 
-fn overlay(base: ModelMetadata, own: ModelMetadata) ModelMetadata {
+/// `base` with what `own` declares on top, as an owned copy.
+fn overlay(alloc: Allocator, base: Model, declared: ?ModelMetadata) Allocator.Error!Model {
     var combined = base;
-    // The two limits only make sense together: a declared window paired with
-    // the catalog's output limit can leave no room for input.
-    if (own.context_window != null or own.max_output_tokens != null) {
-        combined.context_window = own.context_window;
-        combined.max_output_tokens = own.max_output_tokens;
+    var efforts = base.reasoning_efforts;
+    var named: [configured_provider.max_effort_levels]types.ReasoningEffort = undefined;
+    if (declared) |own| {
+        // The two limits only make sense together: a declared window paired
+        // with the catalog's output limit can leave no room for input.
+        if (own.context_window != null or own.max_output_tokens != null) {
+            combined.context_window = own.context_window;
+            combined.max_output_tokens = own.max_output_tokens;
+        }
+        if (own.supports_tool_use) |value| combined.supports_tool_use = value;
+        if (own.supports_vision) |value| combined.supports_vision = value;
+        if (own.supports_reasoning) |value| combined.supports_reasoning = value;
+        if (own.reasoning_efforts) |levels| {
+            var count: usize = 0;
+            for (levels) |level| {
+                named[count] = types.ReasoningEffort.parse(level.name) orelse continue;
+                count += 1;
+            }
+            efforts = named[0..count];
+        }
     }
-    if (own.supports_tool_use) |value| combined.supports_tool_use = value;
-    if (own.supports_vision) |value| combined.supports_vision = value;
-    if (own.supports_reasoning) |value| combined.supports_reasoning = value;
-    if (own.reasoning_efforts.len != 0) combined.reasoning_efforts = own.reasoning_efforts;
+    combined.id = try alloc.dupe(u8, base.id);
+    errdefer alloc.free(combined.id);
+    combined.reasoning_efforts = try alloc.dupe(types.ReasoningEffort, efforts);
     return combined;
-}
-
-fn dupe(alloc: Allocator, metadata: ModelMetadata) Allocator.Error!ModelMetadata {
-    var owned = metadata;
-    owned.id = try alloc.dupe(u8, metadata.id);
-    errdefer alloc.free(owned.id);
-    owned.reasoning_efforts = try alloc.dupe(types.ReasoningEffort, metadata.reasoning_efforts);
-    return owned;
 }
 
 const test_catalog =
@@ -295,7 +320,7 @@ test "models.dev extracts one provider and leaves out deprecated models" {
     try std.testing.expectEqualStrings("other", other.name);
     try std.testing.expect(other.api == null and other.env == null);
     const models = try parse(alloc, provider.models_json);
-    defer configured_provider.freeModelMetadata(alloc, models);
+    defer free(alloc, models);
 
     try std.testing.expectEqual(@as(usize, 5), models.len);
     try std.testing.expectEqualStrings("claude-haiku-5-5", models[1].id);
@@ -341,10 +366,10 @@ test "models.dev merge lets declared metadata override and add models" {
     var provider = (try extract(alloc, test_catalog, "opencode-go")).?;
     defer provider.deinit(alloc);
     const catalog = try parse(alloc, provider.models_json);
-    defer configured_provider.freeModelMetadata(alloc, catalog);
+    defer free(alloc, catalog);
 
     const merged = try merge(alloc, catalog, declared_registry.get("local").?.model_metadata);
-    defer configured_provider.freeModelMetadata(alloc, merged);
+    defer free(alloc, merged);
     try std.testing.expectEqual(@as(usize, 6), merged.len);
     const flash = merged[3];
     try std.testing.expectEqual(@as(?u32, 400_000), flash.context_window);
@@ -364,9 +389,13 @@ test "models.dev parse and merge release memory on allocation failure" {
             var provider = (try extract(alloc, test_catalog, "opencode-go")).?;
             defer provider.deinit(alloc);
             const catalog = try parse(alloc, provider.models_json);
-            defer configured_provider.freeModelMetadata(alloc, catalog);
-            const merged = try merge(alloc, catalog, catalog[3..4]);
-            configured_provider.freeModelMetadata(alloc, merged);
+            defer free(alloc, catalog);
+            var declared = try configured_provider.Registry.parse_json(alloc,
+                \\{"local":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"none"},"model_metadata":{"deepseek-v4.1-flash":{"reasoning_efforts":["high"]},"private":{}}}}
+            );
+            defer declared.deinit(alloc);
+            const merged = try merge(alloc, catalog, declared.get("local").?.model_metadata);
+            free(alloc, merged);
         }
     };
     try std.testing.checkAllAllocationFailures(@import("../shared/testing_allocator.zig").no_resize, Check.run, .{});

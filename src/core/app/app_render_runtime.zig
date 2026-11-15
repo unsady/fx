@@ -1265,7 +1265,8 @@ pub fn Runtime(comptime App: type) type {
             );
             // A terminal reset clears the screen and replays the transcript,
             // so the entries the transcript window kept only because a row of
-            // theirs was on screen go before the replay.
+            // theirs was on screen go before the replay, unless the replay is
+            // a resumed transcript's first paint (`transcriptWindowScreenCleared`).
             if (comptime @hasDecl(@TypeOf(app.shell), "transcriptWindowScreenCleared")) {
                 if (app.shell.terminal_reset_pending) try app.shell.transcriptWindowScreenCleared(app.alloc);
             }
@@ -2070,9 +2071,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         // The open agent list takes the footer from the shown agent's
-        // approval or question, so the list stays visible while the agent on
-        // screen is waiting. The prompt itself is untouched and returns when
-        // the list closes.
+        // approval or question, so the list stays visible while it previews
+        // an agent that is waiting. The prompt itself is untouched and returns
+        // when the list closes.
         fn shownApproval(app: *const App, agent: *AppAgent) ?approval_prompt.Projection {
             if (agentsMenuActive(app)) return null;
             return agent.approval_prompt.projection();

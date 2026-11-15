@@ -2,11 +2,14 @@ import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome } from "../../evals/eval-helpers";
 
-export function completion(model: string, text = "local reply", inputTokens = 12) {
+/// `cachedTokens` adds the detail a server that caches prompts reports, as
+/// `fixtures/custom-endpoint-captures/chat-text.sse` shows it.
+export function completion(model: string, text = "local reply", inputTokens = 12, cachedTokens?: number) {
+  const details = cachedTokens === undefined ? {} : { prompt_tokens_details: { cached_tokens: cachedTokens } };
   const chunks = [
     { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] },
     { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
-    { id: "chat-local", model, choices: [], usage: { prompt_tokens: inputTokens, completion_tokens: 3, total_tokens: inputTokens + 3 } },
+    { id: "chat-local", model, choices: [], usage: { prompt_tokens: inputTokens, ...details, completion_tokens: 3, total_tokens: inputTokens + 3 } },
   ];
   return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
 }
@@ -19,25 +22,51 @@ export function toolCompletion(model: string, name: string, args: unknown, callI
   return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
 }
 
-export function createConfiguredProviderFixture(respond?: (body: any) => Response | Promise<Response>) {
+/// A response whose headers never arrive, for a server that accepts a request
+/// and then says nothing. The fixture's `close()` ends it.
+export function neverAnswers(): Promise<Response> {
+  return new Promise(() => {});
+}
+
+/// A streamed reply that sends one empty assistant chunk and then stops
+/// sending, without closing.
+export function stallsAfterFirstChunk(model: string): Response {
+  const first = { id: "chat-stall", model, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] };
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(first)}\n\n`));
+    },
+  });
+  return new Response(body, { headers: { "content-type": "text/event-stream" } });
+}
+
+type Reply = Response | Promise<Response>;
+
+/// `routes` answers paths other than `/v1/chat/completions`, such as
+/// `/v1/models`; a path with no route answers 500, so a request fx should not
+/// make fails loudly.
+export function createConfiguredProviderFixture(respond?: (body: any) => Reply, routes: Record<string, (body: any) => Reply> = {}) {
   const home = realpathSync(createIsolatedTestHome());
   const workspace = join(home, "workspace");
   mkdirSync(workspace);
   mkdirSync(join(home, ".fx"), { mode: 0o700 });
-  const requests: Array<{ path: string; authorization: string | null; body: any }> = [];
+  const requests: Array<{ path: string; method: string; authorization: string | null; headers: Record<string, string>; at: number; body: any }> = [];
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     async fetch(request) {
       const path = new URL(request.url).pathname;
       const body = request.method === "POST" ? await request.json() : null;
-      requests.push({ path, authorization: request.headers.get("authorization"), body });
+      requests.push({ path, method: request.method, authorization: request.headers.get("authorization"), headers: Object.fromEntries(request.headers), at: performance.now(), body });
+      if (routes[path]) return routes[path](body);
       if (path !== "/v1/chat/completions") return new Response("unexpected endpoint", { status: 500 });
       return respond ? respond(body) : completion((body as any).model);
     },
   });
   const settingsPath = join(home, ".fx", "settings.json");
   const settings = {
-    provider: "local", auto_upgrade: false, permission_mode: "ask",
+    // fx ask titles a session on a custom connection with the turn's model,
+    // a request each test would otherwise count; the title tests turn it on.
+    provider: "local", auto_upgrade: false, permission_mode: "ask", session_titles: false as boolean,
     providers: {
       local: { protocol: "openai-chat-completions", base_url: `http://127.0.0.1:${server.port}/v1`, auth: { type: "none" }, model_metadata: { "local-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true } } },
       remote: { protocol: "openai-chat-completions", base_url: `http://127.0.0.1:${server.port}/v1`, auth: { type: "bearer", env: "FX_TEST_PROVIDER_TOKEN" }, model_metadata: { "remote-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true } } },

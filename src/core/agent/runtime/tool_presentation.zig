@@ -12,6 +12,7 @@ const tool_args = @import("../../tooling/tool_args.zig");
 const tool_specs = @import("../../tooling/tool_specs.zig");
 const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const mcp_tool_result = @import("../../mcp/tool_result.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -45,6 +46,17 @@ pub fn streamStartMayHaveExecutedAtProvider(
     if (isProviderSearchAlias(tool_name)) return true;
     const spec = registry.lookup(tool_name) orelse return false;
     return spec.provider_executed;
+}
+
+/// Whether a tool that may run at the provider only reads, as a search does,
+/// so running it again after a failed attempt is safe.
+pub fn providerToolOnlyReads(
+    registry: tool_dispatch.Registry,
+    tool_name: []const u8,
+) bool {
+    if (isProviderSearchAlias(tool_name)) return true;
+    const spec = registry.lookup(tool_name) orelse return false;
+    return spec.provider_executed and spec.activity_kind == .read;
 }
 
 fn fallbackToolDisplay(
@@ -1180,10 +1192,7 @@ fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
         .object => |object| object,
         else => return false,
     };
-    const object = if (outer.get("request")) |request| switch (request) {
-        .object => |value| value,
-        else => return false,
-    } else outer;
+    const object = (try tool_args.unwrapRequest(parsed.arena.allocator(), outer)) orelse return false;
     const action = switch (object.get("action") orelse return false) {
         .string => |value| value,
         else => return false,
@@ -1254,7 +1263,8 @@ pub fn finishExecutedToolStatus(
     if (!status_started) return;
     const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
     const command_decision = if (activity_kind == .command)
-        try commandOutcomeDecision(arena, result_memory.command_process_presentation)
+        (try commandOutcomeDecision(arena, result_memory.command_process_presentation)) orelse
+            try runningCommandDecision(arena, call, result.model_output)
     else
         null;
     const terminal_action_decision = if (std.mem.eql(u8, call.name, "shell"))
@@ -1452,6 +1462,77 @@ pub fn commandOutcomeDecision(
     };
 }
 
+/// The label of a shell `run` whose command was still running when the call
+/// returned, such as when steering moved it to the background or its
+/// `yield_time_ms` ran out. It has no exit status, so it must not read "Ran".
+pub const still_running_label = "Still running";
+
+/// The outcome of a shell `run` call whose result `output` reports
+/// `"state":"running"`, or null for any other call or result.
+pub fn runningCommandDecision(
+    arena: Allocator,
+    call: ToolCall,
+    output: []const u8,
+) !?ToolOutcomeDecision {
+    if (!std.mem.eql(u8, call.name, "shell")) return null;
+    if (std.mem.find(u8, output, "\"running\"") == null) return null;
+    // Only text that is not JSON gives no decision; running out of memory is
+    // reported, so the row does not read "Ran" for a command that still runs.
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const action = tool_args.optionalStringArg(args, "action") orelse "run";
+    if (!std.mem.eql(u8, action, "run")) return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, output, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (parsed != .object) return null;
+    const state = parsed.object.get("state") orelse return null;
+    if (state != .string or !std.mem.eql(u8, state.string, "running")) return null;
+    return .{ .outcome = .completed, .label = still_running_label };
+}
+
+test "a shell run that returns its command running reads Still running" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const run = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 30\"}" };
+    const running = "{\"session_id\":\"shell-1\",\"state\":\"running\",\"steering_notice\":\"New steering arrived\"}";
+    const decision = (try runningCommandDecision(arena, run, running)).?;
+    try std.testing.expectEqualStrings(still_running_label, decision.label);
+    try std.testing.expectEqual(types.ToolOutcomeKind.completed, decision.outcome);
+
+    const no_action = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"command\":\"sleep 30\"}" };
+    try std.testing.expect((try runningCommandDecision(arena, no_action, running)) != null);
+
+    const finished = "{\"session_id\":\"shell-1\",\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"running\"}";
+    try std.testing.expect((try runningCommandDecision(arena, run, finished)) == null);
+    const interact = ToolCall{ .id = "i", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}" };
+    try std.testing.expect((try runningCommandDecision(arena, interact, running)) == null);
+    const read = ToolCall{ .id = "r", .name = "read_file", .arguments_json = "{}" };
+    try std.testing.expect((try runningCommandDecision(arena, read, running)) == null);
+    try std.testing.expect((try runningCommandDecision(arena, run, "not json \"running\"")) == null);
+}
+
+fn checkRunningCommandDecisionAllocationFailures(alloc: Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const run = ToolCall{ .id = "run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 30\"}" };
+    const running = "{\"session_id\":\"shell-1\",\"state\":\"running\"}";
+    const decision = (try runningCommandDecision(arena_state.allocator(), run, running)).?;
+    try std.testing.expectEqualStrings(still_running_label, decision.label);
+}
+
+test "a running shell result reports out of memory instead of reading Ran" {
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        checkRunningCommandDecisionAllocationFailures,
+        .{},
+    );
+}
+
 pub fn terminalActionOutcomeDecision(
     arena: Allocator,
     presentation: ?types.TerminalActionPresentation,
@@ -1528,7 +1609,10 @@ fn failureStatusDetail(
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
         if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
     if (safe_result.len == 0 or !mcp_call) return null;
-    const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    const server_text = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    // A refused call's parameters read as which fields and types, not as the
+    // start of a protocol dump; the model still gets the server's own words.
+    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse server_text;
     const masked_detail = try text_utils.maskSecrets(arena, detail);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
@@ -1898,6 +1982,26 @@ test "stream start execution certainty follows provider ownership" {
         test_tool_registry,
         "parallel_search",
     ));
+}
+
+test "only a provider-run tool that reads is safe to run again" {
+    const writing_provider_tool = blk: {
+        var spec = test_builtin_tools.web_search;
+        spec.name = "provider_publish";
+        spec.activity_kind = .write;
+        break :blk spec;
+    };
+    const provider_registry = tool_dispatch.Registry{
+        .tools = &.{ test_builtin_tools.web_search, writing_provider_tool, test_builtin_tools.read_file },
+    };
+
+    try std.testing.expect(providerToolOnlyReads(provider_registry, "web_search"));
+    try std.testing.expect(providerToolOnlyReads(provider_registry, "exa_search"));
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "provider_publish"));
+    // A local tool is not a provider-run tool, and an unknown name is not
+    // known to read.
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "read_file"));
+    try std.testing.expect(!providerToolOnlyReads(provider_registry, "unknown_tool"));
 }
 
 test "tool lifecycle uses activity metadata from the supplied registry" {
@@ -3259,6 +3363,27 @@ test "cancelled command ignores malformed artifact metadata" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, terminal.outcome.kind);
     try std.testing.expect(terminal.command_artifact_handle == null);
+}
+
+test "a shell wait is read from top-level arguments and from either request wrapper" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { arguments_json: []const u8, wait: bool }{
+        .{ .arguments_json = "{\"action\":\"wait\",\"session_id\":\"shell-1\"}", .wait = true },
+        .{ .arguments_json = "{\"request\":{\"action\":\"wait\",\"session_id\":\"shell-1\"}}", .wait = true },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"wait\\\",\\\"session_id\\\":\\\"shell-1\\\"}\"}", .wait = true },
+        .{ .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\"}\"}", .wait = false },
+        .{ .arguments_json = "{\"request\":\"[\\\"wait\\\"]\"}", .wait = false },
+        .{ .arguments_json = "not json", .wait = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.wait, try isShellWaitCall(arena, .{
+            .id = "shell-wait",
+            .name = "shell",
+            .arguments_json = case.arguments_json,
+        }));
+    }
 }
 
 test "cancelled shell wait names the observation instead of the process" {

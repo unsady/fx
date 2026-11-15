@@ -19,6 +19,8 @@ const profile_paths = @import("../core/shared/profile_paths.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_client = @import("client.zig");
 const chat_completions = @import("chat_completions.zig");
+const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const types = @import("../core/shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 const default_url = "https://models.dev/api.json";
@@ -41,23 +43,69 @@ pub fn provider(definition: *const definitions.Definition) catalog.Provider {
 fn fetch(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
     if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
     const definition: *const definitions.Definition = @ptrCast(@alignCast(raw.?));
-    const id = definition.models_dev orelse return chat_completions.catalog_from_metadata(alloc, definition.model_metadata);
+    const id = definition.models_dev orelse return chat_completions.model_catalog_provider(definition).fetch(alloc, input);
 
     const listed = load(alloc, id, input.cancel_flag) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("gateway", "models_dev catalog unavailable provider={s} error={s}", .{ id, @errorName(err) });
-        return chat_completions.catalog_from_metadata(alloc, definition.model_metadata);
+        return chat_completions.model_catalog_provider(definition).fetch(alloc, input);
     };
-    defer definitions.freeModelMetadata(alloc, listed);
+    defer models_dev.free(alloc, listed);
 
     const merged = try models_dev.merge(alloc, listed, definition.model_metadata);
-    defer definitions.freeModelMetadata(alloc, merged);
-    return chat_completions.catalog_from_metadata(alloc, merged);
+    defer models_dev.free(alloc, merged);
+    return .{ .catalog = try entries(alloc, merged) };
+}
+
+/// Catalog entries for `models`, owned by the result.
+fn entries(alloc: Allocator, models: []const models_dev.Model) Allocator.Error!std.ArrayList(catalog.ModelCatalogEntry) {
+    var list: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
+    errdefer catalog.freeModelCatalog(alloc, &list);
+    try list.ensureTotalCapacity(alloc, models.len);
+    for (models) |model| {
+        const id = try alloc.dupe(u8, model.id);
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        var efforts: std.ArrayList(types.ReasoningEffort) = .empty;
+        errdefer efforts.deinit(alloc);
+        try efforts.appendSlice(alloc, model.reasoning_efforts);
+        const vision = model.supports_vision orelse false;
+        list.appendAssumeCapacity(.{
+            .id = id,
+            .model_type = model_type,
+            .has_reasoning = (model.supports_reasoning orelse false) or model.reasoning_efforts.len != 0,
+            .reasoning_efforts = efforts,
+            .has_tool_use = model.supports_tool_use orelse false,
+            // Chat completions sends images as inline base64 content parts,
+            // so vision support implies file input through the same path.
+            .has_vision = vision,
+            .has_file_input = vision,
+            .context_window = model.context_window orelse 0,
+            .max_tokens = model.max_output_tokens orelse 0,
+        });
+    }
+    return list;
+}
+
+/// The model ids `fx models` lists for a connection with a catalog.
+pub fn cliCatalog(definition: *const definitions.Definition, alloc: Allocator, input: gateway_provider.CliModelCatalogInput, provenance: catalog.Provenance) gateway_provider.CliModelCatalogResult {
+    const exhausted: gateway_provider.CliModelCatalogResult = .{ .failure = .{ .access = provenance.access, .anonymous_fallback_used = false, .failure = .{ .category = .resource_exhausted } } };
+    const result = provider(definition).fetch(alloc, .{ .access = input.access, .endpoint = input.endpoint, .cancel_flag = input.cancel_flag }) catch return exhausted;
+    switch (result) {
+        .failure => |failure| return .{ .failure = .{ .access = provenance.access, .anonymous_fallback_used = false, .failure = failure } },
+        .catalog => |fetched| {
+            var listed = fetched;
+            defer catalog.freeModelCatalog(alloc, &listed);
+            const ids = catalog.projectModelIds(alloc, listed.items) catch return exhausted;
+            return .{ .loaded = .{ .ids = ids, .provenance = provenance } };
+        },
+    }
 }
 
 /// The provider's models from a fresh cache, else from models.dev, else from
 /// an older cache. Caller owns the result.
-fn load(alloc: Allocator, id: []const u8, cancel_flag: ?*std.atomic.Value(bool)) ![]const definitions.ModelMetadata {
+fn load(alloc: Allocator, id: []const u8, cancel_flag: ?*std.atomic.Value(bool)) ![]const models_dev.Model {
     if (comptime host_target.is_wasm) return error.ModelsDevUnavailable;
 
     const cached = readCache(alloc, id) catch |err| blk: {

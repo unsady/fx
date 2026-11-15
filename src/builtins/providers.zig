@@ -20,7 +20,7 @@ pub const native = provider_set.Set{
     .lookup_models_dev_fn = models_dev_catalog.lookup,
     .gateway = gateway.provider_bundle,
     .codex = .{
-        .capabilities = .{ .sends_output_limit = false },
+        .capabilities = openai_codex.bundle_capabilities,
         .presentation = provider_catalog.find(.codex),
         .auth_strategy = .chatgpt,
         .title_model = openai_codex_models.title_model,
