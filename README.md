@@ -101,7 +101,7 @@ The manual at [fx.sh/docs](https://fx.sh/docs) covers models, permissions, confi
 
 To learn fx, read the manual as Markdown. [fx.sh/llms.txt](https://fx.sh/llms.txt) indexes every page, [fx.sh/llms-full.txt](https://fx.sh/llms-full.txt) puts the whole manual in one file, and adding `.md` to any docs URL returns that page as Markdown. For the flags of the installed version, run `fx <command> --help`.
 
-To run fx from your own tools, use `fx ask`. It takes the prompt as arguments or on stdin, writes its result to stdout and progress and diagnostics to stderr, and exits with a nonzero status when the request fails. With `--json`, the final answer is in `final_output`.
+To run fx from your own tools, use `fx ask`. It takes the prompt as arguments or on stdin, writes its result to stdout and progress and diagnostics to stderr, and exits with a nonzero status when the request fails. With `--json`, the final answer is in `final_output`, and when the model provider failed the request, `http_status` is the status it answered with.
 
 To inspect a user's setup, run `fx status --json` for configuration and runtime information, or `fx doctor --json` for health checks. Neither changes the setup.
 

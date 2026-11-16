@@ -331,6 +331,10 @@ pub const PromptRunResult = struct {
     /// empty when the provider did not report routing metadata.
     resolved_provider: []u8 = &.{},
     error_code: ?[]const u8 = null,
+    /// The status the model provider answered the failed request with, so a
+    /// caller can tell a provider's refusal, such as 429, from fx's own error
+    /// without reading the message.
+    http_status: ?std.http.Status = null,
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     recovery: ?types.RouteRecoveryStatus = null,
     usage: types.Usage = .{},
@@ -680,6 +684,7 @@ const AskContext = struct {
     output_write_failed: bool = false,
     output_reader_gone: bool = false,
     typed_error_code: ?[]const u8 = null,
+    http_status: ?std.http.Status = null,
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     output_mode: OutputMode = .raw,
     prompt_permissions: bool = false,
@@ -2183,6 +2188,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .tool_calls = tool_calls,
         .step_count = ctx.step_count,
         .error_code = ctx.typed_error_code,
+        .http_status = ctx.http_status,
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
         .usage = ctx.session.agent.turn_usage,
@@ -3559,6 +3565,7 @@ fn pushCommandOutputComplete(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId) !vo
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.failed = true;
+    ctx.http_status = status;
     const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
     ctx.auth_failure = auth_failure;
     const message = if (auth_failure) |failure|
@@ -4179,6 +4186,7 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         try out.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(error_code, .{}, &out.writer);
     }
+    if (result.http_status) |status| try out.writer.print(",\"http_status\":{d}", .{@backingInt(status)});
     if (result.auth_failure) |failure| {
         try out.writer.writeAll(",\"auth_failure\":");
         try failure.writeJson(&out.writer);
@@ -7762,6 +7770,23 @@ test "ask usage JSON distinguishes unavailable totals from reported zero" {
     const usage = parsed.value.object.get("usage").?.object;
     try std.testing.expectEqual(@as(i64, 0), usage.get("input_tokens").?.integer);
     try std.testing.expect(usage.get("output_tokens").? == .null);
+}
+
+test "ask JSON names the status the provider failed with" {
+    const alloc = std.testing.allocator;
+    const failed = try renderFinalJsonResult(alloc, .{
+        .exit_code = 1,
+        .assistant_output = &.{},
+        .http_status = .too_many_requests,
+    });
+    defer alloc.free(failed);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, failed, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 429), parsed.value.object.get("http_status").?.integer);
+
+    const fine = try renderFinalJsonResult(alloc, .{ .exit_code = 0, .assistant_output = &.{} });
+    defer alloc.free(fine);
+    try std.testing.expect(std.mem.indexOf(u8, fine, "http_status") == null);
 }
 
 test "render final JSON preserves shape escaping order and newline" {
