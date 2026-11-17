@@ -660,6 +660,9 @@ const SessionRecoveryOptions = struct {
 
 const AcpOptions = struct {
     agent: agent_run_flags.Overrides = .{},
+    /// `--system`: replaces fx's system prompt in every session, as in
+    /// `fx ask --system`.
+    system_prompt: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
 
     fn deinit(self: *AcpOptions, alloc: Allocator) void {
@@ -1840,6 +1843,8 @@ fn runNonInteractiveWithDeps(
                 },
             };
             defer acp_opts.deinit(alloc);
+            var acp_prompt_policy = cfg.prompt_policy;
+            if (acp_opts.system_prompt) |text| acp_prompt_policy.system_prompt = text;
             try cfg.acp_runner.run(alloc, .{
                 .auth_mode = cfg.auth_mode,
                 .default_model = cfg.default_model,
@@ -1851,7 +1856,7 @@ fn runNonInteractiveWithDeps(
                 .provider_set = cfg.provider_set,
                 .process_provider = cfg.process_provider,
                 .secret_store = cfg.secret_store,
-                .prompt_policy = cfg.prompt_policy,
+                .prompt_policy = acp_prompt_policy,
                 .ignored_list_entries = cfg.ignored_list_entries,
                 .max_list_entries = cfg.max_list_entries,
                 .max_read_file_bytes = cfg.max_read_file_bytes,
@@ -4390,7 +4395,7 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     };
 }
 
-const AcpFlag = enum { permission_mode, ask, auto, full_access, yolo, provider, model, effort, fast, no_fast, ultrafast, no_ultrafast, log_file };
+const AcpFlag = enum { permission_mode, ask, auto, full_access, yolo, provider, model, effort, fast, no_fast, ultrafast, no_ultrafast, system, log_file };
 const acp_flag_ids = cli_flags.idTable(AcpFlag, &builtin_commands.acp_options);
 
 fn parseAcpArgs(alloc: Allocator, args: []const [:0]const u8, bad: *?BadAgentValue) !AcpOptions {
@@ -4406,6 +4411,7 @@ fn parseAcpArgs(alloc: Allocator, args: []const [:0]const u8, bad: *?BadAgentVal
                 continue;
             }
             switch (id) {
+                .system => opts.system_prompt = match.value.?,
                 .log_file => opts.log_file = match.value.?,
                 else => unreachable,
             }
@@ -4431,6 +4437,10 @@ test "ACP arguments take the agent-run flags and a log file" {
     try std.testing.expectEqual(types.PermissionMode.ask, last.agent.permission.?);
     try std.testing.expectEqualStrings("codex", last.agent.provider.?.label());
     try std.testing.expectEqualStrings("/tmp/acp.log", last.log_file.?);
+
+    var system = try parseAcpArgs(alloc, &.{ "--system", "You are den." }, &bad);
+    defer system.deinit(alloc);
+    try std.testing.expectEqualStrings("You are den.", system.system_prompt.?);
 
     try std.testing.expectError(error.InvalidAgentRunValue, parseAcpArgs(alloc, &.{ "--effort", "high effort" }, &bad));
     try std.testing.expectEqualStrings("--effort", bad.?.flag);

@@ -118,10 +118,11 @@ pub const session_options = [_]command_specs.OptionDoc{
 };
 
 pub const acp_options = agentRunOptions("sessions this server starts", .without_provider_order) ++ [_]command_specs.OptionDoc{
+    .{ .flag = "--system TEXT", .description = "Replace the built-in system prompt for the sessions this server starts" },
     .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
 };
 
-pub const acp_usage = "acp " ++ agent_run_usage_base ++ " [--log-file <path>]";
+pub const acp_usage = "acp " ++ agent_run_usage_base ++ " [--system <text>] [--log-file <path>]";
 
 pub const pr_options = agentRunOptions("this request", .with_provider_order) ++ [_]command_specs.OptionDoc{
     .{ .flag = "--create", .description = "Publish the drafted pull request via the GitHub CLI" },
