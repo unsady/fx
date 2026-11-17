@@ -2993,7 +2993,16 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.process_model_override = startup.model_source == .process_override;
     }
     if (state.cfg.provider_override) |override| {
-        state.provider = override;
+        // A configured provider's name binds to its definition, as it does
+        // for the settings: an unbound one cannot be saved with the session.
+        state.provider = override.bind(startup.configured_providers) catch |err| {
+            const message = try config_runtime.configuredProviderMessage(alloc, err);
+            defer if (message) |m| alloc.free(m);
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = message orelse "Failed to load startup state",
+            });
+        };
         state.process_provider_override = true;
     } else {
         state.provider = startup.provider;
