@@ -9004,7 +9004,7 @@ describe("acp: model-independent", () => {
           5,
         ) as any;
         expect(missingLoad.error).toEqual({
-          code: -32602,
+          code: -32002,
           message: "Session not found",
         });
 

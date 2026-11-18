@@ -52,6 +52,9 @@ pub const ErrorCode = struct {
     pub const method_not_found: i64 = -32601;
     pub const invalid_params: i64 = -32602;
     pub const internal_error: i64 = -32603;
+    /// ACP's code for a resource that does not exist, such as a session id
+    /// with no saved session.
+    pub const resource_not_found: i64 = -32002;
 };
 
 pub const RequestId = union(enum) {

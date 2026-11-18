@@ -666,7 +666,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
 
     var loaded = (js_host_session_store.load(alloc, session_id) catch
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Session could not be loaded" })) orelse
-        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Session not found" });
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.resource_not_found, .message = "Session not found" });
     var loaded_owned = true;
     defer if (loaded_owned) loaded.deinit(alloc);
     const sid_copy = try alloc.dupe(u8, loaded.state.id);
@@ -1414,7 +1414,7 @@ fn handleLoadFailure(
         });
     }
     return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
+        .code = ErrorCode.resource_not_found,
         .message = "Session not found",
     });
 }
