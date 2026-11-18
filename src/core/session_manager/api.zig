@@ -98,9 +98,10 @@ pub const NewOptions = struct {
     role: Role = .root,
     /// Required for a child session.
     parent: ?[]const u8 = null,
-    /// A child's id, already named in its parent's `child_spawned` (D34); a
-    /// root always gets a fresh one. A taken id fails the first turn's
-    /// append and leaves the existing session as it was.
+    /// A child's id, already named in its parent's `child_spawned` (D34),
+    /// or the id a client chose for a root; null draws a fresh one. A taken
+    /// id fails the first turn's append and leaves the existing session as
+    /// it was.
     id: ?[]const u8 = null,
 };
 
@@ -266,10 +267,7 @@ pub const Manager = struct {
     pub fn openNew(m: *Manager, options: NewOptions) OpenError!Session {
         try checkText(options.workspace);
         try checkRoleParent(options.role, options.parent);
-        if (options.id) |id| {
-            if (options.role != .child) return error.InvalidArgument;
-            try checkId(id);
-        }
+        if (options.id) |id| try checkId(id);
         const inner = try session_mod.openNew(&m.env, .{
             .workspace = options.workspace,
             .host = options.host,
@@ -1268,15 +1266,20 @@ const api_tests = struct {
         again.release();
     }
 
-    test "only a child takes an id, it must be valid, and a taken id never replaces a session (D34)" {
+    test "a session takes an id, it must be valid, and a taken id never replaces a session (D34, D98)" {
         var f: Fixture = undefined;
         try f.init();
         defer f.deinit();
         const m = f.manager;
-        try testing.expectError(error.InvalidArgument, m.openNew(.{ .workspace = "/w", .host = .app, .id = "1786460757753-root" }));
-        const p = try m.openNew(.{ .workspace = "/w", .host = .app });
+        try testing.expectError(error.InvalidArgument, m.openNew(.{ .workspace = "/w", .host = .acp, .id = "../escape" }));
+        const p = try m.openNew(.{ .workspace = "/w", .host = .acp, .id = "1786460757753-root" });
         defer p.release();
+        try testing.expectEqualStrings("1786460757753-root", p.id());
+        // A root holds its id in memory until its first turn saves it.
+        try testing.expectError(error.NotFound, m.read(gpa, "1786460757753-root", .start, .forward, 1));
         _ = try p.append(&.{ .turn_started, piece, .turn_committed });
+        var root_page = try m.read(gpa, "1786460757753-root", .start, .forward, 1);
+        root_page.deinit();
         try testing.expectError(error.InvalidArgument, m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = "../escape" }));
 
         const first = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = "1786460757753-taken" });

@@ -1286,6 +1286,9 @@ pub const Seed = struct {
     /// A child's instructions, kept in its own `prefs` (D34); roots leave
     /// it empty.
     instructions: []const u8 = "",
+    /// The id a client chose for a new root session, such as den's for the
+    /// chat it starts; null draws a fresh one.
+    id: ?[]const u8 = null,
 };
 
 pub const Target = union(enum) {
@@ -1710,7 +1713,7 @@ pub const Session = struct {
         // resumeSession: E2E tests use this to prove read-only paths never
         // reach one.
         io_mod.e2eFailIfDurableMutationAttempted();
-        const handle = try newHandle(store, workspace, host);
+        const handle = try newHandle(store, workspace, host, seed.id);
         errdefer handle.release();
         const self = try init(alloc, store, handle, true);
         errdefer self.destroyInner();
@@ -1721,8 +1724,19 @@ pub const Session = struct {
 
     /// A new session whose id no v1 folder has, so it never hides a session
     /// still to convert (`tests/tla/session_manager/V1Conversion.tla` NoShadow). `openNew` touches
-    /// no disk, so a taken id costs one more try.
-    fn newHandle(store: *Store, workspace: []const u8, host: Host) !sm.Session {
+    /// no disk, so a taken id costs one more try; a chosen one that is taken
+    /// fails.
+    fn newHandle(store: *Store, workspace: []const u8, host: Host, chosen: ?[]const u8) !sm.Session {
+        if (chosen) |chosen_id| {
+            const handle = try store.manager.openNew(.{ .workspace = workspace, .host = host, .id = chosen_id });
+            errdefer handle.release();
+            const taken = v1_conversion.hasFolder(store.home, chosen_id) catch |err| {
+                debug_trace.logf("convert", "action=IdUnchecked session={s} err={s}", .{ chosen_id, @errorName(err) });
+                return error.SessionStoreUnavailable;
+            };
+            if (taken) return error.SessionIdTaken;
+            return handle;
+        }
         for (0..8) |_| {
             const handle = try store.manager.openNew(.{ .workspace = workspace, .host = host });
             const taken = v1_conversion.hasFolder(store.home, handle.id()) catch |err| {
@@ -6135,6 +6149,29 @@ test "a new session commits turns, and resume gives them back with its settings"
     var st = try r.handle.state(testing.allocator);
     defer st.deinit(testing.allocator);
     try testing.expectEqualStrings("\"first question\"", st.title.?);
+}
+
+test "a new session keeps the id its client chose, and its first turn saves it under that id" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "test-model".*;
+    var seed = testSeed(&model);
+    seed.id = "den-chosen1";
+    const s = try Session.create(testing.allocator, &t.store, "/w", .acp, seed);
+    try testing.expectEqualStrings("den-chosen1", s.id());
+    try s.commitTurn(assistantTurn("question", "answer"), types.ConversationLanguage.default());
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = "den-chosen1" }, "/w", .acp);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+
+    // An id that is not one fails before anything is held.
+    seed.id = "../escape";
+    try testing.expectError(error.InvalidArgument, Session.create(testing.allocator, &t.store, "/w", .acp, seed));
 }
 
 test "a result the model saw whole comes back whole after a resume, or says its body is unavailable" {

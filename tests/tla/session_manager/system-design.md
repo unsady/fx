@@ -269,7 +269,7 @@ With no callback, the cost is one null check.
 Thirteen operations:
 
 ```text
-open(.new{workspace, role, parent, host, id})   -> Session   no disk I/O until the first turn; `id` for a child only (D34)
+open(.new{workspace, role, parent, host, id})   -> Session   no disk I/O until the first turn; `id` for a child (D34) or a client's root (D98)
 open(.resume{target, workspace, parent, host, lock_wait_ms})
                                                 -> Session   Busy, NotFound, ChildSession, Corrupt, UnsupportedVersion
      target: id | .last (newest updated, any host) | .last_opened{host} (newest opened by that host)
@@ -1939,3 +1939,16 @@ as it was sent):
 - the index rewrite threshold;
 - the snapshot distance, tuned to 64 KB by the benchmark;
 - test names and fixture layout.
+- **D98 Decision:** `session/new` takes the id a client chose for a root
+  session in `_meta.fx.sessionId`, as `open(.new)` takes a child's (D34):
+  the session holds it in memory, and its first turn creates the log under
+  it. den starts a chat this way and names the session to its own clients
+  before any prompt. An id a live v1 session has fails at once
+  (`V1Conversion.tla` `NoShadow` lets `FCreate` take any root id that rule
+  allows); one a v2 session has fails the first turn's append and leaves
+  that session as it was. A client resumes an id it chose first and makes
+  it new only when the resume finds nothing, so it never relies on that
+  failure. Its ids are as random as fx's own (`V1Conversion.tla`
+  assumption A1). **Why:** a client that names a session only after its
+  first prompt has to guess which events belong to it. **Alternative:**
+  save a session at `session/new`, which D2 rules out.

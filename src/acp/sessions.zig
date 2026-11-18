@@ -399,6 +399,14 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }),
     };
     defer if (client_system_prompt) |text| alloc.free(text);
+    const chosen_id = chosenSessionId(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "_meta.fx.sessionId must be a session id: letters, digits, '.', '_' and '-'",
+        }),
+    };
+    defer if (chosen_id) |id| alloc.free(id);
     var workspace = workspace_binding.prepare(state, alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
@@ -458,7 +466,25 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         .mcp_host = session_host,
         .workspace = if (workspace) |*binding| binding else null,
         .client_system_prompt = &client_system_prompt,
+        .id = chosen_id,
     });
+}
+
+/// The owned `_meta.fx.sessionId` of `session/new`, or null when absent: the
+/// id the client chose for the new session, so it can name the session
+/// before its first prompt saves it.
+fn chosenSessionId(alloc: Allocator, params_raw: ?[]const u8) error{ OutOfMemory, InvalidSessionId }!?[]u8 {
+    const raw = params_raw orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = acp_types.fxMetaField(parsed.value.object, "sessionId") orelse return null;
+    if (value != .string) return error.InvalidSessionId;
+    session_store_paths.validateSessionId(value.string) catch return error.InvalidSessionId;
+    return try alloc.dupe(u8, value.string);
 }
 
 /// What `session/new` hands `startV2Session`.
@@ -471,6 +497,8 @@ const V2Start = struct {
     /// Owned by the caller. The session takes the text over on success, and
     /// this is then set to null.
     client_system_prompt: *?[]u8,
+    /// The id the client chose, borrowed; null draws a fresh one.
+    id: ?[]const u8 = null,
 };
 
 /// `session/new` on v2. The session stays in memory until its first prompt,
@@ -497,8 +525,12 @@ fn startV2Session(
         },
         .language = session_runtime.ConversationLanguage.default(),
         .permission_state = .{},
-    }) catch
-        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Failed to create session" });
+        .id = start.id,
+    }) catch |err| return state.writer.writeError(alloc, msg.id, switch (err) {
+        error.SessionIdTaken => .{ .code = ErrorCode.invalid_params, .message = "_meta.fx.sessionId names a session that exists" },
+        error.InvalidArgument => .{ .code = ErrorCode.invalid_params, .message = "_meta.fx.sessionId is not a valid session id" },
+        else => .{ .code = ErrorCode.internal_error, .message = "Failed to create session" },
+    });
     var v2_owned = true;
     defer if (v2_owned) v2.close();
     if (start.client_system_prompt.*) |text| {
