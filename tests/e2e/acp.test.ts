@@ -12120,3 +12120,55 @@ test("ACP keeps an idle Claude session's cache warm until the next session repla
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 45000);
+
+test("ACP libfx/compact compacts a session in place and keeps its id", async () => {
+  const root = createIsolatedRoot("fx-acp-compact-");
+  const model = "fixture/compact";
+  const summaries: string[] = [];
+  const gateway = startDynamicFakeGateway((body: string) => {
+    const request = JSON.parse(body);
+    if (request.tools?.length === 0 && request.toolChoice?.type === "none") {
+      summaries.push(body);
+      return finalText("Turn 1\nIn between: none");
+    }
+    return finalText("ANSWER " + "word ".repeat(12_000));
+  }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: 128_000, max_tokens: 8192 }] });
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: root.workspace, env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: model } });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+    const sessionId = created.result.sessionId;
+
+    const unknown = await client.request("libfx/compact", { sessionId: "missing" }, 3) as any;
+    expect(unknown.error.code).toBe(-32002);
+    const invalid = await client.request("libfx/compact", {}, 4) as any;
+    expect(invalid.error.code).toBe(-32602);
+
+    // Nothing to compact in a session that has no turns.
+    const empty = await client.request("libfx/compact", { sessionId }, 5) as any;
+    expect(empty.result.compacted).toBe(false);
+
+    for (let n = 0; n < 3; n++) {
+      const turn = await runPrompt(client, `Question ${n}`, TIMEOUT);
+      expect(turn.promptResult.result.stopReason).toBe("end_turn");
+    }
+    const compacted = await client.request("libfx/compact", { sessionId }, 6) as any;
+    expect(compacted.error).toBeUndefined();
+    expect(compacted.result.compacted).toBe(true);
+    expect(compacted.result.tokensBefore).toBeGreaterThan(0);
+    expect(compacted.result.tokensAfter).toBeGreaterThan(0);
+    expect(savedSessionIds(root.home)).toEqual([sessionId]);
+    expect(logLines(root.home, sessionId).filter((line: any) => line.kind === "compacted")).toHaveLength(1);
+
+    // The next prompt runs on the compacted history of the same session.
+    const next = await runPrompt(client, "Question after", TIMEOUT);
+    expect(next.promptResult.result.stopReason).toBe("end_turn");
+    expect(JSON.stringify(JSON.parse(gateway.requests.at(-1)!.body).prompt)).toContain("<compacted_conversation>");
+    expect(client.stderr).toBe("");
+  } finally {
+    await client?.close();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 60000);

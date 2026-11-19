@@ -1952,3 +1952,14 @@ as it was sent):
   assumption A1). **Why:** a client that names a session only after its
   first prompt has to guess which events belong to it. **Alternative:**
   save a session at `session/new`, which D2 rules out.
+- **D99 Decision:** `libfx/compact {sessionId}` compacts the active
+  session's context on demand and answers `{compacted, tokensBefore,
+  tokensAfter}`, estimates of what the model reads. It runs the compactor as
+  `/compact` does and commits through the path automatic compaction uses, so
+  the log gets a `compacted` line and the session keeps its id. A running
+  prompt is refused (`invalid_request`), another session id is
+  `resource_not_found`, and a session with nothing to compact answers
+  `compacted: false`. Unlike the other `libfx/` methods it is served on every
+  ACP connection, not only the kernel's. **Why:** den compacts a chat when
+  the user asks, without a new session. **Alternative:** a prompt that
+  compacts first, which has no answer when the model call is not wanted.

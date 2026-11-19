@@ -56,6 +56,8 @@ const libfx_journal = @import("libfx_journal.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_steering = @import("libfx_steering.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
+const result_store = @import("../core/session/result_store.zig");
+const token_estimate = @import("../core/shared/token_estimate.zig");
 const session_runtime = @import("../core/session/session.zig");
 const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
@@ -3273,6 +3275,91 @@ fn commitContextCompaction(
     if (session.journal) |*journal| try journal.append(ctx.alloc, session.session_id, .{ .history_replaced = prepared });
     session.session_rt.commitCompactedHistory(ctx.alloc, prepared);
     prepared_owned = false;
+}
+
+/// `libfx/compact`: compacts the session's context in place. The log gets the
+/// same `compacted` line an automatic compaction writes, so the session keeps
+/// its id and the next prompt reads the compacted history. The caller has
+/// already refused the call while a prompt runs.
+pub fn handleCompact(state: *server.ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
+    const invalid: jsonrpc.RpcError = .{ .code = ErrorCode.invalid_params, .message = "Invalid libfx compact params" };
+    const raw = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, invalid);
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
+        return state.writer.writeError(alloc, msg.id, invalid);
+    defer parsed.deinit();
+    const session_id = if (parsed.value == .object) parsed.value.object.get("sessionId") orelse return state.writer.writeError(alloc, msg.id, invalid) else return state.writer.writeError(alloc, msg.id, invalid);
+    if (session_id != .string) return state.writer.writeError(alloc, msg.id, invalid);
+    const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.resource_not_found, .message = "Session not found" });
+    if (!std.mem.eql(u8, session.session_id, session_id.string)) return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.resource_not_found, .message = "Session not found" });
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var ctx = AcpContext{ .alloc = alloc, .state = state, .session_id = session.session_id };
+    var deps = agentRuntimeDeps(&ctx);
+    const capabilities = availableModelCapabilities(@ptrCast(&ctx), session.model);
+    var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, session.effort, session.fast_mode);
+    provider_options.prompt_caching = state.cfg.provider_set.select(session.provider).capabilities.gateway_prompt_caching;
+    var summary_model: agent_runtime.CompactorCaller = .{
+        .stream_provider = deps.agent_stream_provider,
+        .cooperative_transport_pulse = deps.cooperative_transport_pulse,
+        .provider = session.provider,
+        .model = session.model,
+        .api_key = session.api_key,
+        .credential_source = session.credential_source,
+        .account_id = session.account_id,
+        .gateway_team = state.gateway_team,
+        .session_id = session.session_id,
+        .retry_count = state.cfg.gateway_retry_count,
+        .provider_options = provider_options,
+        .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
+        .capabilities_context = deps.ctx,
+        .capabilities_fn = deps.available_model_capabilities,
+        .renewal_deps = &deps,
+    };
+    defer summary_model.deinit();
+
+    const history = try session.session_rt.snapshotHistory(alloc);
+    defer types.freeHistoryTurnSlice(alloc, history);
+    const tokens_before = try contextTokens(arena, history);
+    session.cancel_flag.store(false, .seq_cst);
+    const result = agent_runtime.compactContext(arena, &deps, .{
+        .activity_origin = .manual,
+        .compactor = .{
+            .history = history,
+            .append_messages = session_runtime.appendHistoryChatMessages,
+            .size = agent_runtime.compactionSize(&session.session_rt.agent, capabilities, state.auto_compact_percent, session.model),
+            .caller = summary_model.caller(),
+            .records = if (sessionChildCapability(session)) |capability| result_store.compactorStore(capability) else null,
+            .cancel_flag = &session.cancel_flag,
+            .trace_ctx = .{},
+        },
+    }) catch |err| {
+        const message = try alloc.print("Compaction failed: {s}", .{@errorName(err)});
+        defer alloc.free(message);
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });
+    };
+    if (result == null) {
+        const none = try alloc.print("{{\"compacted\":false,\"tokensBefore\":{d},\"tokensAfter\":{d}}}", .{ tokens_before, tokens_before });
+        defer alloc.free(none);
+        return state.writer.writeResponse(alloc, msg.id, none);
+    }
+
+    const after = try session.session_rt.snapshotHistory(alloc);
+    defer types.freeHistoryTurnSlice(alloc, after);
+    const response = try alloc.print("{{\"compacted\":true,\"tokensBefore\":{d},\"tokensAfter\":{d}}}", .{ tokens_before, try contextTokens(arena, after) });
+    defer alloc.free(response);
+    try state.writer.writeResponse(alloc, msg.id, response);
+}
+
+/// Estimated tokens of the conversation the model reads from `history`.
+fn contextTokens(arena: Allocator, history: []const HistoryTurn) !usize {
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    try session_runtime.appendActiveContextHistoryChatMessages(arena, &messages, history, 0);
+    var total: usize = 0;
+    for (messages.items) |item| total += token_estimate.textTokens(item.content orelse "");
+    return total;
 }
 
 /// `recovery_checkpoint.set` for a journaled libfx session: the open turn

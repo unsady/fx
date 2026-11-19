@@ -89,6 +89,7 @@ const AcpMethod = enum {
     libfx_handoff,
     libfx_follow_up,
     libfx_snapshot,
+    libfx_compact,
     libfx_journal_open,
     libfx_journal_images,
     mcp_message,
@@ -115,6 +116,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/handoff")) return .libfx_handoff;
         if (std.mem.eql(u8, method, "libfx/follow_up")) return .libfx_follow_up;
         if (std.mem.eql(u8, method, "libfx/snapshot")) return .libfx_snapshot;
+        if (std.mem.eql(u8, method, "libfx/compact")) return .libfx_compact;
         if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
         if (std.mem.eql(u8, method, "libfx/journal_images")) return .libfx_journal_images;
         if (std.mem.eql(u8, method, "mcp/message")) return .mcp_message;
@@ -144,6 +146,7 @@ const AcpMethod = enum {
             .libfx_checkpoint,
             .libfx_restore,
             .libfx_snapshot,
+            .libfx_compact,
             .libfx_journal_open,
             .libfx_journal_images,
             .mcp_message,
@@ -1570,6 +1573,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_handoff => handleKernelHandoff(state, alloc, msg),
         .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
         .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
+        .libfx_compact => prompt_handler.handleCompact(state, alloc, msg),
         .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
         .libfx_journal_images => handleKernelJournalImages(state, alloc, msg),
         .initialize,
@@ -4504,7 +4508,11 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("libfx/new"));
     try std.testing.expectEqual(AcpMethod.libfx_steer, AcpMethod.parse("libfx/steer"));
     try std.testing.expectEqual(AcpMethod.libfx_handoff, AcpMethod.parse("libfx/handoff"));
+    try std.testing.expectEqual(AcpMethod.libfx_compact, AcpMethod.parse("libfx/compact"));
     try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("workspace/unknown"));
+    try std.testing.expect(AcpMethod.libfx_compact.waitsForActivePrompt());
+    // Not a kernel-only method: every ACP connection serves it.
+    try std.testing.expect(!AcpMethod.libfx_compact.isLibfx());
     try std.testing.expect(AcpMethod.libfx_checkpoint.isLibfx());
     try std.testing.expect(AcpMethod.libfx_restore.isLibfx());
     try std.testing.expect(AcpMethod.libfx_new.isLibfx());
