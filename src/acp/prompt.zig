@@ -1204,6 +1204,7 @@ pub fn handlePrompt(
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
         .behind_toolbox = state.toolbox_behind.slice(),
+        .provider_search = state.cfg.provider_set.select(session.provider).capabilities.fx_search,
     });
     defer tool_projection.deinit(alloc);
 
@@ -1469,6 +1470,7 @@ pub fn runSubagentChild(
             .permission_rules = admission.rules,
             .subagent_available = true,
             .behind_toolbox = state.toolbox_behind.slice(),
+            .provider_search = state.cfg.provider_set.select(admission.provider).capabilities.fx_search,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);

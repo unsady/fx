@@ -3731,7 +3731,7 @@ fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *st
         turn_context
     else
         try arena.print(
-            "{s}\nRuntime context: this is a noninteractive run with no question UI. When a user-owned decision remains after inspection, stop and state the blocker and the options in plain text, without recommending one.",
+            "{s}\nRuntime context: this is a noninteractive run with no question UI. When a user-owned decision remains after inspection, stop and state the blocker and the options in plain text.",
             .{turn_context},
         );
     try messages.append(arena, .{ .role = .system, .content = content });
@@ -3815,7 +3815,7 @@ test "runtime context composes exact auto mode with noninteractive blockers" {
     try expectContains(messages.items[0].content.?, "this is a noninteractive run");
     try expectContains(messages.items[0].content.?, "with no question UI");
     try expectContains(messages.items[0].content.?, "state the blocker and the options in plain text");
-    try expectContains(messages.items[0].content.?, "without recommending one");
+    try expectNotContains(messages.items[0].content.?, "recommend");
     try expectNotContains(messages.items[0].content.?, "ask_user_question");
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[1].role);

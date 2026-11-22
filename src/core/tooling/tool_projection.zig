@@ -18,6 +18,10 @@ pub const Options = struct {
     subagent_profiles: []const profiles.Entry = &.{},
     /// Built-in tools fx lists in the toolbox menu instead of sending.
     behind_toolbox: []const []const u8 = &toolbox.default_behind,
+    /// Whether the provider runs fx's provider-executed tools, such as
+    /// `web_search`. A provider without them gets neither the tool nor its
+    /// guidance, which would point the model at a search it cannot run.
+    provider_search: bool = true,
 };
 
 /// The longest profile description shown to the model, on one line.
@@ -525,6 +529,7 @@ fn appendBuiltinTool(
     // they're denied too.
     if (toolNameInSet(options.behind_toolbox, tool.name)) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
+    if (tool.provider_executed and !options.provider_search) return;
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
         if (permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;
@@ -740,6 +745,15 @@ fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
     defer projection.deinit(alloc);
     try expectContainsName(projection.advertised_names, "read_file");
     try std.testing.expectEqualStrings(test_web_search.description, projection.custom_guidance);
+}
+
+test "a provider without search gets neither web_search nor its guidance" {
+    const alloc = std.testing.allocator;
+    var projection = try buildTestModelToolProjection(alloc, .{ .provider_search = false });
+    defer projection.deinit(alloc);
+    try expectContainsName(projection.advertised_names, "read_file");
+    try std.testing.expect(!containsName(projection.advertised_names, "web_search"));
+    try std.testing.expectEqualStrings("", projection.custom_guidance);
 }
 
 test "effective tool projection cleans up every partial allocation failure" {

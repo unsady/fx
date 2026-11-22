@@ -2087,6 +2087,7 @@ const App = struct {
             .subagent_available = subagent_available,
             .subagent_profiles = subagent_profiles,
             .behind_toolbox = self.toolbox_behind.slice(),
+            .provider_search = self.providerSet().select(provider_runtime.providerOf(self, agent)).capabilities.fx_search,
         });
     }
 

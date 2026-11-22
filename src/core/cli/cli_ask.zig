@@ -289,6 +289,7 @@ fn runAskChild(
             .permission_rules = admission.rules,
             .subagent_available = true,
             .behind_toolbox = ctx.toolbox_behind.slice(),
+            .provider_search = ctx.cfg.provider_set.select(admission.provider).capabilities.fx_search,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
@@ -1897,6 +1898,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
         .behind_toolbox = ctx.toolbox_behind.slice(),
+        .provider_search = ctx.cfg.provider_set.select(ctx.provider).capabilities.fx_search,
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
