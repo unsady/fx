@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { copyFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createServer as createTlsServer } from "node:tls";
@@ -264,10 +264,12 @@ describe("configured providers", () => {
   test("a models.dev catalog lists models and their reasoning levels, and is cached", async () => {
     const f = fixture();
     let catalogRequests = 0;
+    let catalogDown = false;
     const catalogServer = Bun.serve({
       hostname: "127.0.0.1", port: 0,
       fetch() {
         catalogRequests++;
+        if (catalogDown) return new Response("down", { status: 503 });
         return Response.json({
           other: { id: "other", models: { "other-model": { id: "other-model" } } },
           "test-provider": { id: "test-provider", models: {
@@ -296,8 +298,22 @@ describe("configured providers", () => {
       const asked = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env, timeoutMs: 20000 });
       if (asked.code !== 0) throw new Error(`fx ask failed: ${asked.stdout} ${asked.stderr}`);
       expect(f.requests.at(-1)!.body.reasoning_effort).toBe("high");
-      // The second run reads the day-old-at-most cache instead of the network.
+      // The second run reads the hour-old-at-most cache instead of the network.
       expect(catalogRequests).toBe(1);
+
+      // An hour later fx asks models.dev again; when it fails, the older copy
+      // still lists the models and counts as fresh for another hour.
+      const cacheFile = join(f.home, ".fx", "model-catalogs", "test-provider.json");
+      const hourAgo = new Date(Date.now() - 61 * 60 * 1000);
+      utimesSync(cacheFile, hourAgo, hourAgo);
+      catalogDown = true;
+      const stale = await runFx(["models", "--json"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (stale.code !== 0) throw new Error(`fx models failed: ${stale.stdout} ${stale.stderr}`);
+      expect(JSON.parse(stale.stdout).ids).toEqual(["catalog-model", "local-model", "messages-model", "own-model"]);
+      expect(catalogRequests).toBe(2);
+      const again = await runFx(["models", "--json"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      expect(again.code).toBe(0);
+      expect(catalogRequests).toBe(2);
     } finally {
       catalogServer.stop(true);
       f.close();
