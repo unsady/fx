@@ -6,10 +6,12 @@
 //!
 //! The provider's part of the catalog is cached under
 //! `~/.fx/model-catalogs/<id>.json` for an hour, so a model models.dev adds
-//! shows up within the hour. A long-running fx refreshes its model list behind
-//! the one it shows, so only a one-shot command such as `fx models` waits for
-//! the download. A failed refresh keeps using the older copy for another hour,
-//! and with none the provider lists only its declared models.
+//! shows up within the hour. A long-running fx reloads its model list hourly
+//! behind the one it shows; a one-shot command such as `fx models` or `fx ask`
+//! waits for the download when the cache is older. A refresh that fails keeps
+//! using the older copy for another hour, so an unreachable models.dev does not
+//! hold up every call until its timeout; with no copy the provider lists only
+//! its declared models.
 
 const std = @import("std");
 const http_tls = @import("../core/shared/http_tls.zig");
@@ -40,6 +42,7 @@ const max_cache_bytes = 4 * 1024 * 1024;
 pub fn provider(definition: *const definitions.Definition) catalog.Provider {
     var listed = chat_completions.model_catalog_provider(definition);
     listed.fetch_fn = fetch;
+    listed.refresh_interval_ms = refresh_interval_ms;
     return listed;
 }
 
@@ -107,8 +110,8 @@ pub fn cliCatalog(definition: *const definitions.Definition, alloc: Allocator, i
 }
 
 /// The provider's models from a fresh cache, else from models.dev, else from
-/// an older cache, which then counts as fresh so that an unreachable models.dev
-/// does not hold up every call until its timeout. Caller owns the result.
+/// an older cache, which then counts as fresh unless the caller cancelled the
+/// refresh. Caller owns the result.
 fn load(alloc: Allocator, id: []const u8, cancel_flag: ?*std.atomic.Value(bool)) ![]const models_dev.Model {
     if (comptime host_target.is_wasm) return error.ModelsDevUnavailable;
 
@@ -128,7 +131,8 @@ fn load(alloc: Allocator, id: []const u8, cancel_flag: ?*std.atomic.Value(bool))
         if (err == error.OutOfMemory) return error.OutOfMemory;
         const entry = cached orelse return err;
         debug_trace.logf("gateway", "models_dev refresh failed provider={s} error={s}; using cached copy", .{ id, @errorName(err) });
-        writeCache(alloc, id, entry.models_json) catch |write_err| {
+        const cancelled = if (cancel_flag) |flag| flag.load(.seq_cst) else false;
+        if (!cancelled) writeCache(alloc, id, entry.models_json) catch |write_err| {
             if (write_err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("gateway", "models_dev cache not saved provider={s} error={s}", .{ id, @errorName(write_err) });
         };
