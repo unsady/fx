@@ -842,6 +842,12 @@ pub const Reducer = struct {
             .output_tokens = try token_count(fields, "completion_tokens"),
         };
         const incoming_total = try token_count(fields, "total_tokens");
+        // Some servers, such as OpenCode's, put a usage of zeros on every
+        // chunk, the finishing one too, and the real counts on a chunk after
+        // it. A reply never costs no tokens, so zeros before any count report
+        // nothing; zeros after one still contradict it below.
+        const none_yet = self.usage.input_tokens == null and self.usage.output_tokens == null and self.usage_total == null;
+        if (none_yet and (incoming.input_tokens orelse 0) == 0 and (incoming.output_tokens orelse 0) == 0 and (incoming_total orelse 0) == 0) return;
         var usage = types.Usage{
             .input_tokens = incoming.input_tokens orelse self.usage.input_tokens,
             .output_tokens = incoming.output_tokens orelse self.usage.output_tokens,
@@ -1705,6 +1711,21 @@ test "chat completions progress totals constrain current assertions rather than 
     try std.testing.expectEqual(@as(?u64, 2), result.completed.completion.usage.output_tokens);
 }
 
+test "chat completions takes a usage of zeros as none, even on the finishing chunk" {
+    const alloc = std.testing.allocator;
+    const zeros = "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}";
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"}}]," ++ zeros ++ "}");
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]," ++ zeros ++ "}");
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":202,\"completion_tokens\":9,\"total_tokens\":211}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 202), result.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 9), result.completed.completion.usage.output_tokens);
+}
+
 test "chat completions partial usage rejects conflicts against merged observations" {
     const alloc = std.testing.allocator;
     for ([_]struct { first: []const u8, next: []const u8, final: bool = false, failure: Error }{
@@ -1722,6 +1743,7 @@ test "chat completions partial usage rejects conflicts against merged observatio
         .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":11}", .final = true, .failure = error.ConflictingIdentity },
         .{ .first = "{\"completion_tokens\":3}", .next = "{\"completion_tokens\":4}", .final = true, .failure = error.ConflictingIdentity },
         .{ .first = "{\"total_tokens\":13}", .next = "{\"total_tokens\":14}", .final = true, .failure = error.ConflictingIdentity },
+        .{ .first = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}", .next = "{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}", .failure = error.ConflictingIdentity },
         .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":-1}", .failure = error.InvalidChunk },
         .{ .first = "{\"prompt_tokens\":10}", .next = "{\"total_tokens\":-1}", .final = true, .failure = error.InvalidChunk },
         .{ .first = "{\"prompt_tokens\":10}", .next = "{\"completion_tokens\":1.5}", .final = true, .failure = error.InvalidChunk },
