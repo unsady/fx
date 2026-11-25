@@ -817,9 +817,10 @@ pub const Reducer = struct {
             }
             while (self.tools.items.len <= index) try self.tools.append(self.alloc, .{});
             const tool = &self.tools.items[index];
-            if (non_null(delta, "type")) |kind| if (!std.mem.eql(u8, try string(kind), "function")) return error.InvalidChunk;
-            // Qwen on OpenCode Go repeats `"id":""` in every chunk after a
-            // call's first, so an empty id names no call rather than a bad one.
+            // Models on OpenCode Go, such as Qwen and HungerG, repeat `"id":""`
+            // and `"type":""` in every chunk after a call's first, so an empty
+            // value names nothing rather than a bad one.
+            if (named(non_null(delta, "type"))) |kind| if (!std.mem.eql(u8, try string(kind), "function")) return error.InvalidChunk;
             try self.accept_identity(&tool.id, named(non_null(delta, "id")), self.limits.identity_bytes);
             if (tool.id) |id| for (self.tools.items, 0..) |other, other_index| {
                 if (other_index != index and other.id != null and std.mem.eql(u8, id, other.id.?)) return error.ConflictingIdentity;
@@ -2226,14 +2227,14 @@ test "chat completions owns fragmented interleaved tools and results independent
     try std.testing.expectEqual(types.ToolExecutionProvenance.fx_local, completion.tool_calls[1].provenance);
 }
 
-test "chat completions takes an empty tool call id after the first chunk as none" {
+test "chat completions takes an empty tool call id and type after the first chunk as none" {
     const alloc = std.testing.allocator;
     var reducer = try Reducer.init(alloc, test_tool_request(), .{});
     var result: stream_provider.Result = undefined;
     {
         defer reducer.deinit();
         try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}");
-        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"function\",\"function\":{\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}]}");
+        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"\",\"function\":{\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}]}");
         result = try test_finish(&reducer, test_tools_finish);
     }
     defer result.deinit(alloc);
