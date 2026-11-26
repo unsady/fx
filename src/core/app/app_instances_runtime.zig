@@ -44,6 +44,8 @@ pub const Seed = struct {
     provider_order: [][]u8 = &.{},
     provider_strict: bool = false,
     agent_effort: types.ReasoningEffort = .auto,
+    /// `experimental.workspace_capture`, read once at startup (D98).
+    workspace_capture: bool = false,
     profile_name: ?[]u8 = null,
 
     pub fn deinit(self: *Seed, alloc: Allocator) void {
@@ -112,6 +114,7 @@ pub const Seed = struct {
         self.turn_settings = agent.worker.agent_turn_settings;
         self.turn_settings.provider_order = &.{};
         self.agent_effort = agent.effort;
+        self.workspace_capture = agent.session_persistence.workspace_capture;
         self.permission_mode = mode;
         self.captured = true;
     }
@@ -256,8 +259,12 @@ pub fn Runtime(comptime App: type) type {
             return launchWith(app, profile_name, session_id);
         }
 
-        fn resumeInContext(session_id: []const u8, app: *App, agent: *agents.Agent) anyerror!void {
-            try SessionRuntime.resumeSessionById(app, agent, session_id);
+        /// The saved session a resumed instance loads, and the instance it loads into.
+        const ResumeInContext = struct { session_id: []const u8, child: *ChildAgent };
+
+        fn resumeInContext(resumed: ResumeInContext, app: *App, agent: *agents.Agent) anyerror!void {
+            try SessionRuntime.resumeSessionById(app, agent, resumed.session_id);
+            AgentsRuntime.releaseHiddenResumeFlow(app, resumed.child, "hidden_resumed_instance");
         }
 
         fn launchWith(app: *App, profile_name: ?[]const u8, resume_id: ?[]const u8) !*ChildAgent {
@@ -267,6 +274,7 @@ pub fn Runtime(comptime App: type) type {
             errdefer AgentsRuntime.dropHosted(app, child);
             const agent = &child.agent;
             app_session_runtime.Persistence.initInto(&agent.session_persistence);
+            agent.session_persistence.workspace_capture = seed.workspace_capture;
             const name = profile_name orelse seed.profile_name;
             if (name) |value| try app.applyInstanceProfile(agent, value);
             try SessionRuntime.configureStartupPreferences(
@@ -302,7 +310,7 @@ pub fn Runtime(comptime App: type) type {
             agent.permission_mode = app.instanceProfileMode(agent, seed.permission_mode);
             try SessionRuntime.initializePersistence(app, agent, resume_id != null);
             if (resume_id) |id| {
-                try AgentsRuntime.visit(app, child, id, resumeInContext);
+                try AgentsRuntime.visit(app, child, ResumeInContext{ .session_id = id, .child = child }, resumeInContext);
                 child.view_built = true;
             } else {
                 try SessionRuntime.beginInstanceSession(app, agent);

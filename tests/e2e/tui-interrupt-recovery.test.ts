@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { processAlive as processExists } from "./process-alive";
 import {
   chmodSync,
   existsSync,
@@ -23,6 +24,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable();
@@ -200,7 +202,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(session.isPaneAlive()).toBe(true);
 
       await session.sendText("Continue after cancellation.");
-      await session.waitForText("COMPOSER_INTERRUPT_RECOVERED", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("COMPOSER_INTERRUPT_RECOVERED") && turnSettled(pane), TIMEOUT);
       const scrollback = await session.captureFullScrollback();
       expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
       expect(scrollback).not.toContain("DISCARD_THIS_DRAFT");
@@ -768,10 +770,9 @@ while :; do sleep 1; done
       ]);
 
       await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
-      await session.waitForText(
-        "Cancelled ./hold-workspace-cancel.sh · What can fx do differently?",
-        TIMEOUT,
-      );
+      // The command's row names it once its cancellation lands; the notice
+      // under the row names no command.
+      await session.waitForText("● Cancelled ./hold-workspace-cancel.sh", TIMEOUT);
       await session.sendText("/workspace list");
       await session.waitForText("available=false active=false", TIMEOUT);
       expect(countOccurrences(readTrace(tracePath), "file index generation started")).toBe(
@@ -1007,7 +1008,7 @@ while :; do sleep 1; done
       // Race the finalization window on purpose: the follow-up must be
       // accepted even if the interrupted turn has not finished closing.
       await session.sendText("Send this right after the cancel.");
-      await session.waitForText("SEND_AFTER_CANCEL_ACCEPTED", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("SEND_AFTER_CANCEL_ACCEPTED") && turnSettled(pane), TIMEOUT);
 
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).not.toContain("InvalidRecoveryCheckpoint");
@@ -1129,13 +1130,4 @@ async function waitForCondition(
 
 function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }

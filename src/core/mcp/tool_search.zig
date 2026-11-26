@@ -601,6 +601,12 @@ pub fn writeAuthenticationRequired(alloc: Allocator, server_name: []const u8, re
     return try out.toOwnedSlice();
 }
 
+/// What a server held back for an unset variable says, in the words `toolbox open` and a command's
+/// `list` and `search` share. The server needs no login, so none is mentioned.
+pub fn missingEnvironmentText(alloc: Allocator, server_name: []const u8, variable: []const u8) Allocator.Error![]u8 {
+    return alloc.print("MCP server '{s}' needs {s} set before fx starts.", .{ server_name, variable });
+}
+
 /// The page a search returns when the server it names is down.
 pub fn writeServerFailure(alloc: Allocator, server_name: []const u8, failure: []const u8) ![]u8 {
     const message = try alloc.print("MCP server '{s}' is unavailable: {s}", .{ server_name, failure });
@@ -613,6 +619,33 @@ pub fn writeServerFailure(alloc: Allocator, server_name: []const u8, failure: []
     try writeEncodedJsonScalar(alloc, &out.writer, message);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
+}
+
+/// A search by a subagent whose view of the session's servers has changed
+/// under it: nothing, and why. Its `state` and `error` go to the model as the
+/// search of a server that is down gives them.
+pub fn writeServersChanged(alloc: Allocator, reason: []const u8) ![]u8 {
+    const message = try alloc.print("MCP search is not available to this work: {s}", .{reason});
+    defer alloc.free(message);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll(
+        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"servers_changed\",\"error\":",
+    );
+    try writeEncodedJsonScalar(alloc, &out.writer, message);
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+test "MCP search of a changed view says the servers changed" {
+    const alloc = std.testing.allocator;
+    const output = try writeServersChanged(alloc, "the servers changed.");
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"servers_changed\"," ++
+            "\"error\":\"MCP search is not available to this work: the servers changed.\"}",
+        output,
+    );
 }
 
 test "MCP search names why the server it names is down" {

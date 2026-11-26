@@ -11,7 +11,7 @@ const libfx_hooks = @import("libfx_hooks.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const client_instructions = @import("client_instructions.zig");
-const tool_call_identities = @import("tool_call_identities.zig");
+const tool_call_identities = @import("../core/mcp/tool_call_identities.zig");
 const workspace_binding = @import("workspace_binding.zig");
 const server = @import("server.zig");
 const session_codec = @import("../core/session/session_codec.zig");
@@ -136,6 +136,7 @@ pub fn handleNewLibfxSession(
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
     };
+    server.stopSubagentsForSwitch(state);
     try server.releaseActiveSession(state);
     requested_owned = false;
     const session_id = requested orelse try session_store.generateSessionId(alloc);
@@ -435,8 +436,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         });
     }
     if (state.cfg.allow_acp_mcp) {
-        try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
-        try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
+        try appendMcpConfigs(state, alloc, msg.params_raw, workspace_root, &mcp_configs);
     }
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
@@ -586,7 +586,7 @@ fn writeNewSessionResponse(
     session_id: []const u8,
     observer_hooks: ?libfx_hooks.Config,
 ) !void {
-    state.active_session.?.observer_hooks = observer_hooks;
+    setObserverHooks(state, observer_hooks);
     try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -660,6 +660,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
             defer sources.deinit(alloc);
             for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
             try sendActiveSessionInfoUpdate(state, alloc);
+            setObserverHooks(state, observer_hooks);
             return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks);
         }
     }
@@ -725,6 +726,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     defer sources.deinit(alloc);
     for (state.active_session.?.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
     try sendActiveSessionInfoUpdate(state, alloc);
+    setObserverHooks(state, observer_hooks);
     try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model, observer_hooks);
 }
 
@@ -846,8 +848,7 @@ fn handleRestoreSession(
             });
         }
     } else {
-        try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
-        try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
+        try appendMcpConfigs(state, alloc, msg.params_raw, workspace_root, &mcp_configs);
     }
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
@@ -873,37 +874,13 @@ fn handleRestoreSession(
         // reopens it through the ordinary rebinding path below.
         if (sameSessionId(active.session_id, session_id) and workspace != null) {
             server.cancelAndReapActivePrompt(state);
+            server.stopSubagentsForReopen(state);
             try server.releaseActiveSession(state);
         }
     }
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
-            server.cancelAndReapActivePrompt(state);
-            server.disableSubagentHost(state);
-            state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-            const previous_host = active.mcp_host;
-            active.mcp_host = session_host;
-            session_host_owned = false;
-            const start = server.loadStartingMode(state, alloc);
-            active.mode = start.id;
-            active.permission_mode = start.permission_mode;
-            state.subagent_authority_mutex.unlock(io_mod.getIo());
-            if (previous_host) |h| h.stop();
-            server.enableSubagentHost(state);
-            // One map, so a recovered read can name a call from an earlier turn.
-            var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
-            defer sources.deinit(alloc);
-            if (kind.replaysHistory()) {
-                try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
-            }
-            try sendActiveSessionInfoUpdate(state, alloc);
-            return writeLoadSessionResponse(
-                state,
-                alloc,
-                msg,
-                active.model,
-                observer_hooks,
-            );
+            return reloadActiveSession(state, alloc, msg, kind, &mcp_configs, session_host, &session_host_owned, observer_hooks);
         }
     }
 
@@ -1013,6 +990,7 @@ fn handleRestoreSession(
     }
     try sendActiveSessionInfoUpdate(state, alloc);
 
+    setObserverHooks(state, observer_hooks);
     try writeLoadSessionResponse(
         state,
         alloc,
@@ -1022,34 +1000,53 @@ fn handleRestoreSession(
     );
 }
 
-/// Adds the user's profile MCP servers after the request's own servers when
-/// the client sets `_meta.fx.profileMcpServers`. ACP sessions otherwise use
-/// only client-supplied and approved project servers. Request entries win
-/// name collisions, and profile entries win over project entries.
-fn appendProfileMcpConfigsIfRequested(
+/// Adds the project's MCP servers after the request's own, and the user's profile servers too when the client sets
+/// `_meta.fx.profileMcpServers`. ACP sessions otherwise use only client-supplied and approved project servers. With the
+/// profile, the servers are the ones the terminal app runs: an entry fx can't read is skipped, `${VAR}` is expanded, a
+/// name a terminal can't print is skipped, and the host keeps a note for each skip (`builtin_mcp.composeHostConfigs`).
+/// Request entries win name collisions, and profile entries win over project entries.
+fn appendMcpConfigs(
     state: *server.ServerState,
     alloc: Allocator,
     params_raw: ?[]const u8,
+    workspace_root: []const u8,
     configs: *mcp_servers.OwnedServerConfigs,
 ) !void {
-    if (!profileMcpRequested(alloc, params_raw)) return;
+    var project = try loadProjectMcpConfigs(state, alloc, workspace_root);
+    defer project.deinit(alloc);
+    if (!profileMcpRequested(alloc, params_raw)) {
+        try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &project.configs);
+        return;
+    }
     const home = state.cfg.home_override orelse io_mod.homeDir() orelse {
         debug_trace.logf("mcp", "ACP profile MCP servers skipped reason=no_home", .{});
+        try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &project.configs);
         return;
     };
     const config_path = try builtin_mcp.configPathFromHome(alloc, home);
     defer alloc.free(config_path);
-    var profile = builtin_mcp.loadConfigFromPath(alloc, config_path) catch |err| {
+    var loaded: builtin_mcp.NativeConfigs = .{};
+    defer loaded.deinit(alloc);
+    var profile = builtin_mcp.readProfile(alloc, config_path, &loaded.diagnostics) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "ACP profile MCP servers unavailable err={s}", .{@errorName(err)});
+        try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &project.configs);
         return;
     };
     defer {
         for (profile.items) |*config| config.deinit(alloc);
         profile.deinit(alloc);
     }
-    debug_trace.logf("mcp", "ACP profile MCP servers requested count={d}", .{profile.items.len});
-    try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &profile);
+    try builtin_mcp.mergeNativeConfigs(alloc, &loaded, &profile, &project);
+    // Read only while the servers are composed.
+    var inherited = try io_mod.cloneEnvironMap(alloc);
+    defer inherited.deinit();
+    try builtin_mcp.composeHostConfigs(alloc, &loaded, configs.items.items, &inherited);
+    debug_trace.logf("mcp", "ACP profile MCP servers requested count={d} notes={d}", .{ loaded.configs.items.len, loaded.diagnostics.items.len });
+    const notes = try builtin_mcp.renderNotes(alloc, loaded.diagnostics.items);
+    configs.setNotes(alloc, notes);
+    try configs.items.appendSlice(alloc, loaded.configs.items);
+    loaded.configs.clearRetainingCapacity();
 }
 
 fn profileMcpRequested(alloc: Allocator, params_raw: ?[]const u8) bool {
@@ -1060,23 +1057,24 @@ fn profileMcpRequested(alloc: Allocator, params_raw: ?[]const u8) bool {
     return acp_types.fxMetaBool(parsed.value.object, "profileMcpServers") orelse false;
 }
 
-fn appendProjectMcpConfigs(
+/// The session's project servers, which run in its workspace, and the notes for the entries fx skipped. Empty when the
+/// project's choices can't be read.
+fn loadProjectMcpConfigs(
     state: *server.ServerState,
     alloc: Allocator,
     workspace_root: []const u8,
-    configs: *mcp_servers.OwnedServerConfigs,
-) !void {
+) !project_config.WorkspaceParseResult {
     var choices = if (state.cfg.home_override) |home|
         config_runtime.loadProjectMcpChoicesFromHome(alloc, home, workspace_root) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            return;
+            return .{};
         }
     else
         config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            return;
+            return .{};
         };
     defer choices.deinit(alloc);
 
@@ -1086,7 +1084,7 @@ fn appendProjectMcpConfigs(
         .workspace,
         choices.choices,
     );
-    defer workspace.deinit(alloc);
+    errdefer workspace.deinit(alloc);
     for (workspace.diagnostics.items) |diagnostic| {
         var name_buf: [256]u8 = undefined;
         var variable_buf: [160]u8 = undefined;
@@ -1113,15 +1111,109 @@ fn appendProjectMcpConfigs(
         if (config.transport != .stdio or config.cwd != null) continue;
         config.cwd = try alloc.dupe(u8, workspace_root);
     }
-    try project_config.appendWorkspaceAfterAcpPrimary(
-        alloc,
-        &configs.items,
-        &workspace.configs,
-    );
+    return workspace;
 }
 
 fn sameSessionId(active_session_id: []const u8, requested_session_id: []const u8) bool {
     return std.mem.eql(u8, active_session_id, requested_session_id);
+}
+
+/// A load or resume of the session that is already active, under its own
+/// `cwd`. The session stays open, so its subagent host and the children it
+/// runs stay too: a child that works goes on, and its report reaches the
+/// session as the next turn, as after `session/cancel`
+/// (`tests/tla/session_manager/Wiring.tla` ParentOutlivesChildren only needs
+/// the parent open while a child runs). The prompt that runs is cancelled and
+/// joined first.
+///
+/// A kept child runs beside this thread, so what the reload sets and a child
+/// reads is set under `subagent_authority_mutex`, which `runSubagentChild`
+/// reads it under: the mode, the permission mode, the hook config and the MCP
+/// host. A child reads its model route, credential and model catalog from its
+/// own copy (`ModelRoute` in prompt.zig), so a catalog refresh, which the
+/// reload skips while a subagent works, and the switches of
+/// `session/set_config_option`, which replace the catalog, free nothing a
+/// child reads. The rest the reload writes is atomic or under its own lock:
+/// the cancel flag, and the pending outbound requests of a kept child, such as
+/// an MCP elicitation, which end cancelled as they do after `session/cancel`.
+///
+/// A child that waits on an approval is stopped, as the reload always did,
+/// since in ACP an approval reaches no client and the wait would last until
+/// the child's turn ends (#1722 changes that). Its work ends interrupted and
+/// owes its report. The other children go on.
+///
+/// What the reload may not do to a working child is destroy the MCP host its
+/// tool context holds. So a session with no working subagent swaps its host
+/// for the new one, as it always has, and a session with one keeps its host
+/// and takes the new servers in place (`Host.reload`): a server whose config
+/// is the same keeps running with its calls, and a removed or changed one
+/// stops and ends its calls cancelled.
+fn reloadActiveSession(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    kind: RestoreKind,
+    mcp_configs: *const mcp_servers.OwnedServerConfigs,
+    session_host: ?*mcp_host.Host,
+    session_host_owned: *bool,
+    observer_hooks: ?libfx_hooks.Config,
+) !void {
+    const active = &state.active_session.?;
+    const session_id = active.session_id;
+    server.cancelAndReapActivePrompt(state);
+    if (state.subagent_host) |subagents| {
+        const interrupted = subagents.interruptApprovalWaits();
+        if (interrupted > 0) {
+            debug_trace.logf("acp", "event=reload_interrupted_approval_waits session={s} count={d} reason=approval_reaches_no_client", .{ session_id, interrupted });
+        }
+    }
+    const previous_host = active.mcp_host;
+    const subagents_working = if (state.subagent_host) |subagents| !subagents.quiet() else false;
+    const in_place = subagents_working and previous_host != null;
+    if (in_place) {
+        debug_trace.logf("acp", "event=reload_mcp_in_place session={s} reason=subagents_working", .{session_id});
+        mcp_servers.reloadHost(alloc, previous_host.?, mcp_configs) catch |err| {
+            debug_trace.logf("acp", "event=reload_mcp_in_place_failed session={s} err={s}", .{ session_id, @errorName(err) });
+            const message = try alloc.print("MCP servers could not be reloaded: {s}", .{@errorName(err)});
+            defer alloc.free(message);
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = message,
+            });
+        };
+    }
+    {
+        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        if (!in_place) {
+            active.mcp_host = session_host;
+            session_host_owned.* = false;
+        }
+        const start = server.loadStartingMode(state, alloc);
+        active.mode = start.id;
+        active.permission_mode = start.permission_mode;
+        active.observer_hooks = observer_hooks;
+    }
+    if (!in_place) if (previous_host) |h| h.stop();
+    // A session whose host did not build when it opened gets one now, as
+    // every reload gave it before.
+    if (state.subagent_host == null) server.enableSubagentHost(state);
+    // One map, so a recovered read can name a call from an earlier turn.
+    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+    defer sources.deinit(alloc);
+    if (kind.replaysHistory()) {
+        try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
+    }
+    try sendActiveSessionInfoUpdate(state, alloc);
+    return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks);
+}
+
+/// Sets the hook config of the active session under the lock its subagents
+/// read it with.
+fn setObserverHooks(state: *server.ServerState, observer_hooks: ?libfx_hooks.Config) void {
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    state.active_session.?.observer_hooks = observer_hooks;
 }
 
 fn writeLoadSessionResponse(
@@ -1131,7 +1223,6 @@ fn writeLoadSessionResponse(
     model: []const u8,
     observer_hooks: ?libfx_hooks.Config,
 ) !void {
-    state.active_session.?.observer_hooks = observer_hooks;
     try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -1255,32 +1346,17 @@ fn restoredClientSystemPrompt(
     return text orelse &.{};
 }
 
-/// Returns the tool identity record of a restored session. A record that
-/// cannot be read is reported in the trace and replaced by an empty one.
+/// Returns the tool identity record of a restored session
+/// (`tool_call_identities.restore`).
 fn restoredToolIdentities(
     alloc: Allocator,
     session: *session_adapter.Session,
 ) Allocator.Error!tool_call_identities.Record {
-    const record = blk: {
-        const stored = session.toolIdentities(alloc) catch |err| break :blk err;
-        const bytes = stored orelse return .{};
-        defer alloc.free(bytes);
-        break :blk tool_call_identities.parse(alloc, bytes);
-    };
-    return record catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            debug_trace.logf(
-                "acp",
-                "dropped unreadable tool identity record session={s} err={s}",
-                .{ session.id(), @errorName(err) },
-            );
-            return .{};
-        },
-    };
+    return tool_call_identities.restore(alloc, session);
 }
 
 fn activateSession(state: *server.ServerState, activation: SessionActivation) !void {
+    server.stopSubagentsForSwitch(state);
     try server.releaseActiveSession(state);
     const client_system_prompt: []u8 = activation.client_system_prompt orelse &.{};
     if (activation.workspace) |binding| try workspace_binding.commit(state, binding);
@@ -2420,6 +2496,91 @@ test "ACP load recognizes the retained active session exactly" {
     ));
 }
 
+test "ACP load of the active session keeps its subagent host and the session it appends to" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const active = &state.active_session.?;
+    _ = server.applySessionMode(state.cfg.mode_registry, active, "review");
+    const subagents = state.subagent_host.?;
+    const children = state.subagent_v2_children.?;
+    const parent = active.v2.?;
+
+    for ([_]struct { method: []const u8, handler: *const fn (*server.ServerState, Allocator, *jsonrpc.Message) anyerror!void }{
+        .{ .method = "session/load", .handler = handleLoadSession },
+        .{ .method = "session/resume", .handler = handleResumeSession },
+    }, 0..) |request, index| {
+        var params: std.Io.Writer.Allocating = .init(arena);
+        defer params.deinit();
+        try params.writer.writeAll("{\"sessionId\":");
+        try writeJsonStr(active.session_id, &params.writer);
+        try params.writer.writeAll(",\"mcpServers\":[]}");
+        var msg = jsonrpc.Message{
+            .id = .{ .integer = @intCast(index + 2) },
+            .method = request.method,
+            .params_raw = params.writer.buffered(),
+        };
+        try request.handler(&state, arena, &msg);
+
+        // The host, its children, and the session they append to are the ones that were there.
+        try std.testing.expect(state.subagent_host.? == subagents);
+        try std.testing.expect(state.subagent_v2_children.? == children);
+        try std.testing.expect(state.active_session.?.v2.? == parent);
+        // What a reload always did still happens: the mode starts over.
+        try std.testing.expectEqualStrings(
+            test_session_mode_registry.default_mode_id,
+            state.active_session.?.mode,
+        );
+        _ = server.applySessionMode(state.cfg.mode_registry, &state.active_session.?, "review");
+    }
+
+    // A session whose host did not build when it opened gets one on a reload, as it always did.
+    server.disableSubagentHost(&state);
+    try std.testing.expect(state.subagent_host == null);
+    try std.testing.expect(state.subagent_v2_children == null);
+    var params: std.Io.Writer.Allocating = .init(arena);
+    defer params.deinit();
+    try params.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(state.active_session.?.session_id, &params.writer);
+    try params.writer.writeAll(",\"mcpServers\":[]}");
+    var again = jsonrpc.Message{
+        .id = .{ .integer = 4 },
+        .method = "session/load",
+        .params_raw = params.writer.buffered(),
+    };
+    try handleLoadSession(&state, arena, &again);
+    const rebuilt = state.subagent_host orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.subagent_v2_children != null);
+    try std.testing.expect(state.active_session.?.v2.? == parent);
+    // It is wired to the live server: a report a child posts reaches this session's queue.
+    try std.testing.expect(rebuilt.report_sink.?.context == @as(?*anyopaque, @ptrCast(&state)));
+}
+
 test "ACP history excludes typed summaries without filtering original user text" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3316,6 +3477,119 @@ test "ACP new and loaded sessions provide a writable subagent host" {
     defer alloc.free(captured);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":1") != null);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":2") != null);
+}
+
+test "a switch away from a session drops the reports its host queued and closes its host" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const subagents = state.subagent_host.?;
+    // A report and a message the host posted that no prompt took.
+    try subagents.report_sink.?.post(subagents, .{ .report = .{ .agent = "reviewer", .child_id = "child-1", .work_id = "work-1", .call_id = "call-1", .outcome = .completed, .output = "done" } });
+    try subagents.report_sink.?.post(subagents, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "child-1", .text = "found it" } });
+    try std.testing.expectEqual(@as(usize, 2), state.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 2), state.report_calls.items.len);
+
+    server.stopSubagentsForSwitch(&state);
+    try std.testing.expect(state.subagent_host == null);
+    try std.testing.expectEqual(@as(usize, 0), state.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 0), state.report_calls.items.len);
+    // The session stays until the switch releases it.
+    try std.testing.expect(state.active_session != null);
+    // With no session to leave, a second call has nothing to do.
+    try server.releaseActiveSession(&state);
+    server.stopSubagentsForSwitch(&state);
+    try std.testing.expect(state.active_session == null);
+}
+
+test "a reload under another cwd and a libfx/new drop what the host they replace queued" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const subagents = state.subagent_host.?;
+    try subagents.report_sink.?.post(subagents, .{ .report = .{ .agent = "reviewer", .child_id = "child-1", .work_id = "work-1", .call_id = "call-1", .outcome = .completed, .output = "done" } });
+    // A child's message sits between two reports, and no log of the parent holds it.
+    try subagents.report_sink.?.post(subagents, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "child-1", .text = "a note for you" } });
+    try subagents.report_sink.?.post(subagents, .{ .report = .{ .agent = "reviewer", .child_id = "child-3", .work_id = "work-3", .call_id = "call-3", .outcome = .completed, .output = "done" } });
+    try std.testing.expectEqual(@as(usize, 3), state.worker.queuedPromptCount());
+
+    // A reload under another cwd: the host is joined and the reports the log owes are dropped, which it posts again.
+    // The message stays queued for the reopened session, with its call, and the session stays until it is released.
+    server.stopSubagentsForReopen(&state);
+    try std.testing.expect(state.subagent_host == null);
+    try std.testing.expectEqual(@as(usize, 1), state.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 1), state.report_calls.items.len);
+    try std.testing.expect(state.report_calls.items[0].outcome == null);
+    try std.testing.expectEqualStrings("child-1", state.report_calls.items[0].child_id);
+    try std.testing.expect(state.active_session != null);
+    // With no session to reload, a second call has nothing to do.
+    try server.releaseActiveSession(&state);
+    server.stopSubagentsForReopen(&state);
+
+    // A libfx/new session replaces a session whose host queued a report, and drops all the mail, a message too.
+    try handleNewSession(&state, arena, &new_msg);
+    const next = state.subagent_host.?;
+    try next.report_sink.?.post(next, .{ .report = .{ .agent = "reviewer", .child_id = "child-2", .work_id = "work-2", .call_id = "call-2", .outcome = .completed, .output = "done" } });
+    try std.testing.expectEqual(@as(usize, 2), state.worker.queuedPromptCount());
+    var libfx_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "libfx/new",
+        .params_raw = "{}",
+    };
+    try handleNewLibfxSession(&state, arena, &libfx_msg);
+    try std.testing.expectEqual(@as(usize, 0), state.worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 0), state.report_calls.items.len);
+    try std.testing.expect(state.subagent_host == null);
 }
 
 test "libfx/new uses a valid host session id and generates one when none is named" {

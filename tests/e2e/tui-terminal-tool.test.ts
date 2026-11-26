@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { processAlive } from "./process-alive";
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
@@ -21,6 +22,7 @@ import {
   terminalFixtureShell,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -182,18 +184,6 @@ function askEnv(
   };
 }
 
-function processAlive(pid: number): boolean {
-  // Signal 0 to pid 0 or below reaches a whole process group, which is
-  // always alive, so only a real pid can be checked.
-  if (!(pid > 0)) throw new Error(`not a process id: ${pid}`);
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /** Pids of processes whose command line contains `fragment`. */
 function processesMatching(fragment: string, options: { exact?: boolean } = {}): number[] {
   const listing = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
@@ -319,17 +309,192 @@ test.skipIf(!tmuxAvailable())(
     expect(interactResult).toContain('\\"state\\":\\"completed\\"');
     expect(interactResult).toContain("CAPTURED_DONE");
     const scrollback = await active.captureFullScrollback();
-    // The run returned before the command ended, so its row has no exit
-    // status, and the session's rows show its launch command's steps in short
-    // form.
-    expect(scrollback).toContain("Still running sleep, printf");
-    expect(scrollback).toContain("Observed sleep, printf");
+    // The run returned before the command ended, and its session's input
+    // joins its row, which shows the launch command's steps in short form
+    // with the session's latest state.
+    // The check found the command ended, so the row says it ran.
+    expect(scrollback).toContain("● Ran sleep, printf · 2 calls");
+    expect(scrollback).not.toContain("Observed sleep, printf");
+    expect(scrollback).not.toContain("Still running sleep, printf");
     expect(scrollback).not.toContain(`Observed session ${sessionId}`);
+    expect(scrollback).not.toContain(`Ran session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
     expect(scrollback).not.toContain("Used terminal");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a command check row keeps one verb while its command runs and after a resume",
+  async () => {
+    const fixture = createFixture("fx-shell-check-verb-");
+    // A here-document whose body has an apostrophe: folded onto one line, as
+    // the check's display holds it, the body no longer lexes.
+    const command = [
+      "python3 - <<'EOF'",
+      "import time",
+      "note = '''it's still running'''",
+      "time.sleep(60)",
+      "EOF",
+    ].join("\n");
+    let sessionId = "";
+    let releaseFinal: () => void = () => {};
+    const finalHeld = new Promise<void>((resolve) => {
+      releaseFinal = resolve;
+    });
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_check_run", "shell", {
+        request: { action: "run", command, profile: "clean", yield_time_ms: 0 },
+      }),
+      (body) => {
+        sessionId = findSessionId(JSON.parse(body)) ?? "";
+        if (!sessionId) return new Response("missing session id", { status: 500 });
+        return fakeGatewayToolCall("shell_check_wait", "shell", {
+          request: { action: "interact", session_id: sessionId, yield_time_ms: 200 },
+        });
+      },
+      async () => {
+        await finalHeld;
+        return fakeGatewayFinalText("CHECK_VERB_DONE");
+      },
+    ]);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({
+      isolated: true,
+      cmd: "/bin/sh -i",
+      cwd: fixture.workspace,
+      env: {
+        HOME: fixture.home,
+        SHELL: terminalFixtureShell(),
+        AI_GATEWAY_API_KEY: "fake-shell-tool-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "yolo",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        PS1: "CHECK_SHELL> ",
+      },
+      width: 100,
+      height: 36,
+    });
+    sessions.push(session);
+    const row = async (prefix: string) =>
+      (await session.capturePaneGrid()).map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
+    await session.waitForText("CHECK_SHELL>", TIMEOUT);
+    await session.sendText(`${FX_BIN} 2>${fixture.stderrPath}`);
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText("Start the script and check on it.");
+
+    // The check came back while the command runs on, and the turn goes on:
+    // the row still waits, and names the command by its short form. The
+    // third model request starts only after the check came back.
+    const deadline = Date.now() + TIMEOUT;
+    while (gateway.requests.length < 3 && Date.now() < deadline) await Bun.sleep(25);
+    expect(gateway.requests).toHaveLength(3);
+    expect(toolResultEnvelope(gateway.requests[2]!.body, "shell_check_wait")).toContain('\\"state\\":\\"running\\"');
+    await session.waitForText("● Waiting for python3 · 2 calls", TIMEOUT);
+    expect(await row("● Waiting for ")).toBe("● Waiting for python3 · 2 calls");
+    const running = (await session.capturePaneGrid()).join("\n");
+    expect(running).not.toContain("Observed");
+    expect(running).not.toContain("<<'EOF'");
+
+    // The turn ends with the command still running.
+    releaseFinal();
+    await session.waitForPane((pane) => pane.includes("CHECK_VERB_DONE") && turnSettled(pane), TIMEOUT);
+    await session.waitForText("● Waited for python3 · 2 calls", TIMEOUT);
+    await session.sendText("/quit");
+    await session.waitForText("CHECK_SHELL>", TIMEOUT);
+
+    // The resumed row says the same.
+    const fxSessionIds = rootSessionIds(fixture.home);
+    expect(fxSessionIds).toHaveLength(1);
+    await session.sendText(`clear; ${FX_BIN} --resume ${fxSessionIds[0]} 2>>${fixture.stderrPath}`);
+    await session.waitForText("session resumed", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    expect(await row("● Waited for ")).toBe("● Waited for python3 · 2 calls");
+    expect((await session.capturePaneGrid()).join("\n")).not.toContain("Observed");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a command check row stays on Ran in every frame while the model checks the ended command again",
+  async () => {
+    const fixture = createFixture("fx-shell-recheck-");
+    const tapePath = join(fixture.root, "recheck.fxtape");
+    const rechecks = 200;
+    let sessionId = "";
+    const check = (id: string, wait: number) => (body: string) => {
+      sessionId = sessionId || (findSessionId(JSON.parse(body)) ?? "");
+      if (!sessionId) return new Response("missing session id", { status: 500 });
+      return fakeGatewayToolCall(id, "shell", {
+        request: { action: "interact", session_id: sessionId, yield_time_ms: wait },
+      });
+    };
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_recheck_run", "shell", {
+        request: { action: "run", command: "sleep 1; printf done", profile: "clean", yield_time_ms: 0 },
+      }),
+      // The first check waits until the command ends; each later check
+      // finds it ended at once.
+      check("shell_recheck_end", 10_000),
+      ...Array.from({ length: rechecks }, (_, index) => check(`shell_recheck_${index}`, 1_000)),
+      fakeGatewayFinalText("RECHECK_DONE"),
+    ]);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({
+      isolated: true,
+      cwd: fixture.workspace,
+      env: {
+        HOME: fixture.home,
+        SHELL: terminalFixtureShell(),
+        AI_GATEWAY_API_KEY: "fake-shell-tool-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "yolo",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_RECORD: tapePath,
+      },
+      width: 100,
+      height: 36,
+      stderrPath: fixture.stderrPath,
+    });
+    sessions.push(session);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Run the command and keep checking it.");
+    await session.waitForText("RECHECK_DONE", TIMEOUT);
+    expect(gateway.requests).toHaveLength(rechecks + 3);
+    expect(toolResultEnvelope(gateway.requests[2]!.body, "shell_recheck_end")).toContain('\\"state\\":\\"completed\\"');
+    await session.waitForText(`● Ran sleep, printf · ${rechecks + 2} calls ✓`, TIMEOUT);
+
+    // Every frame the terminal drew: once the row says the command ran, it
+    // never says it waits for it again while a later check runs.
+    const replay = execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    const sessionRows = replay
+      .split(/^--- frame \d+ .*---$/m)
+      .slice(1)
+      .map((frame) =>
+        frame
+          .split("\n")
+          .filter((line) => line.startsWith("|"))
+          .map((line) => line.slice(1).replace(/\|$/, "").trimEnd())
+          .find((line) => line.includes("sleep, printf"))
+      )
+      .filter((line): line is string => line !== undefined);
+    const firstRan = sessionRows.findIndex((line) => line.startsWith("● Ran sleep, printf"));
+    expect(firstRan).toBeGreaterThanOrEqual(0);
+    expect(sessionRows.slice(firstRan).filter((line) => !/^● Ran sleep, printf · \d+ calls ✓$/.test(line))).toEqual([]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT * 2,
 );
 
 test.skipIf(!tmuxAvailable())(
@@ -367,7 +532,7 @@ test.skipIf(!tmuxAvailable())(
 
     await active.sendText("Start the command and return control while it remains active.");
     await active.sendKeys("Enter");
-    await active.waitForText("PHASE_ONE_READY", TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("PHASE_ONE_READY") && turnSettled(pane), TIMEOUT);
     expect(sessionId.length).toBeGreaterThan(0);
     expect(toolResultEnvelope(
       gateway.requests[1]!.body,
@@ -445,15 +610,8 @@ test.skipIf(!tmuxAvailable())(
     const pid = Number(readFileSync(pidPath, "utf8"));
     expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
     const deadline = Date.now() + 3_000;
-    while (Date.now() < deadline) {
-      try {
-        process.kill(pid, 0);
-      } catch {
-        break;
-      }
-      await Bun.sleep(25);
-    }
-    expect(() => process.kill(pid, 0)).toThrow();
+    while (Date.now() < deadline && processAlive(pid)) await Bun.sleep(25);
+    expect(processAlive(pid)).toBe(false);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
@@ -490,10 +648,10 @@ test.skipIf(!tmuxAvailable())(
 
     await active.sendText("Run the first captured command.");
     await active.sendKeys("Enter");
-    await active.waitForText("FIRST_REUSED_CALL_DONE", TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("FIRST_REUSED_CALL_DONE") && turnSettled(pane), TIMEOUT);
     await active.sendText("Run the second captured command.");
     await active.sendKeys("Enter");
-    await active.waitForText("SECOND_REUSED_CALL_DONE", TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("SECOND_REUSED_CALL_DONE") && turnSettled(pane), TIMEOUT);
 
     const firstSessionId = findSessionId(JSON.parse(gateway.requests[1]!.body));
     const secondSessionId = findSessionId(JSON.parse(gateway.requests[3]!.body));
@@ -689,7 +847,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Run and observe the session.");
-    await session.waitForText("WIDTH_FLOW_DONE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("WIDTH_FLOW_DONE") && turnSettled(pane), TIMEOUT);
     await Bun.sleep(300);
 
     // The 126-column activity cap used to freeze these phrases with trailing
@@ -698,10 +856,11 @@ test.skipIf(!tmuxAvailable())(
     const grid = await session.capturePaneGrid();
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
-    // The session's input and its stop share one row with its latest state.
-    expect(row("├ Still running ")).toBe("├ Still running echo, sleep");
+    // The run, the session's input, and its stop share one row with its
+    // latest state, so the row is the group's line.
+    expect(row("● Stopped ")).toBe("● Stopped echo, sleep · 3 calls ✓");
+    expect(row("├ Still running ")).toBeUndefined();
     expect(row("├ Observed ")).toBeUndefined();
-    expect(row("└ Stopped ")).toBe("└ Stopped echo, sleep · 2 calls");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
@@ -761,14 +920,14 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Run and observe the session.");
-    await session.waitForText("FULL_WIDTH_FLOW_DONE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("FULL_WIDTH_FLOW_DONE") && turnSettled(pane), TIMEOUT);
     await Bun.sleep(300);
 
-    // The main view shows the launch command's steps in short form.
-    // The session's input and its stop share one row, whose note stays.
+    // The main view shows the launch command's steps in short form. The
+    // run, the session's input, and its stop share one row, whose note stays.
     const mainRows = (await session.capturePaneGrid()).map((line) => line.trimEnd());
-    const mainSession = mainRows.find((line) => line.startsWith("└ Stopped "));
-    expect(mainSession).toBe("└ Stopped echo, sleep · 2 calls");
+    const mainSession = mainRows.find((line) => line.startsWith("● Stopped "));
+    expect(mainSession).toBe("● Stopped echo, sleep · 3 calls ✓");
     expect(mainRows.join("\n")).not.toContain("FULL_LAUNCH_TAIL");
 
     // `interact` carries no command argument, so the Observed heading is the
@@ -814,7 +973,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendKeys("C-o");
     await session.waitForPane((pane) => !pane.includes("esc close · pgup/pgdn scroll"), TIMEOUT);
     const scrollback = await session.captureFullScrollback();
-    expect(scrollback).toContain("└ Stopped echo, sleep · 2 calls");
+    expect(scrollback).toContain("● Stopped echo, sleep · 3 calls ✓");
     expect(scrollback).not.toContain("FULL_LAUNCH_TAIL");
     expect(scrollback).not.toContain("action: interact");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -880,7 +1039,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText(`${FX_BIN} 2>${fixture.stderrPath}`);
     await session.waitForStableComposer(TIMEOUT);
     await session.sendText("Run and observe the session.");
-    await session.waitForText("RESUME_WIDTH_DONE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("RESUME_WIDTH_DONE") && turnSettled(pane), TIMEOUT);
     await session.sendText("/quit");
     await session.waitForText("RESUME_SHELL>", TIMEOUT);
 
@@ -897,10 +1056,11 @@ test.skipIf(!tmuxAvailable())(
     const grid = await session.capturePaneGrid();
     const row = (prefix: string) =>
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
-    // The session's input and its stop share one row with its latest state.
-    expect(row("├ Still running ")).toBe("├ Still running echo, sleep");
+    // The run, the session's input, and its stop share one row with its
+    // latest state, so the row is the group's line.
+    expect(row("● Stopped ")).toBe("● Stopped echo, sleep · 3 calls ✓");
+    expect(row("├ Still running ")).toBeUndefined();
     expect(row("├ Observed ")).toBeUndefined();
-    expect(row("└ Stopped ")).toBe("└ Stopped echo, sleep · 2 calls");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT * 2,
@@ -1134,7 +1294,7 @@ test.skipIf(!tmuxAvailable())(
 
     const first = await launch(fixture, gateway);
     await first.sendText("Start the managed TTY.");
-    await first.waitForText("SHELL_TTY_RESUME_STARTED", TIMEOUT);
+    await first.waitForPane((pane) => pane.includes("SHELL_TTY_RESUME_STARTED") && turnSettled(pane), TIMEOUT);
     expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     const shellPid = await waitForRecordedPid(fixture.home, sessionId);
     expect(processAlive(shellPid)).toBe(true);

@@ -42,7 +42,11 @@ export function fxEnv(f: Fixture, extra: Record<string, string> = {}): Record<st
 
 /** A stdio server entry for mcp.json running the fixture. */
 export function stdioServer(f: Fixture, name: string, extra: Record<string, string> = {}) {
-  return { command: BUN, args: [FIXTURE], env: { FIXTURE_NAME: name, FIXTURE_LOG: f.serverLog, FIXTURE_CONTROL: f.control, ...extra } };
+  // These traces model the session's own engine (HostLifecycle.tla and its
+  // neighbors): its starts, reloads, and stops. A server shared between
+  // sessions runs in the owner instead, which SharedServers.tla and the
+  // owner's tests cover, so these servers stay in the session.
+  return { command: BUN, args: [FIXTURE], shared: false, env: { FIXTURE_NAME: name, FIXTURE_LOG: f.serverLog, FIXTURE_CONTROL: f.control, ...extra } };
 }
 
 export function writeProfile(f: Fixture, servers: Record<string, unknown>) {
@@ -60,12 +64,21 @@ const SIGN_IN_RULES = [
   { method: "tools/list", result: { resultType: "complete", tools: [{ name: "echo", inputSchema: { type: "object" } }] } },
 ];
 
-/** The fake Streamable HTTP server with fake OAuth (`HTTP_FAKE`), serving one echo tool. */
-export async function startFake(f: Fixture, server: Record<string, unknown> = {}) {
+/** One line of the fake server's log; `gate` and `issued` come from its OAuth gate (fakes/oauth.ts). */
+export interface FakeEntry {
+  t: number; dir?: string; path?: string; form?: Record<string, string>; json?: { redirect_uris?: string[] };
+  token?: string | null; status?: number; method?: string; grant?: string;
+}
+
+/**
+ * The fake Streamable HTTP server with fake OAuth (`HTTP_FAKE`), serving one echo tool.
+ * `gate` adds to the OAuth config: `refuseTokens`, `tokenFault` (fakes/oauth.ts).
+ */
+export async function startFake(f: Fixture, server: Record<string, unknown> = {}, gate: Record<string, unknown> = {}) {
   if (!existsSync(HTTP_FAKE)) throw new Error(`harness: the fake HTTP server is missing at ${HTTP_FAKE}`);
   const rules = join(f.base, "rules.json"), auth = join(f.base, "auth.json"), log = join(f.base, "http-fake.jsonl");
   writeFileSync(rules, JSON.stringify(SIGN_IN_RULES));
-  writeFileSync(auth, JSON.stringify({ servers: [server], challengeScope: "mcp:read" }));
+  writeFileSync(auth, JSON.stringify({ servers: [server], challengeScope: "mcp:read", ...gate }));
   const child = Bun.spawn([BUN, HTTP_FAKE, "--script", rules, "--log", log, "--auth", auth], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const reader = child.stdout.getReader();
   let text = "";
@@ -76,12 +89,29 @@ export async function startFake(f: Fixture, server: Record<string, unknown> = {}
     text += new TextDecoder().decode(value);
   }
   const port = JSON.parse(text.split("\n")[0]!).listening as number;
-  const entries = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []) as { t: number; dir?: string; path?: string; form?: Record<string, string>; json?: { redirect_uris?: string[] } }[];
+  const entries = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []) as FakeEntry[];
   return { url: `http://127.0.0.1:${port}/mcp`, entries, stop: () => child.kill() };
 }
 
 export const redemptions = (entries: ReturnType<Awaited<ReturnType<typeof startFake>>["entries"]>) =>
   entries.filter((e) => e.dir === "auth" && e.path?.endsWith("/token") && e.form?.grant_type === "authorization_code");
+
+/**
+ * The first request the MCP endpoint decided for each token a sign-in brought (an authorization code's, not a
+ * refresh's), in the order issued: what the server said to that login's token.
+ */
+export function checkAnswers(entries: FakeEntry[]): { token: string; t: number; status: number; result: "accept" | "refuse" | "fail" }[] {
+  const out: { token: string; t: number; status: number; result: "accept" | "refuse" | "fail" }[] = [];
+  const issued = entries.filter((e) => e.dir === "issued" && e.token && e.grant === "authorization_code").map((e) => e.token!);
+  for (const token of issued) {
+    const first = entries.find((e) => e.dir === "gate" && e.token === token);
+    if (!first) continue;
+    const status = first.status ?? 0;
+    // Only a 401 refuses a token: any other answer that isn't a success is a failure to check it.
+    out.push({ token, t: first.t, status, result: status >= 200 && status < 300 ? "accept" : status === 401 ? "refuse" : "fail" });
+  }
+  return out;
+}
 
 /** `fx mcp login --no-browser web` with stdin left open, its output read as it comes. */
 export async function cliLogin(binary: string, f: Fixture) {

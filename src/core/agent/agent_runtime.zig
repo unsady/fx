@@ -54,6 +54,7 @@ test {
     _ = @import("runtime/tests/tool_flow.zig");
     _ = @import("runtime/tests/interruption_flow.zig");
     _ = @import("runtime/tests/finalization_flow.zig");
+    _ = @import("runtime/tests/assistant_tail_flow.zig");
     _ = @import("runtime/agent.zig");
     _ = @import("runtime/cache_warming.zig");
     _ = @import("runtime/cache_warmer.zig");
@@ -63,6 +64,7 @@ test {
     _ = @import("runtime/resend_strategy.zig");
     _ = @import("runtime/request_recovery.zig");
     _ = @import("runtime/request_image_budget.zig");
+    _ = @import("runtime/telemetry.zig");
     _ = @import("runtime/text_completion.zig");
     _ = @import("runtime/vision_contracts.zig");
 }

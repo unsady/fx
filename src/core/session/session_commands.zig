@@ -337,7 +337,7 @@ pub fn Commands(comptime App: type) type {
                 .settings_error = settings_error,
                 .fx_home = fx_home,
                 .history_turns = agent.session.historyLen(),
-                .session_permission_grants = permissions.liveSessionGrantCount(app_permission_runtime.Runtime(App).grantsOf(app, agent)),
+                .session_permission_grants = app_permission_runtime.Runtime(App).liveGrantCount(app, agent),
                 .agent_step_limit = app.agent_step_limit,
                 .ultrafast_requested = agent.worker.agent_turn_settings.ultrafast_mode,
             };
@@ -359,7 +359,7 @@ pub fn Commands(comptime App: type) type {
                     .unavailable => null,
                     .open => |open| open.saved,
                 } else null,
-                .session_grants = permissions.liveSessionGrantCount(app_permission_runtime.Runtime(App).grantsOf(app, agent)),
+                .session_grants = app_permission_runtime.Runtime(App).liveGrantCount(app, agent),
             } };
         }
 
@@ -373,7 +373,7 @@ pub fn Commands(comptime App: type) type {
             const snapshot: output_contracts.PermissionsSnapshot = .{
                 .workspace_root = app.workspace_root,
                 .mode = app_permission_runtime.Runtime(App).viewOf(app, agent).mode,
-                .grants = try permissions.liveSessionGrants(alloc, app_permission_runtime.Runtime(App).grantsOf(app, agent)),
+                .grants = try app_permission_runtime.Runtime(App).liveGrants(app, agent, alloc),
                 .rules = app.permission_engine.rules,
                 .saved_rules = try savedPermissionRules(app, agent, alloc),
             };
@@ -391,7 +391,7 @@ pub fn Commands(comptime App: type) type {
         fn permissionsFacts(app: *App, agent: *AppAgent) info_panel.Facts {
             return .{ .permissions = .{
                 .mode = app_permission_runtime.Runtime(App).viewOf(app, agent).mode,
-                .session_grants = permissions.liveSessionGrantCount(app_permission_runtime.Runtime(App).grantsOf(app, agent)),
+                .session_grants = app_permission_runtime.Runtime(App).liveGrantCount(app, agent),
                 .configured_rules = app.permission_engine.rules.rules.len,
             } };
         }
@@ -509,10 +509,6 @@ pub fn Commands(comptime App: type) type {
             }
 
             const first = splitFirstWord(trimmed).?;
-            const scope_word = if (std.ascii.eqlIgnoreCase(first.word, "view")) std.mem.trim(u8, first.rest, " \t") else first.word;
-            if (oldAllowlistWarning(scope_word)) |warning| {
-                try app.writeDomainNotice(.{ .topic = "", .tone = .warning, .body = warning }, true);
-            }
             if (std.ascii.eqlIgnoreCase(first.word, "view")) {
                 const view = parseAllowlistView(first.rest) orelse {
                     try writeAllowlistUsage(app);
@@ -1741,18 +1737,10 @@ fn allowlistScopeWord(scope: config_runtime.PermissionScope) []const u8 {
     };
 }
 
-/// The warning for the older scope words `user` and `local`, which still work
-/// until fx drops old spellings; null for any other word.
-fn oldAllowlistWarning(word: []const u8) ?[]const u8 {
-    if (std.ascii.eqlIgnoreCase(word, "user")) return "/allowlist user " ++ command_specs.deprecated_until ++ "; use /allowlist global";
-    if (std.ascii.eqlIgnoreCase(word, "local")) return "/allowlist local " ++ command_specs.deprecated_until ++ "; use /allowlist workspace";
-    return null;
-}
-
-/// `global` and `workspace`, and the older `user` and `local`, which still work.
+/// The scope words `/allowlist` takes: `global` and `workspace`.
 fn allowlistScope(word: []const u8) ?config_runtime.PermissionScope {
-    if (std.ascii.eqlIgnoreCase(word, "global") or std.ascii.eqlIgnoreCase(word, "user")) return .user;
-    if (std.ascii.eqlIgnoreCase(word, "workspace") or std.ascii.eqlIgnoreCase(word, "local")) return .local;
+    if (std.ascii.eqlIgnoreCase(word, "global")) return .user;
+    if (std.ascii.eqlIgnoreCase(word, "workspace")) return .local;
     return null;
 }
 
@@ -2940,7 +2928,7 @@ test "session_commands allowlist scopes expose and mutate hidden user rules inde
     var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
     defer app.deinit();
 
-    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "user add command \"user *\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "global add command \"user *\"");
     try expectTranscriptContains(&app, "(scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
 
@@ -2949,13 +2937,13 @@ test "session_commands allowlist scopes expose and mutate hidden user rules inde
     try expectTranscriptContains(&app, "(scope=workspace)");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view user");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view global");
     try expectTranscriptContains(&app, "* allowlist: global persistent allow rules:");
     try expectTranscriptContains(&app, "user *");
     try expectTranscriptContains(&app, "global rules are shadowed by workspace settings");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view local");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view workspace");
     try expectTranscriptContains(&app, "* allowlist: workspace persistent allow rules:");
     try expectTranscriptContains(&app, "local *");
     try std.testing.expect(std.mem.find(u8, app.text(), "user *") == null);
@@ -2967,7 +2955,7 @@ test "session_commands allowlist scopes expose and mutate hidden user rules inde
     try std.testing.expect(std.mem.find(u8, app.text(), "user *") == null);
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "user remove command \"user *\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "global remove command \"user *\"");
     try expectTranscriptContains(&app, "(scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
 
@@ -2980,9 +2968,9 @@ test "session_commands allowlist scopes expose and mutate hidden user rules inde
     try std.testing.expectEqual(@as(usize, 1), after_remove.permission_sources.local.rules.len);
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "user add command \"user-again *\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "global add command \"user-again *\"");
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "user reset all");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "global reset all");
     try expectTranscriptContains(&app, "reset all: removed 1 rule (scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
 
@@ -3611,6 +3599,25 @@ test "session_commands durable user save survives post-commit resolver diagnosti
     try expectTranscriptContains(&app, "next-startup source unknown (DurablePathUnsafe)");
 }
 
+test "session_commands allowlist refuses the removed user and local words with a usage line" {
+    const home = try SessionCommandTestHome.install(std.testing.allocator, null);
+    defer home.deinit();
+    var app = try FakeApp.init(std.testing.allocator, "/tmp/workspace", "model");
+    defer app.deinit();
+
+    for ([_][]const u8{
+        "user add command \"git status *\"",
+        "local add command \"git status *\"",
+        "user",
+        "local remove command \"git status *\"",
+    }) |rest| {
+        app.clearTranscript();
+        try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), rest);
+        try expectTranscriptContains(&app, "usage: /allowlist [view [effective|workspace|global]|[workspace|global] add|remove|reset ...]");
+        try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+    }
+}
+
 test "session_commands allowlist failures retain explicit scope and error" {
     const home = try SessionCommandTestHome.install(std.testing.allocator, null);
     defer home.deinit();
@@ -3620,7 +3627,7 @@ test "session_commands allowlist failures retain explicit scope and error" {
     try Commands(FakeApp).handleAllowlist(
         &app,
         (&app).agent(),
-        "user add command \"git status *\"",
+        "global add command \"git status *\"",
     );
 
     try expectTranscriptContains(
@@ -3650,7 +3657,7 @@ test "session_commands allowlist durable save survives post-commit resolver diag
     try Commands(FakeApp).handleAllowlist(
         &app,
         (&app).agent(),
-        "user add command \"git status *\"",
+        "global add command \"git status *\"",
     );
 
     try expectTranscriptContains(&app, "! allowlist: added command");

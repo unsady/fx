@@ -24,6 +24,7 @@ import {
   startFakeGateway as startGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { findActiveFileApprovalBlock } from "./tui-render-assertions";
 import { stdoutFrames } from "./render-lab/tape";
@@ -909,7 +910,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(resized).toContain(`Apply once, ${feedback}`);
 
       await session.sendKeys("Enter");
-      await session.waitForText("amended review complete", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("amended review complete") && turnSettled(pane), TIMEOUT);
       const finalPane = await session.capturePane();
       expect(finalPane).toContain(feedback);
       const terminalTool = finalPane.indexOf("Wrote amended-review.txt");
@@ -1146,8 +1147,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const cases = [
         {
           name: "denied",
-          // The group's only call is its header, which says it was denied.
-          outcome: "● Denied file",
+          // The group's only call is its header, which says it was denied
+          // and names the file it would have written.
+          outcome: "● Denied marker-denied.txt",
           resolve: async (session: TmuxSession) => {
             await decide(session, 3);
           },
@@ -1412,9 +1414,11 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         await session.waitForText(`${selection} marker complete`, TIMEOUT);
         expect(readFileSync(target, "utf8")).toBe("after\n");
         const scrollback = await session.captureFullScrollbackEscapes();
-        const row = scrollback.split("\n").find((line) =>
-          line.includes("Edited marker.txt") && line.includes("+1") && line.includes("-1")
-        );
+        // The file name links to the file, so the match skips the link.
+        const row = scrollback.split("\n").find((line) => {
+          const text = line.replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
+          return text.includes("Edited marker.txt") && text.includes("+1") && text.includes("-1");
+        });
         expect(row).toBeDefined();
         if (selection === "default") {
           expect(row).not.toContain("\x1b[38;5;71m");
@@ -1432,12 +1436,12 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "grouped edit rows keep diff counts when a long path is clipped",
+    "an edit row keeps its counts when a long file name is clipped",
     async () => {
       const width = 80;
       const root = createIsolatedRoot();
       const relativePath =
-        "packages/render-pipeline/transcript-projection/grouped-rows/edit-row-fixture.txt";
+        "packages/render-pipeline/transcript-projection/grouped-rows/edit-row-fixture-with-a-file-name-much-too-long-for-an-eighty-column-row.txt";
       const target = join(root.workspace, relativePath);
       mkdirSync(join(target, ".."), { recursive: true });
       writeFileSync(target, "one\ntwo\n");
@@ -1464,32 +1468,28 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       });
 
       await session.sendText("Edit the long path fixture twice.");
-      // The header says what the group did; each row keeps its file and
-      // counts.
+      // Both edits change one file, so they share one row, which is the
+      // group's line. It shows the file by name, not its path.
       await session.waitForPane(
-        (pane) =>
-          pane.includes("long path edits complete") &&
-          /^● Edited a file$/m.test(pane),
+        (pane) => pane.includes("long path edits complete") && /^● Edited edit-row-fixture/m.test(pane),
         TIMEOUT,
       );
       expect(readFileSync(target, "utf8")).toBe("uno\ndos\n");
 
       const grid = await session.capturePaneGrid();
-      const rows = grid.filter((line) => /^[├└] Edited packages\//.test(line));
-      expect(rows).toHaveLength(2);
-      for (const row of rows) {
-        expect([...row.trimEnd()].length).toBeLessThanOrEqual(width);
-        expect(row.trimEnd()).toMatch(/^[├└] Edited packages\/\S*… \+1 \/ -1$/);
-      }
+      const rows = grid.filter((line) => line.startsWith("● Edited edit-row-fixture"));
+      expect(rows).toHaveLength(1);
+      expect([...rows[0]!.trimEnd()].length).toBeLessThanOrEqual(width);
+      // The name clips; the added-up counts and the merge note stay.
+      expect(rows[0]!.trimEnd()).toMatch(/^● Edited edit-row-fixture\S*… \+2\/-2 · 2 edits$/);
+      expect(grid.some((line) => line.includes("packages/"))).toBe(false);
 
       const escapes = await session.capturePaneEscapes();
-      // Each row keeps its counts and their colors after its clipped path.
-      const styledRows = escapes.split("\n").filter((line) => line.includes("Edited packages/"));
-      expect(styledRows).toHaveLength(2);
-      for (const row of styledRows) {
-        expect(row).toContain("\x1b[38;5;71m+1");
-        expect(row).toContain("\x1b[38;5;167m-1");
-      }
+      // The counts keep their colors after the clipped name.
+      const styledRows = escapes.split("\n").filter((line) => line.includes("Edited ") && line.includes("edit-row-fixture"));
+      expect(styledRows).toHaveLength(1);
+      expect(styledRows[0]).toContain("\x1b[38;5;71m+2");
+      expect(styledRows[0]).toContain("\x1b[38;5;167m-2");
       expectCleanStderr(stderrPath);
       await session.kill();
       activeSession = null;
@@ -1522,7 +1522,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         scope: "workspace file access for this session",
       });
       await decide(session, 2);
-      await session.waitForText("first grant complete", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("first grant complete") && turnSettled(pane), TIMEOUT);
       expect(readFileSync(target, "utf8")).toBe("first\n");
 
       await session.sendText("Update the granted fixture.");
@@ -1588,14 +1588,14 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         required: ["CTRL_O_FIRST_120"],
       });
       await decide(session, 1);
-      await session.waitForText("CTRL_O_FIRST_DONE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("CTRL_O_FIRST_DONE") && turnSettled(pane), TIMEOUT);
 
       await session.sendText("Create the second Ctrl-O file fixture.");
       await waitForFileApproval(session, {
         required: ["CTRL_O_SECOND_060"],
       });
       await decide(session, 1);
-      await session.waitForText("CTRL_O_SECOND_DONE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("CTRL_O_SECOND_DONE") && turnSettled(pane), TIMEOUT);
       expect(readFileSync(join(root.workspace, "first.txt"), "utf8")).toBe(
         `${firstLines.join("\n")}\n`,
       );
@@ -1689,7 +1689,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         required: ["OLD_WRAP_TAIL", "NEW_WRAP_TAIL"],
       });
       await decide(session, 1);
-      await session.waitForText("WRAP_DIFF_COMPLETE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("WRAP_DIFF_COMPLETE") && turnSettled(pane), TIMEOUT);
       expect(readFileSync(target, "utf8")).toBe(newLine);
 
       const inline = await session.captureFullScrollback();
@@ -1911,7 +1911,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(gateway.requests).toHaveLength(1);
       expect(existsSync(controlTarget)).toBe(false);
       await decide(session, 3);
-      await session.waitForText("consolidated control complete", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("consolidated control complete") && turnSettled(pane), TIMEOUT);
 
       await session.sendText("Create the consolidated large fixture.");
       pane = await waitForFileApproval(session, {
@@ -2024,7 +2024,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(approval).toContain("+ hostile");
       expect(existsSync(target)).toBe(false);
       await decide(session, 1);
-      let settled = await session.waitForText("hostile write complete", TIMEOUT);
+      let settled = await session.waitForPane((pane) => pane.includes("hostile write complete") && turnSettled(pane), TIMEOUT);
 
       expect(readFileSync(target, "utf8")).toBe("hostile\n");
       expect(settled).toContain(encodedName);

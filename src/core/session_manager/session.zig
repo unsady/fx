@@ -15,6 +15,7 @@
 //! `Session.sync_mutex` (one fsync at a time). Hosts never lock anything.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const schema = @import("schema.zig");
 const storage = @import("storage.zig");
 const log_mod = @import("log.zig");
@@ -571,6 +572,7 @@ pub const Session = struct {
         const lock = s.createFile(dir, "lock") catch |io_err| return storage.ioFault(io_err);
         errdefer s.closeFile(lock);
         if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return error.Io;
+        s.writeLockPid(lock, currentPid());
         s.syncDir(dir) catch |io_err| return storage.ioFault(io_err);
         if (!rename_first) try session.publishRename(tmp);
         s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
@@ -926,7 +928,10 @@ pub const Session = struct {
                 session.phase = .closed;
             },
             .failed => |maybe_live| {
-                if (maybe_live) |live| session.release(live);
+                if (maybe_live) |live| {
+                    session.env.s.clearLockPid(live.lock);
+                    session.release(live);
+                }
                 session.phase = .closed;
             },
             .live => |*live| {
@@ -948,6 +953,7 @@ pub const Session = struct {
                     .failed => |l| l.?,
                     else => unreachable,
                 };
+                session.env.s.clearLockPid(resources.lock);
                 session.release(resources);
                 session.phase = .closed;
                 return result;
@@ -1232,7 +1238,13 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
         else => |io_err| storage.ioFault(io_err),
     };
     errdefer s.closeFile(lock);
-    if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
+    const locked = !env.isPlanted(.skip_flock);
+    if (locked) {
+        try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
+        s.writeLockPid(lock, currentPid());
+    }
+    // Declared after `closeFile`, so it runs first: the PID is cleared before the file closes.
+    errdefer if (locked) s.clearLockPid(lock);
 
     var opened = Log.open(gpa, s, dir, "log.jsonl", .read_write, .{}) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
@@ -1659,6 +1671,12 @@ pub fn readBlob(env: *const Env, gpa: std.mem.Allocator, id_: []const u8, hash: 
     defer s.closeDir(dir);
     const blobs = s.openDir(dir, "blobs") catch |err| return notFoundOr(err);
     defer s.closeDir(blobs);
+    return readBlobIn(s, blobs, gpa, hash);
+}
+
+/// `readBlob` within a session's open blobs folder. The caller owns the
+/// result.
+fn readBlobIn(s: storage.Storage, blobs: storage.Dir, gpa: std.mem.Allocator, hash: []const u8) BlobError![]u8 {
     const file = s.openFile(blobs, hash, .read_only) catch |err| return notFoundOr(err);
     defer s.closeFile(file);
     const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
@@ -1680,6 +1698,11 @@ pub fn blobExists(env: *const Env, id_: []const u8, hash: []const u8) (error{Not
     defer s.closeDir(dir);
     const blobs = s.openDir(dir, "blobs") catch |err| return notFoundOr(err);
     defer s.closeDir(blobs);
+    return blobFileIn(s, blobs, hash);
+}
+
+/// `blobExists` within a session's open blobs folder.
+fn blobFileIn(s: storage.Storage, blobs: storage.Dir, hash: []const u8) (error{NotFound} || storage.IoFault)!void {
     const st = s.stat(blobs, hash) catch |err| return notFoundOr(err);
     if (st.kind != .file) return error.NotFound;
 }
@@ -2262,20 +2285,41 @@ pub fn discardStaging(env: *const Env, id_: []const u8) storage.IoFault!void {
     s.deleteTree(tmp, id_) catch |io_err| return storage.ioFault(io_err);
 }
 
-/// Whether a session with this id is open for writing anywhere.
-pub fn isBusy(env: *const Env, id_: []const u8) DeleteError!bool {
+pub const LockStatus = union(enum) {
+    free,
+    /// Held by another process; null when no valid PID was recorded.
+    busy: ?i64,
+};
+
+fn currentPid() i64 {
+    if (comptime builtin.target.os.tag == .wasi or builtin.target.os.tag == .freestanding) return 0;
+    return std.c.getpid();
+}
+
+/// Whether another process has session `id_` open for writing, and its PID
+/// when it recorded one. When none has, this holds the lock for an instant.
+pub fn lockStatus(env: *const Env, id_: []const u8) DeleteError!LockStatus {
     const s = env.s;
     if (!schema.validId(id_)) return error.NotFound;
     const dir = s.openDir(env.root, id_) catch |err| return notFoundOr(err);
     defer s.closeDir(dir);
     const lock = s.openFile(dir, "lock", .read_write) catch |err| return switch (err) {
-        error.NotFound => false,
+        error.NotFound => .free,
         else => |io_err| storage.ioFault(io_err),
     };
     defer s.closeFile(lock);
-    if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return true;
+    if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) {
+        return .{ .busy = s.readLockPid(lock) };
+    }
     s.unlock(lock);
-    return false;
+    return .free;
+}
+
+pub fn isBusy(env: *const Env, id_: []const u8) DeleteError!bool {
+    return switch (try lockStatus(env, id_)) {
+        .free => false,
+        .busy => true,
+    };
 }
 
 /// The distinct child ids named by `child_spawned` lines.
@@ -2318,12 +2362,97 @@ pub const Verified = struct {
     bad_snapshots: u64,
     /// Blobs a line names that are missing or fail their hash (D39).
     bad_blobs: u64 = 0,
+    /// Offset of the first line left unchecked because the caller stopped
+    /// the check; null when the check reached the end of the log.
+    stopped_at: ?u64 = null,
+};
+
+pub const VerifyOptions = struct {
+    /// `hash` reads each blob and checks its bytes against its name.
+    /// `exists` only checks that each blob is a regular file, which costs
+    /// one `stat` in place of an open, a read, and a hash per blob.
+    blobs: enum { hash, exists } = .hash,
+    /// Asked before each line is checked; when it says stop, the check ends
+    /// there and `Verified.stopped_at` names the line.
+    stop: ?Stop = null,
+};
+
+/// Asked between the steps of a long read, such as `verifySession`;
+/// true ends the read there.
+pub const Stop = struct {
+    context: *anyopaque,
+    requested: *const fn (context: *anyopaque) bool,
+
+    pub fn now(stop: ?Stop) bool {
+        const s = stop orelse return false;
+        return s.requested(s.context);
+    }
+};
+
+/// The blobs folder of the session being verified, opened on first use, and
+/// the blobs already checked, so each is checked once however many lines
+/// name it.
+const BlobChecker = struct {
+    s: storage.Storage,
+    session_dir: storage.Dir,
+    mode: @FieldType(VerifyOptions, "blobs"),
+    folder: union(enum) { unopened, missing, open: storage.Dir } = .unopened,
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    names: std.heap.ArenaAllocator,
+
+    fn init(gpa: std.mem.Allocator, s: storage.Storage, session_dir: storage.Dir, mode: @FieldType(VerifyOptions, "blobs")) BlobChecker {
+        return .{ .s = s, .session_dir = session_dir, .mode = mode, .names = .init(gpa) };
+    }
+
+    fn deinit(c: *BlobChecker, gpa: std.mem.Allocator) void {
+        if (c.folder == .open) c.s.closeDir(c.folder.open);
+        c.seen.deinit(gpa);
+        c.names.deinit();
+    }
+
+    /// Whether the blob is present and, in `hash` mode, matches its name.
+    /// A blob already checked counts as whole: its first check reported it.
+    fn whole(c: *BlobChecker, gpa: std.mem.Allocator, hash: []const u8) (error{OutOfMemory} || storage.IoFault)!bool {
+        if (c.seen.contains(hash)) return true;
+        try c.seen.put(gpa, try c.names.allocator().dupe(u8, hash), {});
+        if (!schema.validBlobHash(hash)) return false;
+        const blobs = switch (c.folder) {
+            .open => |dir| dir,
+            .missing => return false,
+            .unopened => blk: {
+                const dir = c.s.openDir(c.session_dir, "blobs") catch |err| switch (err) {
+                    error.NotFound => {
+                        c.folder = .missing;
+                        return false;
+                    },
+                    else => return error.Io,
+                };
+                c.folder = .{ .open = dir };
+                break :blk dir;
+            },
+        };
+        switch (c.mode) {
+            .exists => blobFileIn(c.s, blobs, hash) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => |e| return e,
+            },
+            .hash => {
+                const bytes = readBlobIn(c.s, blobs, gpa, hash) catch |err| switch (err) {
+                    error.NotFound, error.Corrupt => return false,
+                    else => |e| return e,
+                };
+                gpa.free(bytes);
+            },
+        }
+        return true;
+    }
 };
 
 /// Reads a whole log without its lock: every line's frame, checksum and
 /// seq, and every snapshot against the fold at its position (a snapshot is
 /// a cache that must equal what it replaces).
-pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
+/// `options` choose the blob check and the stop.
+pub fn verifySession(env: *const Env, id_: []const u8, options: VerifyOptions) OpenError!Verified {
     const s = env.s;
     const gpa = env.gpa;
     if (!schema.validId(id_)) return error.NotFound;
@@ -2339,6 +2468,8 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
     defer state.deinit(gpa);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
+    var blobs = BlobChecker.init(gpa, s, dir, options.blobs);
+    defer blobs.deinit(gpa);
     var result: Verified = .{ .lines = 0, .damaged_at = null, .bad_snapshots = 0 };
     var fork_seq: u64 = 0;
     while (true) {
@@ -2350,6 +2481,12 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
             error.OutOfMemory => return error.OutOfMemory,
             else => |io_err| return storage.ioFault(io_err),
         }) orelse break;
+        // Asked only when a line is left, so a check that reached the end
+        // is whole however late the stop comes.
+        if (Stop.now(options.stop)) {
+            result.stopped_at = line.offset;
+            break;
+        }
         result.lines += 1;
         _ = arena.reset(.retain_capacity);
         const kind = line.header.kind orelse continue;
@@ -2358,7 +2495,7 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
             break;
         };
         for (body.blobRefs()) |hash| {
-            if (!try blobIsWhole(env, id_, hash)) result.bad_blobs += 1;
+            if (!try blobs.whole(gpa, hash)) result.bad_blobs += 1;
         }
         switch (body) {
             .session_created => |c| fork_seq = if (c.forked_from) |o| o.seq else 0,
@@ -3043,7 +3180,7 @@ const session_tests = struct {
         const fork_id = try gpa.dupe(u8, f.id());
         defer gpa.free(fork_id);
         try closeAndDestroy(f);
-        const verified = try session_mod.verifySession(&t.env, fork_id);
+        const verified = try session_mod.verifySession(&t.env, fork_id, .{});
         try testing.expectEqual(@as(?u64, null), verified.damaged_at);
         try testing.expectEqual(@as(u64, 0), verified.bad_snapshots);
 
@@ -3713,6 +3850,51 @@ const session_tests = struct {
         }
         try testing.expectEqual(@as(usize, 1), roots);
         try testing.expectEqual(@as(usize, 2), sessions);
+    }
+
+    fn expectLockStatus(env: *const session_mod.Env, id: []const u8, want: LockStatus) !void {
+        try testing.expectEqual(want, try lockStatus(env, id));
+    }
+
+    fn lockFileLength(t: *TestEnv, id: []const u8) !u64 {
+        const dir = try t.env.s.openDir(t.env.root, id);
+        defer t.env.s.closeDir(dir);
+        const file = try t.env.s.openFile(dir, "lock", .read_only);
+        defer t.env.s.closeFile(file);
+        return t.env.s.length(file);
+    }
+
+    test "lockStatus names the writer's PID while a session is open, and is free after a close or a crash" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const writer = try newRoot(&t);
+        _ = try writer.append(&.{ .turn_started, .turn_committed });
+        const id = try gpa.dupe(u8, writer.id());
+        defer gpa.free(id);
+        try expectLockStatus(&t.env, id, .{ .busy = currentPid() });
+        try closeAndDestroy(writer);
+        try expectLockStatus(&t.env, id, .free);
+        try testing.expectEqual(@as(u64, 0), try lockFileLength(&t, id));
+
+        {
+            const dir = try t.env.s.openDir(t.env.root, id);
+            defer t.env.s.closeDir(dir);
+            const holder = try t.env.s.openFile(dir, "lock", .read_write);
+            defer t.env.s.closeFile(holder);
+            try testing.expect(try t.env.s.tryLock(holder));
+            try expectLockStatus(&t.env, id, .{ .busy = null });
+            try t.env.s.writeAt(holder, "not-a-pid\n", 0);
+            try t.env.s.sync(holder);
+            try expectLockStatus(&t.env, id, .{ .busy = null });
+            t.env.s.unlock(holder);
+        }
+
+        const again = try resumeRoot(&t, id);
+        try expectLockStatus(&t.env, id, .{ .busy = currentPid() });
+        crash(&t, again);
+        try expectLockStatus(&t.env, id, .free);
+        try testing.expect(try lockFileLength(&t, id) > 0);
     }
 };
 

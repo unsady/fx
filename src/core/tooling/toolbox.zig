@@ -156,6 +156,55 @@ pub fn carriedCall(arena: Allocator, name: []const u8, arguments_json: []const u
     return .{ .name = target.string, .arguments_json = arguments.written(), .arguments_from_text = from_text };
 }
 
+/// The alias of the MCP tool a call runs: its own name for a direct call,
+/// and the one a `toolbox {run}` carries. Null for any other call, an open
+/// or a search of an MCP tool included. Borrows `name` or `arena`.
+pub fn mcpToolAlias(arena: Allocator, name: []const u8, arguments_json: ?[]const u8) Allocator.Error!?[]const u8 {
+    if (core_types.isMcpToolName(name)) return name;
+    const run = (try carriedCall(arena, name, arguments_json orelse return null)) orelse return null;
+    return if (core_types.isMcpToolName(run.name)) run.name else null;
+}
+
+test "the MCP tool a call runs is its own name or the one its toolbox run carries" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cases = [_]struct { name: []const u8, arguments: ?[]const u8, alias: ?[]const u8 }{
+        .{ .name = "mcp_slack_read_thread", .arguments = null, .alias = "mcp_slack_read_thread" },
+        .{ .name = tool_name, .arguments = "{\"run\":\"mcp_slack_read_thread\",\"arguments\":{\"ts\":\"1\"}}", .alias = "mcp_slack_read_thread" },
+        .{ .name = tool_name, .arguments = "{\"open\":\"mcp_slack_read_thread\"}", .alias = null },
+        .{ .name = tool_name, .arguments = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"a\"}}", .alias = null },
+        .{ .name = tool_name, .arguments = null, .alias = null },
+        .{ .name = "read_file", .arguments = "{\"path\":\"a\"}", .alias = null },
+    };
+    for (cases) |case| {
+        const alias = try mcpToolAlias(a, case.name, case.arguments);
+        if (case.alias) |expected| {
+            try std.testing.expectEqualStrings(expected, alias orelse return error.TestExpectedAlias);
+        } else try std.testing.expect(alias == null);
+    }
+}
+
+/// The call a `toolbox {run}` of a built-in tool shows as on its rows: the
+/// call fx runs for it, of that tool with that tool's arguments under the
+/// toolbox call's id, so the rows read as a direct call of the tool from
+/// start to end, live and after a resume. Null for any other call, which
+/// keeps toolbox's own rows: an open or a search, a run of an MCP tool,
+/// whose row already reads as a direct call of it, and a run of a name
+/// `registry` doesn't hold or that toolbox doesn't run. The result borrows
+/// `call` and `arena`.
+pub fn shownBuiltinRun(arena: Allocator, registry: tool_dispatch.Registry, call: core_types.ToolCall) Allocator.Error!?core_types.ToolCall {
+    const run = (try carriedCall(arena, call.name, call.arguments_json)) orelse return null;
+    if (std.mem.eql(u8, run.name, tool_name) or core_types.isMcpToolName(run.name)) return null;
+    const tool = registry.lookup(run.name) orelse return null;
+    if (!runs(tool.*)) return null;
+    var shown = call;
+    shown.name = tool.name;
+    shown.arguments_json = run.arguments_json;
+    shown.carried_by = tool_name;
+    return shown;
+}
+
 test "a run's arguments written as JSON text are carried as their object, and other text is not" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -305,6 +354,38 @@ test "a toolbox run carries the tool it names and that tool's arguments" {
     try std.testing.expectEqual(@as(?Carried, null), try carriedCall(arena, "shell", "{\"run\":\"x\"}"));
 }
 
+test "a toolbox run of a built-in tool shows as a direct call of it, and any other call shows as itself" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const registry = @import("../../builtins/tools.zig").registry;
+    const run: core_types.ToolCall = .{ .id = "call_box", .name = tool_name, .arguments_json = "{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"https://example.com/page\"}}" };
+    const shown = (try shownBuiltinRun(arena, registry, run)).?;
+    try std.testing.expectEqualStrings("call_box", shown.id);
+    try std.testing.expectEqualStrings("web_fetch", shown.name);
+    try std.testing.expectEqualStrings("{\"url\":\"https://example.com/page\"}", shown.arguments_json);
+    try std.testing.expectEqualStrings(tool_name, shown.carried_by.?);
+    // Arguments written as JSON text show as their object, as fx runs them.
+    const text = (try shownBuiltinRun(arena, registry, .{ .id = "t", .name = tool_name, .arguments_json = "{\"run\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\"}\"}" })).?;
+    try std.testing.expectEqualStrings("read_file", text.name);
+    try std.testing.expectEqualStrings("{\"path\":\"notes.txt\"}", text.arguments_json);
+    const kept = [_][]const u8{
+        // An MCP tool's run already reads as a direct call of it.
+        "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}",
+        // A name fx doesn't hold keeps toolbox's own row, which names it.
+        "{\"run\":\"no_such_tool\",\"arguments\":{}}",
+        "{\"run\":\"toolbox\",\"arguments\":{\"open\":\"x\"}}",
+        "{\"open\":\"read_file\"}",
+        "{\"search\":\"files\"}",
+        "{\"run\":\"read_file\",\"search\":\"x\"}",
+        "not json",
+    };
+    for (kept) |arguments| {
+        try std.testing.expect(try shownBuiltinRun(arena, registry, .{ .id = "k", .name = tool_name, .arguments_json = arguments }) == null);
+    }
+    try std.testing.expect(try shownBuiltinRun(arena, registry, .{ .id = "d", .name = "read_file", .arguments_json = "{\"run\":\"web_fetch\"}" }) == null);
+}
+
 pub fn isReplaced(name: []const u8) bool {
     for (replaced) |item| {
         if (std.mem.eql(u8, item, name)) return true;
@@ -405,7 +486,7 @@ pub fn render(alloc: Allocator, entries: []const Entry, limits: Limits) Allocato
 /// (`mcp_call_capability.supported`), so the model is never told to use it
 /// there.
 pub const mcp_call_hint = if (mcp_call_capability.supported)
-    "When an MCP tool's result would be large or needs filtering, run it from a shell command instead: fx mcp call TOOL_NAME '<JSON arguments>' > FILE. Only what the command prints returns to you.\n"
+    "When an MCP tool's result would be large or needs filtering, run it from a shell command instead: fx mcp call TOOL_NAME '<JSON arguments>' > FILE. Only what the command prints returns to you. It works only while that shell call runs. " ++ mcp_call_capability.short_checks_advice ++ "\n"
 else
     "";
 

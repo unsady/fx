@@ -25,6 +25,7 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
 const file_index = @import("../workspace/file_index.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
+const diagnostics = @import("../workspace/diagnostics.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const event_loop = @import("../../ui/event_loop.zig");
@@ -503,7 +504,13 @@ pub fn Runtime(comptime App: type) type {
                 debug_trace.logf("theme", "theme_transcript_retint_failed err={s}", .{@errorName(err)});
                 return;
             };
-            app.pacer.rethemeInlineCode(light);
+            app.pacer.retintForTheme(app.alloc, prior_theme, target) catch |err| {
+                debug_trace.logf("theme", "theme_pending_retint_failed err={s} kept=old_colors", .{@errorName(err)});
+            };
+            // Each hidden agent keeps its own transcript and paced text.
+            if (comptime @hasField(App, "child_agents") and @hasField(App, "main_screen")) {
+                @import("app_agents_runtime.zig").Runtime(App).retintHiddenScreens(app, prior_theme, target);
+            }
             if (resolved_target) |resolved| {
                 ui_render.applyTheme(resolved, rgb);
             } else {
@@ -1008,6 +1015,11 @@ pub fn Runtime(comptime App: type) type {
                         render_requests.visibleAnimationPhase(),
                         render_requests.animation_next_deadline_ms,
                     },
+                );
+                diagnostics.recordRenderEvent(
+                    .commit,
+                    "frame_error err={s} reasons={s} pending_reasons={d}",
+                    .{ @errorName(err), reason_names, render_requests.pendingReasonCount() },
                 );
                 return err;
             };
@@ -3512,6 +3524,8 @@ test "core.app_render_runtime requested-frame flush preserves work injected duri
 }
 
 test "core.app_render_runtime requested-frame flush restores preparation errors" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
     var app = CoordinatorFaultTestApp{
         .fault = .preparation_error,
         .injected_reason = .modal,
@@ -3527,6 +3541,16 @@ test "core.app_render_runtime requested-frame flush restores preparation errors"
         error.TestPreparationFailure,
         Runtime(CoordinatorFaultTestApp).flushRequestedFrame(&app, (&app).agent()),
     );
+
+    var render_events: [8]diagnostics.RenderEvent = undefined;
+    const render_event_count = diagnostics.snapshotRenderEvents(&render_events);
+    var found_frame_error = false;
+    for (render_events[0..render_event_count]) |*event| {
+        if (std.mem.startsWith(u8, event.detail(), "frame_error err=TestPreparationFailure")) {
+            found_frame_error = true;
+        }
+    }
+    try std.testing.expect(found_frame_error);
 
     try std.testing.expectEqual(@as(usize, 1), app.attempts);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
@@ -3799,6 +3823,11 @@ const CoordinatorTestWorker = struct {
     cancel_requested: bool = false,
     cancel_continues_turn: bool = false,
     steering_messages: []const []const u8 = &.{},
+    compaction: @import("../output/compaction_activity.zig").State = .{},
+
+    pub fn compactionActivitySnapshot(self: *const @This()) @import("../output/compaction_activity.zig").Snapshot {
+        return self.compaction.snapshot;
+    }
 
     pub fn snapshotSteeringPresentation(
         self: *const @This(),
@@ -4930,6 +4959,8 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
     const status_id = if (retry.cancel) blk: {
         const id: types.ToolLifecycleId = .{ .turn_id = 41, .call_id = "publication-cancel" };
         _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{ .id = id, .reconciles_provisional_call_id = null, .tool_name = "run_command", .activity_kind = .command } });
+        // Core names the call right after it starts; until then it has no row.
+        _ = try app.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = id, .text = "● Running publication check" } });
         break :blk app.shell.toolActivityRecord(id).?.entry_id;
     } else try store.appendPinnedToolStatusAtomic(&app.shell, alloc, "phase one\nphase two\nphase three\n");
     var physical = try vt_emulator.Grid.init(alloc, 80, rows);
@@ -5676,6 +5707,68 @@ test "core.app_render_runtime roomy resume footer paints twenty VT session rows"
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Responsive session title")));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "twenty-row transcript remains visible"));
+}
+
+test "core.app_render_runtime compaction row shows its count and its own clock in the VT, then the turn row goes on" {
+    const activity_status = @import("../output/activity_status.zig");
+    const turn_clock = @import("../output/turn_clock.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]u16{ 120, 28 }) |cols| {
+        var file = try tmp.dir.createFile(std.testing.io, "compaction-row-vt.log", .{ .read = true });
+        defer file.close(io_mod.getIo());
+        var app = CoordinatorTestApp{
+            .alloc = alloc,
+            .shell = .{
+                .stdout_file = file,
+                .layout = .{
+                    .rows = 24,
+                    .cols = cols,
+                    .content_bottom = 20,
+                    .divider_top_row = 21,
+                    .input_row = 22,
+                    .divider_bottom_row = 23,
+                    .hint_row = 24,
+                },
+                .owned_top_row = 1,
+                .viewport_top_row = 1,
+            },
+        };
+        defer app.deinit();
+        try app.selected_model.appendSlice(alloc, "test-model");
+        try app.shell.initBacking(alloc);
+        try app.shell.enableShadowVt(alloc);
+        try app.shell.writeTranscript(alloc, &app.metrics, "earlier turn output\n", true);
+
+        // 10m15s into the turn a compaction began 12 s ago. Each mark sits
+        // 50 ms past a whole second, so the shown second holds for 950 ms.
+        var now = io_mod.milliTimestamp();
+        const began = now - 12_050;
+        app.agent().stream = .{ .active = true, .phase = .thinking, .turn_started_ms = began - 615_000 };
+        const id = app.agent().worker.compaction.begin(.automatic, 1, began);
+        app.agent().worker.compaction.running(id, .summary);
+        app.agent().worker.compaction.written(id, 66, now);
+        activity_status.syncWaitingClock(&app.agent().stream, turn_clock.waits(false, app.agent().worker.compactionActivitySnapshot()), began);
+        app.shell.render_requests.request(.footer);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
+        const grid = app.shell.shadow_vt.?;
+        // The compaction's count and its own clock replace the turn row,
+        // whole even on a narrow row.
+        try std.testing.expect(try coordinatorGridContains(grid.*, "• Compacting 66% (12s)"));
+        try std.testing.expect(!(try coordinatorGridContains(grid.*, "Thinking")));
+        try std.testing.expect(try coordinatorGridContains(grid.*, "earlier turn output"));
+
+        // The compaction ends; syncState resumes the turn clock.
+        now = io_mod.milliTimestamp();
+        app.agent().worker.compaction.settle(id, .{ .outcome = .succeeded, .stage = .publication, .publication = .committed }, now);
+        activity_status.syncWaitingClock(&app.agent().stream, turn_clock.waits(false, app.agent().worker.compactionActivitySnapshot()), now);
+        app.shell.render_requests.request(.footer);
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
+        // The turn goes on from the 10m15s it showed when compaction began.
+        try std.testing.expect(try coordinatorGridContains(grid.*, "• Thinking (10m15s)"));
+        try std.testing.expect(!(try coordinatorGridContains(grid.*, "Compacting")));
+    }
 }
 
 test "core.app_render_runtime inline menus survive the VT size and resize matrix" {

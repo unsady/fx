@@ -34,6 +34,7 @@ const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
+const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
@@ -108,6 +109,26 @@ const empty_reply_nudge_prompt =
 const empty_reply_asking = "Asking it to continue.";
 const empty_reply_follow_up = "Continue with a follow-up prompt if needed.";
 
+/// The longest an empty reply waits for mail that still sits in the host's
+/// hand-off before the nudge goes out.
+const handoff_mail_wait_ms: i64 = 1000;
+
+/// An empty reply's step has ended. A subagent's report or message for this
+/// agent may still sit in the host's hand-off, a moment from the worker's queue,
+/// where the check for mail that follows cannot see it. Waits for it, at most
+/// `handoff_mail_wait_ms`, so the mail takes the nudge's place. A host with no
+/// hand-off waits for nothing
+/// (`tests/tla/subagent/MainMail.tla` NoNudgeWithMail, WaitBounded).
+fn awaitHandoffMail(deps: *const AgentRuntimeDeps, turn_id: u64, step_ctx: TraceContext) void {
+    const wait = deps.wait_for_handoff_mail orelse return;
+    const outcome = wait(deps.ctx, turn_id, handoff_mail_wait_ms);
+    if (outcome == .none) return;
+    debug_trace.eventf("agent", "empty_reply_mail_wait", step_ctx, "outcome={s}", .{@tagName(outcome)});
+    if (outcome == .timed_out) {
+        debug_trace.logf("agent", "empty reply: mail for this agent did not land in the worker within {d} ms, so the nudge goes out", .{handoff_mail_wait_ms});
+    }
+}
+
 /// What fx shows for a reply that stopped for `other` with no text and no tool
 /// call: the provider's own reason when it sent one, then `next_step`.
 fn emptyReplyNotice(arena: Allocator, provider_reason: []const u8, next_step: []const u8) ![]const u8 {
@@ -153,19 +174,18 @@ fn malformedToolCallFeedback(arena: Allocator, attempt: usize, tool_name: ?[]con
     );
 }
 
-/// What fx shows for a malformed tool call: that it asks the model again, or,
-/// once the feedback is spent, that the turn failed and the next step is the
-/// user's.
-fn malformedToolCallNotice(arena: Allocator, failed: bool) ![]const u8 {
-    if (!failed) return try arena.print(
-        "The model's tool call could not be read (provider reason: {s}). {s}",
-        .{ types.malformed_function_call_reason, malformed_tool_call_asking },
-    );
-    return try arena.print(
-        "The model's tool call could not be read {d} times in a row (provider reason: {s}). {s}",
-        .{ malformed_tool_call_max_feedbacks + 1, types.malformed_function_call_reason, empty_reply_follow_up },
-    );
-}
+/// What fx shows when it asks the model again after a malformed tool call.
+const malformed_tool_call_retry_notice = std.fmt.comptimePrint(
+    "The model's tool call could not be read (provider reason: {s}). {s}",
+    .{ types.malformed_function_call_reason, malformed_tool_call_asking },
+);
+
+/// What fx shows once the feedback is spent: the turn failed, and the next
+/// step is the user's.
+const malformed_tool_call_failed_notice = std.fmt.comptimePrint(
+    "The model's tool call could not be read {d} times in a row (provider reason: {s}). {s}",
+    .{ malformed_tool_call_max_feedbacks + 1, types.malformed_function_call_reason, empty_reply_follow_up },
+);
 
 /// The tool a malformed reply's call named, when it is one fx knows; a name
 /// the provider made up stays out of the feedback.
@@ -190,11 +210,11 @@ test "malformed tool call feedback names the tool, then asks for smaller calls" 
     );
     try std.testing.expectEqualStrings(
         "The model's tool call could not be read (provider reason: MALFORMED_FUNCTION_CALL). Asking it to try again.",
-        try malformedToolCallNotice(arena, false),
+        malformed_tool_call_retry_notice,
     );
     try std.testing.expectEqualStrings(
         "The model's tool call could not be read 3 times in a row (provider reason: MALFORMED_FUNCTION_CALL). Continue with a follow-up prompt if needed.",
-        try malformedToolCallNotice(arena, true),
+        malformed_tool_call_failed_notice,
     );
 }
 
@@ -221,7 +241,11 @@ fn appendContinuationPrompt(
 }
 
 const ignored_effort_notice =
-    "Effort {s} is not available for {s}, so it is not sent. To offer it, add it to the model's reasoning_efforts in settings.json.";
+    "Effort {s} is not available for {s}, so it is not sent.";
+/// Only a custom connection offers a level through its settings, so only its
+/// notice says where to add one.
+const custom_effort_hint =
+    " To offer it, add it to the model's reasoning_efforts in settings.json.";
 
 fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
     const prefix = empty_length_limited_reply ++ " Retrying with";
@@ -2980,6 +3004,96 @@ fn preparedCallApplicableTargetsFresh(
     };
 }
 
+const LateTargetResolution = enum {
+    may_run,
+    scoped_instructions_pending,
+    stale,
+};
+
+const NotExecutedReason = struct {
+    result_kind: []const u8,
+    model_output: []const u8,
+};
+
+fn lateTargetNotExecutedReason(resolution: LateTargetResolution) ?NotExecutedReason {
+    return switch (resolution) {
+        .may_run => null,
+        .scoped_instructions_pending => .{
+            .result_kind = "scoped_instructions_pending",
+            .model_output = types.scoped_instructions_pending_tool_result_output,
+        },
+        .stale => .{
+            .result_kind = "applicable_targets_changed",
+            .model_output = types.deferred_tool_result_output,
+        },
+    };
+}
+
+/// A target that did not exist when the step was prepared and that brings no
+/// new scoped instructions is safe to run, so a read after an earlier write in
+/// the same step is not skipped (test "same-batch read of a file an earlier
+/// call created runs when no scoped instructions apply" in
+/// src/core/agent/runtime/tests/tool_flow.zig). Returns `.may_run` only when
+/// the call prepared as `.legacy_target_resolution` resolves now and the
+/// registry has nothing new to deliver for it, and
+/// `.scoped_instructions_pending` when it resolves but the registry would
+/// deliver new rules, which only a reissue loads. The call keeps its legacy
+/// preparation, so execution still classifies it.
+fn lateTargetResolution(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    context_delivery_state: *const context_contract.DeliveryState,
+    step_ctx: TraceContext,
+    tool_call: ToolCall,
+    maybe_preparation: ?tool_preparation.Result,
+) !LateTargetResolution {
+    const context_registry = deps.context_registry orelse return .stale;
+    const preparation = maybe_preparation orelse return .stale;
+    const stale_candidate = switch (preparation) {
+        .terminal => return .stale,
+        .candidate => |*candidate| candidate,
+    };
+    const late_targets = (try tool_preparation.lateResolvedApplicableTargets(
+        arena,
+        tool_call,
+        deps.tool_registry,
+        config.workspace_root,
+        config.access_scope,
+        stale_candidate,
+    )) orelse return .stale;
+    // The probe is only a question to the registry.
+    var resolved_candidate: tool_preparation.Candidate = .{
+        .kind = .registered,
+        .applicable_targets = late_targets,
+    };
+    defer resolved_candidate.deinit(arena);
+    if (try candidateHasApplicableContextDelta(
+        arena,
+        context_registry,
+        config,
+        context_delivery_state,
+        resolved_candidate,
+    )) {
+        debug_trace.eventf(
+            "tool",
+            "applicable_targets_resolved_with_scope",
+            step_ctx,
+            "call_id={s} name={s} targets={d}",
+            .{ tool_call.id, tool_call.name, late_targets.len },
+        );
+        return .scoped_instructions_pending;
+    }
+    debug_trace.eventf(
+        "tool",
+        "applicable_targets_resolved",
+        step_ctx,
+        "call_id={s} name={s} targets={d}",
+        .{ tool_call.id, tool_call.name, late_targets.len },
+    );
+    return .may_run;
+}
+
 fn parallelApplicableTargetsFresh(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
@@ -3238,6 +3352,7 @@ fn appendNotExecutedToolResult(
     completed_tool_names: *std.ArrayList([]u8),
     batch: *runtime_tool_batch.StepBatchState,
     result_kind: []const u8,
+    model_output: []const u8,
 ) !void {
     _ = try provisional_statuses.settleAdmittedCall(
         deps,
@@ -3253,7 +3368,7 @@ fn appendNotExecutedToolResult(
         "execution_result",
         step_ctx,
         "call_id={s} name={s} result_kind={s} model_output_bytes={d}",
-        .{ call.id, call.name, result_kind, types.deferred_tool_result_output.len },
+        .{ call.id, call.name, result_kind, model_output.len },
     );
     try runtime_tool_batch.appendToolResultContent(
         arena,
@@ -3261,7 +3376,7 @@ fn appendNotExecutedToolResult(
         completed_tool_names,
         batch,
         call,
-        types.deferred_tool_result_output,
+        model_output,
         null,
         .{
             .increment_total = false,
@@ -3860,7 +3975,7 @@ fn build_provider_prompt_with_response_language_control(
     origin: runtime_config.TurnOrigin,
     enforce_response_language: bool,
     correction_attempted: bool,
-    compaction_handoff: ?[]const u8,
+    compaction_handoff: ?ChatMessage,
     compaction_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !ProviderPromptProjection {
@@ -3915,7 +4030,7 @@ test "compacted request keeps the pending user prompt after the handoff" {
         .subagent,
         false,
         false,
-        "handoff",
+        .{ .role = .user, .content = "handoff", .context_origin = .handoff },
         &.{.{ .role = .assistant, .content = "retained tail" }},
         1,
     );
@@ -4189,6 +4304,32 @@ fn checkpointToolState(
         // reconciles instead of searching again.
         .repeatable, .uncertain => .uncertain,
     };
+}
+
+/// Saves the turn's user message through `append_turn_piece` before its
+/// start capture (D98). A resumed turn is already on disk, so callers skip
+/// it. A failed write is traced and left to the turn's later writes, which
+/// write every piece the session lacks, and never fails the turn.
+fn persistPromptBeforeCapture(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+) void {
+    const append = deps.append_turn_piece orelse return;
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer mem_utils.deinit_arena(scratch);
+    const arena = scratch.allocator();
+    const saved = saved: {
+        const execution = runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages) catch |err| break :saved err;
+        const projected = finalization.persistedExecution(arena, execution) catch |err| break :saved err;
+        append(deps.ctx, .{
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
+            .execution = projected,
+        }) catch |err| break :saved err;
+        return;
+    };
+    debug_trace.logf("session", "event=prompt_before_capture_unsaved err={s}", .{@errorName(saved)});
 }
 
 /// Hands the model's tool calls to `append_turn_piece` before any of them
@@ -4980,8 +5121,7 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
     // A saved login's slug is not checked when it loads, so only a valid team
     // name reaches the terminal.
     const message = if (types.displayGatewayTeam(job.gateway_team_label, job.gateway_team)) |team|
-        try std.fmt.allocPrint(
-            arena,
+        try arena.print(
             "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
             .{team},
         )
@@ -5635,6 +5775,31 @@ fn loadJobCredential(
 ) !?RefreshedGatewayCredential {
     return credential_renewal.load(deps, alloc, jobSignIn(job), mode, rejected_token, trace_ctx);
 }
+
+/// A request that waits for a sign-in asks the host about once a second for a
+/// stored login other than the one the provider refused: another fx process
+/// that signs in saves one, and the request then resends with it instead of
+/// waiting for its own sign-in or its next try (`tests/e2e/tui-auth-source-selection.test.ts`
+/// "a sign-in finished in one session continues another session waiting for it").
+const StoredSignInWatch = struct {
+    deps: *const AgentRuntimeDeps,
+    sign_in: credential_renewal.SignIn,
+    /// The caller's own copy: a host can free its key while it loads.
+    rejected: []const u8,
+    trace_ctx: TraceContext,
+
+    fn renewed(raw: *anyopaque) bool {
+        const self: *StoredSignInWatch = @ptrCast(@alignCast(raw));
+        const stored = credential_renewal.load(self.deps, std.heap.c_allocator, self.sign_in, .stored, self.rejected, self.trace_ctx) catch |err| {
+            debug_trace.eventf("gateway", "stored_sign_in_check_failed", self.trace_ctx, "err={s}", .{@errorName(err)});
+            return false;
+        };
+        const credential = stored orelse return false;
+        credential_renewal.free(std.heap.c_allocator, credential);
+        debug_trace.eventf("gateway", "stored_sign_in_found", self.trace_ctx, "source={s}", .{if (self.sign_in.source) |source| @tagName(source) else "none"});
+        return true;
+    }
+};
 
 fn jobSignIn(job: QueuedPrompt) credential_renewal.SignIn {
     return .{ .source = job.credential_source, .account_id = job.account_id };
@@ -6698,6 +6863,23 @@ fn processQueuedPromptInner(
             job.images = images;
         }
     }
+    // The repository as the turn found it, before any tool (D98). The
+    // prompt reaches the session first, so a process killed during the
+    // capture keeps it; the capture then runs beside the first request, and
+    // `executeToolCall` waits for it before any tool acts.
+    if (deps.start_workspace_capture) |start| {
+        const fresh = !job.delivery.isSteering();
+        start(deps.ctx, fresh, .begin);
+        if (fresh and !resumed_request and job.recovery_checkpoint == null) {
+            persistPromptBeforeCapture(deps, finalization, job, within_turn_suffix.items);
+        }
+        start(deps.ctx, fresh, .capture);
+    }
+    // The turn owns the start capture's task: however it ends, failed or
+    // paused before any tool and before any end capture included, the
+    // capture is saved before the turn returns, never after its session
+    // closes.
+    defer if (deps.start_workspace_capture) |start| start(deps.ctx, false, .settle);
 
     const current_user_message: ChatMessage = .{
         .role = .user,
@@ -7189,7 +7371,7 @@ fn buildProviderPromptForCompactionWindow(
     durable_history: []const ChatMessage,
     current_user_message: ChatMessage,
     within_turn_suffix: []const ChatMessage,
-    handoff: ?[]const u8,
+    handoff: ?ChatMessage,
     retained_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !runtime_prompt_context.ProviderPrompt {
@@ -7203,10 +7385,7 @@ fn buildProviderPromptForCompactionWindow(
     );
     var compacted_history: std.ArrayList(ChatMessage) = .empty;
     defer compacted_history.deinit(alloc);
-    try compacted_history.append(alloc, .{
-        .role = .user,
-        .content = handoff.?,
-    });
+    try compacted_history.append(alloc, handoff.?);
     try compacted_history.appendSlice(alloc, retained_history_tail);
     return runtime_prompt_context.buildProviderPrompt(
         alloc,
@@ -7216,6 +7395,14 @@ fn buildProviderPromptForCompactionWindow(
         current_user_message,
         within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
     );
+}
+
+/// The runtime context's texts, which a provider's compaction block keeps
+/// (`compactor.Request.runtime_context`).
+fn runtimeContextTexts(arena: Allocator, messages: []const ChatMessage) Allocator.Error![]const []const u8 {
+    const texts = try arena.alloc([]const u8, messages.len);
+    for (messages, texts) |message, *text| text.* = message.content orelse "";
+    return texts;
 }
 
 fn commitContextCompaction(
@@ -7376,7 +7563,21 @@ const CompactionProgress = struct {
     before_summary: ?BeforeSummary,
 
     fn interface(self: *CompactionProgress) compactor.Progress {
-        return .{ .context = self, .report_fn = report };
+        return .{ .context = self, .report_fn = report, .written_fn = written, .asked_fn = asked };
+    }
+
+    fn asked(context: *anyopaque) void {
+        const self: *CompactionProgress = @ptrCast(@alignCast(context));
+        const id = self.operation_id orelse return;
+        const effect = self.deps.compaction_activity orelse return;
+        if (effect.asked) |ask| ask(self.deps.ctx, id);
+    }
+
+    fn written(context: *anyopaque, percent: u8) void {
+        const self: *CompactionProgress = @ptrCast(@alignCast(context));
+        const id = self.operation_id orelse return;
+        const effect = self.deps.compaction_activity orelse return;
+        if (effect.written) |write| write(self.deps.ctx, id, percent);
     }
 
     fn report(context: *anyopaque, step: compactor.Step) anyerror!void {
@@ -7644,6 +7845,9 @@ test "compaction activity transaction settles only after publication and preserv
         fn running(raw: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
             from(raw).worker.runCompactionActivity(id, stage);
         }
+        fn asked(raw: *anyopaque, id: compaction_activity.OperationId) void {
+            from(raw).worker.askedCompactionActivity(id);
+        }
         fn settle(raw: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
             const self = from(raw);
             if (feedback.outcome == .succeeded) std.debug.assert(self.acknowledged);
@@ -7660,6 +7864,9 @@ test "compaction activity transaction settles only after publication and preserv
         fn stream(raw: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try std.testing.expectEqual(compaction_activity.Stage.summary, self.worker.compactionActivitySnapshot().operation.?.phase.running);
+            // The request was announced before it was sent, so the row
+            // counts its wait.
+            try std.testing.expect(self.worker.compactionActivitySnapshot().operation.?.progress.waiting);
             if (self.provider_error) |err| return err;
             try request.admission.admit();
             request.delivery.markPossiblySent();
@@ -7691,7 +7898,7 @@ test "compaction activity transaction settles only after publication and preserv
         deps.agent_stream_provider = gateway.provider();
         deps.agent_stream_provider.context = &host;
         deps.agent_stream_provider.stream_fn = Host.stream;
-        deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle };
+        deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle, .asked = Host.asked };
         deps.commit_context_compaction = .{ .commit = Host.commit };
         deps.push_interactive_notice = null;
         var tmp = std.testing.tmpDir(.{});
@@ -7830,7 +8037,7 @@ fn processQueuedPromptLoop(
     var identical_failure_escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
     defer identical_failure_escalation.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
-    var active_compaction_handoff: ?[]const u8 = null;
+    var active_compaction_handoff: ?ChatMessage = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
     // The provider's count of the first request after a compaction is traced,
     // so its size can be checked against the room compaction had.
@@ -8494,14 +8701,28 @@ fn processQueuedPromptLoop(
             provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
             // A custom connection sends an effort level only when the model's
-            // settings declare it. One the person set and the model does not
-            // declare is left out, and the session says so once
+            // settings declare it, and the Gateway only when its catalog lists
+            // it. One the person set and the model does not declare is left
+            // out, and the session says so once
             // (`tests/tla/configured_provider/ConfiguredRequest.tla`
-            // IgnoredEffortNoticed, NoticeOncePerSession).
-            if (job.provider == .configured and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
+            // IgnoredEffortNoticed, NoticeOncePerSession). A Gateway catalog
+            // that failed cannot say what it lists, so its drop stays quiet
+            // (`deps.zig` model_catalog_failure).
+            const effort_catalog_known = job.provider == .configured or
+                (job.provider == .gateway and deps.model_catalog_failure != null and request_catalog_failure == null);
+            if (effort_catalog_known and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
                 ignored_effort_notified = true;
                 if (deps.push_session_notice) |push| {
-                    try push(deps.ctx, try overlay_arena.print(ignored_effort_notice, .{ step_effort.label(), gateway_model }));
+                    // The model name comes from the command line, so it shows its
+                    // control bytes as escapes, as other terminal lines do (RULES.md R4.6).
+                    const shown_effort = try overlay_arena.print("{f}", .{text_utils.terminalSafe(step_effort.label())});
+                    const shown_model = try overlay_arena.print("{f}", .{text_utils.terminalSafe(gateway_model)});
+                    const sentence = try overlay_arena.print(ignored_effort_notice, .{ shown_effort, shown_model });
+                    const notice = if (job.provider == .configured)
+                        try overlay_arena.print("{s}{s}", .{ sentence, custom_effort_hint })
+                    else
+                        sentence;
+                    try push(deps.ctx, notice);
                 }
             }
             // Fast drops silently when the catalog cannot confirm support.
@@ -8543,6 +8764,7 @@ fn processQueuedPromptLoop(
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
                 .messages = request_messages,
+                .current_turn_messages = within_turn_suffix.items,
                 .tools = .{
                     .registry = deps.tool_registry,
                     .advertised_names = config.advertised_tool_names,
@@ -8633,7 +8855,7 @@ fn processQueuedPromptLoop(
                 if (just_rebuilt_request) compactor.traceLog(false, "request after compaction estimated_tokens={d} fixed_tokens={any} usable_tokens={any} after_tokens={d}", .{ request_cost.estimated_input_tokens, size.fixed_tokens, size.usable_tokens, size.afterTokens() });
                 const usable_tokens = size.usable_tokens;
                 const compact_at_tokens = size.compact_at_tokens;
-                const wants_compaction = has_new_compactable_context and (overflow_pending or size.due());
+                const wants_compaction = has_new_compactable_context and (overflow_pending or size.due() or agent.compaction_requested);
                 compactor.traceEventIf(
                     wants_compaction,
                     step_ctx,
@@ -8664,6 +8886,7 @@ fn processQueuedPromptLoop(
                         return error.ContextCapacityExceeded;
                     };
                 } else {
+                    agent.compaction_requested = false;
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
                         .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
@@ -8709,6 +8932,7 @@ fn processQueuedPromptLoop(
                     };
                     defer summary_model.deinit();
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
+                    const compaction_started_ms = io_mod.milliTimestamp();
                     const compaction_result = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
                         .failure_provenance = &compaction_failure,
@@ -8722,8 +8946,12 @@ fn processQueuedPromptLoop(
                             .records = if (config.session_child_capability) |capability| result_store.compactorStore(capability) else null,
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
+                            .runtime_context = try runtimeContextTexts(arena, runtime_context.messages()),
                         },
                     });
+                    // The turn's duration leaves out the compaction, as its
+                    // live clock does.
+                    summary_accumulator.addCompaction(compaction_started_ms, io_mod.milliTimestamp());
                     // A summary request the provider rejected with 401 renewed
                     // the sign-in; the rest of the turn sends the renewed one.
                     // Taken first: renewing can free the credential the turn
@@ -8766,15 +8994,18 @@ fn processQueuedPromptLoop(
                         } else .{};
                         compacted_suffix_len += try runtime_execution_memory.retainedMessageOffset(within_turn_suffix.items[compacted_suffix_len..], active_cut);
                         explicit_note_index = try keepExplicitSkillNote(arena, &within_turn_suffix, skills.explicit, explicit_note_index, compacted_suffix_len);
-                        var retained_messages: std.ArrayList(ChatMessage) = .empty;
-                        try session_runtime.appendHistoryChatMessages(arena, &retained_messages, outcome.retained_history);
-                        try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, retained_messages.items);
-                        active_compaction_handoff = outcome.model_text;
-                        trace_count_after_compaction = true;
-                        active_compaction_history_tail = retained_messages.items;
                         const next_history = try arena.alloc(HistoryTurn, outcome.retained_history.len + 1);
                         next_history[0] = .{ .compacted_summary = outcome.checkpoint };
                         @memcpy(next_history[1..], outcome.retained_history);
+                        // The rest of the turn sends the checkpoint as every
+                        // later turn will: a provider's block to the model that
+                        // wrote it, fx's text otherwise, then the kept turns.
+                        var compacted_messages: std.ArrayList(ChatMessage) = .empty;
+                        try session_runtime.appendHistoryChatMessages(arena, &compacted_messages, next_history);
+                        try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, compacted_messages.items);
+                        active_compaction_handoff = compacted_messages.items[0];
+                        trace_count_after_compaction = true;
+                        active_compaction_history_tail = compacted_messages.items[1..];
                         compaction_history = next_history;
                         finalization.compacted_execution = .{
                             .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
@@ -8883,6 +9114,7 @@ fn processQueuedPromptLoop(
                 .retry_count = config.gateway_retry_count,
                 .instructions = request_data.instructions,
                 .messages = request_data.messages,
+                .current_turn_messages = request_data.current_turn_messages,
                 .tools = request_data.tools,
                 .tool_choice = request_data.tool_choice,
                 .vision_mode = request_data.vision_mode,
@@ -9482,6 +9714,14 @@ fn processQueuedPromptLoop(
                         http_failure_notice_shown = true;
                         if (kind == .sign_in) auth_reason_shown = true;
                     }
+                    var stored_sign_in: StoredSignInWatch = undefined;
+                    const watched_rejected = if (kind == .sign_in) try std.heap.c_allocator.dupe(u8, active_api_key) else null;
+                    defer if (watched_rejected) |token| secret.zeroAndFree(std.heap.c_allocator, token);
+                    if (watched_rejected) |token| {
+                        stored_sign_in = .{ .deps = deps, .sign_in = jobSignIn(job), .rejected = token, .trace_ctx = step_ctx };
+                        request_recovery.sign_in_renewed = .{ .ctx = &stored_sign_in, .check = StoredSignInWatch.renewed };
+                    }
+                    defer request_recovery.sign_in_renewed = null;
                     switch (try waitForUser(&request_recovery, deps, kind)) {
                         .resend => {
                             stream_result.deinit(arena);
@@ -9631,6 +9871,7 @@ fn processQueuedPromptLoop(
             }
 
             try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+            try runtime_assistant_stream.finishAssistantTail(&stream_ctx);
 
             const partial_assistant = if (attempt_disposition == .completed)
                 stream_ctx.accepted_source_or(attempt_completion.content orelse "")
@@ -9646,8 +9887,9 @@ fn processQueuedPromptLoop(
                     attempt_disposition == .provider_failure))
             {
                 // A response cut short or ended by a provider error waits and
-                // resends through the recovery module. Content-filter and
-                // non-retryable endings keep their terminal path below.
+                // resends through the recovery module, and so does a content
+                // filter's block until the module needs the user. Endings it
+                // does not resend keep their terminal path below.
                 const finish_reason = attempt_completion.finish_reason;
                 const failure_cause = attempt_completion.provider_failure_cause;
                 const content_filtered = attempt_disposition == .provider_failure and
@@ -9666,25 +9908,31 @@ fn processQueuedPromptLoop(
                     if (content_filtered) "content_filter" else types.ModelFailureDiagnostic.defaultTextForCause(cause),
                 );
                 attempt_failure_diagnostic = diagnostic;
-                // A content filter waits for the user on a host that can ask,
-                // and ends the turn elsewhere, as other non-retryable endings do.
+                // The module resends a content filter's block at once a few
+                // times. Then a host that can ask waits for the user, and
+                // elsewhere the turn ends as other non-retryable endings do.
                 const failure_kind: ?runtime_request_recovery.Failure.Kind = if (content_filtered)
-                    (if (request_recovery.canAskUser()) .content_filter else null)
+                    .content_filter
                 else if (failure_cause == .non_retryable)
                     null
                 else
                     runtime_request_recovery.failureKind(cause);
                 const retryable = failure_kind != null and !config.cancel_flag.load(.seq_cst);
                 const retries = retryable;
-                if (attempt_disposition == .provider_failure or
-                    failure_cause == .gateway_stream_timeout)
+                // The send that failed, for its trace.
+                const failed_attempt = request_recovery.attempt();
+                // A block's trace waits for the module's answer below, so
+                // its `retry` says whether the module resends it.
+                if ((attempt_disposition == .provider_failure or
+                    failure_cause == .gateway_stream_timeout) and
+                    !(content_filtered and retries))
                 {
                     traceRouteFailure(
                         step_ctx,
                         job.model,
                         gateway_model,
                         attempt_fast_mode,
-                        request_recovery.attempt(),
+                        failed_attempt,
                         attempt_completion,
                         &stream_ctx,
                         retries,
@@ -9758,12 +10006,12 @@ fn processQueuedPromptLoop(
                                 &summary_accumulator,
                                 stop_state,
                                 &finish_trace,
-                                try malformedToolCallNotice(arena, true),
+                                malformed_tool_call_failed_notice,
                                 "malformed_tool_call",
                             );
                             return;
                         }
-                        try deps.push_text(deps.ctx, .{ .operational = try malformedToolCallNotice(arena, false) });
+                        try deps.push_text(deps.ctx, .{ .operational = malformed_tool_call_retry_notice });
                         try deps.push_text(deps.ctx, .{ .operational = "\n" });
                         // The feedback stays in the turn, so a later request
                         // in it still explains the earlier stall.
@@ -9779,7 +10027,7 @@ fn processQueuedPromptLoop(
                         continue;
                     }
                 }
-                if (retries) {
+                if (retries) retry: {
                     const failure_tool_evidence = settledAttemptToolEvidence(
                         deps.tool_registry,
                         preserved_tool_evidence,
@@ -9787,8 +10035,31 @@ fn processQueuedPromptLoop(
                         attempt_disposition,
                         &stream_ctx,
                     );
-                    _ = try request_recovery.failed(.{ .kind = failure_kind.? });
-                    if (try request_recovery.waitForSend() != null) {
+                    // Only a content filter's block gets a send back at once;
+                    // every other failure here waits.
+                    const resend_now = try request_recovery.failed(.{ .kind = failure_kind.? }) != null;
+                    if (content_filtered) traceRouteFailure(
+                        step_ctx,
+                        job.model,
+                        gateway_model,
+                        attempt_fast_mode,
+                        failed_attempt,
+                        attempt_completion,
+                        &stream_ctx,
+                        resend_now,
+                    );
+                    if (resend_now) {
+                        debug_trace.eventf("agent", "content_filter_resend", step_ctx, "attempt={d} model={s}", .{
+                            request_recovery.attempt(),
+                            gateway_model,
+                        });
+                    }
+                    // Past its resends, the module needs the user. A host
+                    // that can ask waits for them below; on one that cannot,
+                    // the turn ends on the content-filter error further
+                    // down, as it did before the resends.
+                    if (content_filtered and !resend_now and !request_recovery.canAskUser()) break :retry;
+                    if (resend_now or try request_recovery.waitForSend() != null) {
                         preserved_tool_evidence = failure_tool_evidence;
                         recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
                         recovery_cause = cause;
@@ -10164,10 +10435,13 @@ fn processQueuedPromptLoop(
         }
         if (disposition == .completed) try stream_ctx.start_response();
         var step_has_visible_tool_calls = false;
+        var step_asked_question = false;
         for (completion.tool_calls) |call| {
-            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) continue;
-            step_has_visible_tool_calls = true;
-            break;
+            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) {
+                step_asked_question = true;
+            } else {
+                step_has_visible_tool_calls = true;
+            }
         }
         const step_has_visible_text =
             stream_ctx.saw_visible_text or
@@ -10184,6 +10458,9 @@ fn processQueuedPromptLoop(
                     .has_visible_text = step_has_visible_text,
                     .saw_tool_start = stream_ctx.saw_tool_start,
                     .saw_visible_text_after_tool_start = stream_ctx.saw_visible_text_after_tool_start,
+                    // A length-limited reply's calls never run: they are
+                    // dropped for a resend or blocked below.
+                    .asked_question = step_asked_question and disposition == .completed,
                 },
             );
         stream_ctx.provisional_statuses.presentation_group_id =
@@ -10194,13 +10471,14 @@ fn processQueuedPromptLoop(
             "agent",
             "tool_presentation_group",
             step_ctx,
-            "anchor_step_id={d} visible_tool_calls={s} saw_tool_start={s} visible_text={s} saw_visible_text_after_tool_start={s}",
+            "anchor_step_id={d} visible_tool_calls={s} saw_tool_start={s} visible_text={s} saw_visible_text_after_tool_start={s} asked_question={s}",
             .{
                 if (active_presentation_group_id) |group| group.anchor_step_id else 0,
                 if (step_has_visible_tool_calls) "true" else "false",
                 if (stream_ctx.saw_tool_start) "true" else "false",
                 if (step_has_visible_text) "true" else "false",
                 if (stream_ctx.saw_visible_text_after_tool_start) "true" else "false",
+                if (step_asked_question) "true" else "false",
             },
         );
 
@@ -10360,6 +10638,11 @@ fn processQueuedPromptLoop(
             const history_text = try arena.dupe(u8, raw_final);
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
+            // After the nudge the check below has closed the turn to mail, so a
+            // second empty reply waits for nothing.
+            if (empty_other and !empty_reply_nudged and !lifecycle.view.hasStop() and agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+                awaitHandoffMail(deps, turn_id, step_ctx);
+            }
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {
@@ -11117,7 +11400,7 @@ fn processQueuedPromptLoop(
                         parallel_call.id,
                         parallel_review_attempt_available,
                     );
-                    if (parallel_preserved_review_hold != null) {
+                    if (parallel_preserved_review_hold) |hold| {
                         debug_trace.eventf(
                             "permission",
                             "turn_permission_denial_preserved",
@@ -11125,6 +11408,7 @@ fn processQueuedPromptLoop(
                             "call_id={s} tool_name={s}",
                             .{ parallel_call.id, parallel_call.name },
                         );
+                        tooling_tool_admission.recordReusedReviewHold(parallel_call, hold, config.origin == .subagent);
                     }
                     const maybe_parallel_permission: ?command_admission.PermissionOutcome = if (parallel_preserved_review_hold) |outcome|
                         outcome
@@ -11937,7 +12221,29 @@ fn processQueuedPromptLoop(
                 }
             else
                 true;
-            if (!applicable_targets_fresh) {
+            const late_resolution: LateTargetResolution = if (applicable_targets_fresh)
+                .may_run
+            else
+                lateTargetResolution(
+                    arena,
+                    deps,
+                    config,
+                    &context_delivery_state,
+                    step_ctx,
+                    tool_call,
+                    preparation_batch.preparations[tool_call_index],
+                ) catch |err| {
+                    return settleFailedContextGate(
+                        deps,
+                        &stream_ctx.provisional_statuses,
+                        stream_ctx.alloc,
+                        turn_id,
+                        effective_tool_calls[tool_call_index..],
+                        advertised_dynamic_tool_names,
+                        err,
+                    );
+                };
+            if (lateTargetNotExecutedReason(late_resolution)) |not_executed| {
                 try appendNotExecutedToolResult(
                     deps,
                     &stream_ctx.provisional_statuses,
@@ -11950,7 +12256,8 @@ fn processQueuedPromptLoop(
                     &within_turn_suffix,
                     &completed_tool_names,
                     &step_batch,
-                    "applicable_targets_changed",
+                    not_executed.result_kind,
+                    not_executed.model_output,
                 );
                 continue;
             }
@@ -12020,6 +12327,7 @@ fn processQueuedPromptLoop(
                             "live_authority_denied"
                         else
                             "live_authority_unavailable",
+                        types.deferred_tool_result_output,
                     );
                     continue;
                 }
@@ -12101,6 +12409,10 @@ fn processQueuedPromptLoop(
                     "call_id={s} tool_name={s}",
                     .{ tool_call.id, tool_call.name },
                 );
+            }
+            // The review hold decides the call only when nothing before it does.
+            if (live_target_failure == null and preserved_denial == null) {
+                if (preserved_review_hold) |hold| tooling_tool_admission.recordReusedReviewHold(execution_call, hold, config.origin == .subagent);
             }
             const maybe_permission: ?command_admission.PermissionOutcome = if (live_target_failure) |failure|
                 .{ .tool_failure = failure }
@@ -12482,7 +12794,12 @@ fn processQueuedPromptLoop(
                 );
             }
 
-            if (decision == .always and live_authority == null) {
+            // An "always" answer keeps its grants whoever asked. A subagent's
+            // live authority reads its instance's grants at every call, so the
+            // grants kept here are what its next call, its siblings, and main
+            // find (`src/core/agent/runtime/tests/tool_flow.zig`, "a subagent's
+            // always approval of a command stores the session grant").
+            if (decision == .always) {
                 if (execution_authority == .file_mutation) {
                     const offer = execution_authority.file_mutation.grant_offer orelse
                         return error.MissingToolExecutionAuthority;
@@ -12685,6 +13002,13 @@ fn processQueuedPromptLoop(
                     try deps.push_command_output_complete(deps.ctx, execution_lifecycle_id);
                 }
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
+                // A wait has no result to name whom it waited for, so the turn
+                // keeps the names its row showed (D102).
+                const cancelled_wait: ?types.CancelledWaitPresentation = if (!execution_is_command and
+                    try tooling_presentation.subagentRoster(arena, identity_call) == .working)
+                    .{ .waited_for = tool_display_target }
+                else
+                    null;
                 const persist_error = if (execution_is_command)
                     runtime_interruption.persistInterruptedCommandTurnOnce(
                         deps,
@@ -12699,6 +13023,21 @@ fn processQueuedPromptLoop(
                         stop_state.retained_candidate,
                         &stop_state.terminal_materializing,
                         cancelled_command,
+                    )
+                else if (cancelled_wait) |wait|
+                    runtime_interruption.persistInterruptedWaitTurnOnce(
+                        deps,
+                        finalization,
+                        job,
+                        partial_assistant,
+                        identity_call,
+                        completed_tool_names.items,
+                        &interrupted_persisted,
+                        step_ctx,
+                        within_turn_suffix.items,
+                        stop_state.retained_candidate,
+                        &stop_state.terminal_materializing,
+                        wait,
                     )
                 else
                     runtime_interruption.persistInterruptedTurnOnce(

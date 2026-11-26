@@ -241,6 +241,15 @@ pub const ResumeProjection = struct {
         );
     }
 
+    pub fn attachSubagentReportDetail(
+        self: *ResumeProjection,
+        entry_id: u32,
+        call: types.ToolCall,
+        result: types.PersistedToolResult,
+    ) !void {
+        try self.runtime.attachSubagentReportDetail(self.alloc, entry_id, call, result);
+    }
+
     pub fn setHistoricalToolCommandMetadata(
         self: *ResumeProjection,
         entry_id: u32,
@@ -289,6 +298,19 @@ pub const ResumeProjection = struct {
         );
     }
 
+    pub fn attachHistoricalBridgeCall(
+        self: *ResumeProjection,
+        entry_id: u32,
+        tool: []const u8,
+        outcome: types.ToolOutcomeKind,
+    ) !void {
+        try self.runtime.attachHistoricalBridgeCall(self.alloc, entry_id, tool, outcome);
+    }
+
+    pub fn attachHistoricalMcpToolName(self: *ResumeProjection, entry_id: u32, name: types.McpToolName) !void {
+        try self.runtime.attachHistoricalMcpToolName(self.alloc, entry_id, name);
+    }
+
     pub fn attachHistoricalToolCallWithoutResult(
         self: *ResumeProjection,
         entry_id: u32,
@@ -322,6 +344,15 @@ pub const ResumeProjection = struct {
             command_artifact_handle,
             replayed_output,
         );
+    }
+
+    pub fn attachHistoricalCancelledCallDetail(
+        self: *ResumeProjection,
+        entry_id: u32,
+        call: types.ToolCall,
+        activity_kind: types.ToolActivityKind,
+    ) !void {
+        try self.runtime.attachHistoricalCancelledCallDetail(self.alloc, entry_id, call, activity_kind);
     }
 
     pub fn appendDiff(self: *ResumeProjection, payload: diff.DiffEntryPayload) !void {

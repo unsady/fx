@@ -122,7 +122,7 @@ pub const Options = struct {
     cwd: ?[]const u8 = null,
     config: core.Config = .{},
     /// The longest stdout line; a longer one is a connection error.
-    max_line: usize = 16 * 1024 * 1024,
+    max_line: usize = @import("limits.zig").max_message_bytes,
     /// The longest stderr line kept for logs; the rest of that line is dropped.
     max_stderr_line: usize = 8 * 1024,
     /// How often the exit watcher checks on the process.
@@ -1287,21 +1287,33 @@ fn openDescriptors() usize {
     return n;
 }
 
+/// Starts a server where only `limit` tasks can run, and checks that the
+/// start fails because a task can't run.
+fn startWithTaskLimit(limit: usize) !void {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .concurrent_limit = .limited(limit) });
+    defer threaded.deinit();
+    // `cat` keeps stdout and stderr open until its stdin closes, so no task
+    // the start runs can end and free its place for the next one. A server
+    // that closes stdout at once ends the stdout reader early, and on a busy
+    // machine every task then runs.
+    const argv = shell("exec cat");
+    var p: Process = undefined;
+    p.init(threaded.io(), testing.allocator, .{ .argv = &argv, .config = test_config, .poll_ms = 5, .max_line = 64 });
+    // Before `threaded.deinit`, which waits for every task: a failed check
+    // must still stop the server, or its readers never end.
+    defer p.deinit();
+    // The backoff timer after the failed spawn can't run either.
+    p.start() catch |err| try testing.expectEqual(error.ConcurrencyUnavailable, err);
+    try testing.expectEqual(@as(?SpawnError, error.ConcurrencyUnavailable), p.spawn_error);
+}
+
 test "a start whose tasks can't all run closes each of the server's pipes once" {
     helper.start(testing.io);
     // One, two, then three tasks run: the stdout reader, then the stderr
     // reader, then the exit watcher can't start.
     for ([_]usize{ 1, 2, 3 }) |limit| {
-        var threaded: std.Io.Threaded = .init(testing.allocator, .{ .concurrent_limit = .limited(limit) });
-        defer threaded.deinit();
         const before = openDescriptors();
-        const argv = shell("exec cat >/dev/null");
-        var p: Process = undefined;
-        p.init(threaded.io(), testing.allocator, .{ .argv = &argv, .config = test_config, .poll_ms = 5, .max_line = 64 });
-        // The backoff timer after the failed spawn can't run either.
-        p.start() catch |err| try testing.expectEqual(error.ConcurrencyUnavailable, err);
-        try testing.expectEqual(@as(?SpawnError, error.ConcurrencyUnavailable), p.spawn_error);
-        p.deinit();
+        try startWithTaskLimit(limit);
         // A pipe closed twice would have hit unreachable; one never closed leaks.
         try testing.expectEqual(before, openDescriptors());
     }

@@ -262,6 +262,9 @@ pub const StartupState = struct {
     /// Resolved `cache_warming` preference.
     cache_warming: bool = true,
     notification_turn_end: bool = false,
+    /// `experimental.workspace_capture`: capture the repository at each
+    /// turn's start and end.
+    workspace_capture: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
@@ -944,6 +947,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;
     const max_override: ?bool = if (sound_override) |level| level == .max else null;
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
+    state.workspace_capture = settings.experimental_workspace_capture orelse false;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
 }
@@ -1257,15 +1261,46 @@ fn writeLastShutdownReportInner(alloc: Allocator, trace: *const ShutdownStageTra
     );
 }
 
-/// Reads the persisted shutdown breakdown for the /trace report. Returns the
-/// owned file contents; caller frees. Missing or unreadable file is null.
-pub fn readLastShutdownReport(alloc: Allocator) ?[]u8 {
-    const home = io_mod.homeDir() orelse return null;
-    const path = profile_paths.lastShutdownReportPath(alloc, home) catch return null;
+/// Reads the persisted shutdown breakdown for the /trace report. A home folder
+/// that is not known reads as missing; the bytes are allocated in `alloc`.
+pub fn readLastShutdownReport(alloc: Allocator) io_mod.FileRead {
+    const home = io_mod.homeDir() orelse return .missing;
+    const path = profile_paths.lastShutdownReportPath(alloc, home) catch return .unreadable;
     defer alloc.free(path);
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return null;
-    defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, 64 * 1024) catch null;
+    return readLastShutdownReportAt(alloc, path);
+}
+
+/// The most bytes of the saved shutdown report that the reader reads.
+const last_shutdown_max_bytes = 64 * 1024;
+
+/// Reads the shutdown breakdown at `path`, up to `last_shutdown_max_bytes`.
+fn readLastShutdownReportAt(alloc: Allocator, path: []const u8) io_mod.FileRead {
+    return io_mod.readRegularFile(alloc, path, last_shutdown_max_bytes);
+}
+
+test "last shutdown report read refuses a FIFO at once and reads a regular file" {
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fifo = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, "last-shutdown.json" });
+    const fifo_z = try arena.allocator().allocSentinel(u8, fifo.len, 0);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+    try std.testing.expect(std.meta.activeTag(readLastShutdownReportAt(arena.allocator(), fifo)) == .unreadable);
+
+    const normal_name = "shutdown.json";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = normal_name, .data = "{\"total_ms\":1}" });
+    const normal = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, normal_name });
+    switch (readLastShutdownReportAt(arena.allocator(), normal)) {
+        .bytes => |bytes| try std.testing.expectEqualStrings("{\"total_ms\":1}", bytes),
+        else => return error.TestExpectedBytes,
+    }
 }
 
 test "shutdown stage trace advances monotonically and records stages" {

@@ -53,6 +53,7 @@ pub const ReadOnlyDetail = store_types.ReadOnlyDetail;
 pub const ResumeOptions = store_types.ResumeOptions;
 pub const ResumeTarget = store_types.ResumeTarget;
 pub const SessionRecoveryResult = store_types.SessionRecoveryResult;
+pub const SessionForkResult = store_types.SessionForkResult;
 pub const SessionSummary = store_types.SessionSummary;
 
 fn latestCheckpointHistoryIndex(history: []const session.HistoryTurn) usize {
@@ -592,11 +593,10 @@ pub const Store = struct {
             session_id,
         );
         defer alloc.free(source_dir_path);
-        var source_children = try session_child_store.SessionChildCapability.init(
+        var source_children = try session_child_store.SessionChildCapability.initOlderReadOnly(
             alloc,
             dir.dir,
             source_dir_path,
-            .read_only,
         );
         defer source_children.deinit();
         if (try subagent_child_state.capabilityHasManagedChildMarker(alloc, &source_children)) {

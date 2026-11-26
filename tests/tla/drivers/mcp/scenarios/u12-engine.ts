@@ -16,6 +16,8 @@ const FAKE = join(import.meta.dir, "../fakes/stdio.ts");
 const FAKE_HTTP = join(import.meta.dir, "../fakes/http.ts");
 const WITH_SERVER = join(import.meta.dir, "../with-server.ts");
 const MODERN = "2026-07-28";
+// The engine's default lost_limit (src/mcp/core/engine.zig), as ObsLostLimit.
+const LOST_LIMIT = 2;
 const LEGACY = "2025-11-25";
 
 // ---- fake servers ----
@@ -38,12 +40,12 @@ interface Line {
   did?: { action?: string; expect?: string; met?: boolean; error?: string; line?: string; k?: number };
   allow?: { server: string; tool: string; ok: boolean };
   event?: { tag: string; maybe_ran?: boolean; answer?: string | null; names?: string[]; k?: number };
-  status?: { name: string; phase: string; version: string | null; tools: number; last_error: string | null }[];
+  status?: { name: string; phase: string; version: string | null; tools: number; last_error: string | null; list_refusal: string | null }[];
   final?: { ok: boolean; logged: { name: string; lines: number }[] };
 }
 type Log = { dir: string; line: string }[];
 /** One line of the trace every machine writes. */
-type Step = { machine: string; inst: string; event: string; from: string; to: string; data?: { id?: number; progress?: number; outcome?: string } };
+type Step = { machine: string; inst: string; event: string; from: string; to: string; data?: { id?: number; progress?: number; outcome?: string; ignored?: boolean } };
 type Machine = "engine" | "stdio" | "request" | "era" | "catalog" | "subscription" | "elicitation" | { mrtr: string };
 
 interface EngineCase {
@@ -65,6 +67,12 @@ interface EngineCase {
   control?: { server: string; maxAttempts: number };
   check?: (lines: Line[], logs: { [name: string]: Log }, trace: Step[]) => string | null;
   timeoutMs?: number;
+  /**
+   * What the elicitation trace's model is told about a form the records don't show (ElicitationTrace.tla):
+   * ObsEscaped 1 when a name or choice is written with an escape, ObsFits 1 or 2 when the answer matches the form's strings or not,
+   * and ObsRawCompare 1 for a planted control: the engine's trace is then checked against byte-for-byte matching and must be REJECTED.
+   */
+  elicitation?: { ObsFits?: number; ObsEscaped?: number; ObsRawCompare?: number };
 }
 
 const BASE: Machine[] = ["engine", "stdio", "request", "era"];
@@ -83,13 +91,13 @@ function engineScenario(c: EngineCase): Scenario {
       const remote = `${server}.remote`;
       if (m === "engine") {
         const control = c.control?.server === server ? c.control : undefined;
-        traces.push({ machine: "engine", instance: server, specDir: "tests/tla/mcp", wrapper: "EngineTrace", verdict: control ? "REJECTED" : "ACCEPTED", constants: { ObsMaxAttempts: control?.maxAttempts ?? attempts } });
+        traces.push({ machine: "engine", instance: server, specDir: "tests/tla/mcp", wrapper: "EngineTrace", verdict: control ? "REJECTED" : "ACCEPTED", constants: { ObsMaxAttempts: control?.maxAttempts ?? attempts, ObsLostLimit: LOST_LIMIT } });
       } else if (m === "stdio") traces.push({ machine: "stdio", instance: `${server}.stdio`, specDir: "tests/tla/mcp", wrapper: "StdioConnTrace", verdict: "ACCEPTED", constants: { ObsMaxAttempts: 255 } });
       else if (m === "request") traces.push({ machine: "request", instance: remote, specDir: "tests/tla/mcp", wrapper: "RequestTrace", verdict: "ACCEPTED" });
       else if (m === "era") traces.push({ machine: "era", instance: remote, specDir: "tests/tla/mcp", wrapper: "EraTrace", verdict: "ACCEPTED", constants: { ObsPreferredCount: 1 } });
       else if (m === "catalog") traces.push({ machine: "catalog", instance: remote, specDir: "tests/tla/mcp", wrapper: "CatalogTrace", verdict: "ACCEPTED", constants: { ObsMaxPages: 100 } });
       else if (m === "subscription") traces.push({ machine: "subscription", instance: remote, specDir: "tests/tla/mcp", wrapper: "SubscriptionTrace", verdict: "ACCEPTED", constants: { ObsMaxTries: 8 } });
-      else if (m === "elicitation") traces.push({ machine: "elicitation", instance: remote, specDir: "tests/tla/mcp", wrapper: "ElicitationTrace", verdict: "ACCEPTED", constants: { ObsMaxPending: 16 } });
+      else if (m === "elicitation") traces.push({ machine: "elicitation", instance: remote, specDir: "tests/tla/mcp", wrapper: "ElicitationTrace", verdict: c.elicitation?.ObsRawCompare === 1 ? "REJECTED" : "ACCEPTED", constants: { ObsMaxPending: 16, ObsFits: 0, ObsEscaped: 0, ObsRawCompare: 0, ...c.elicitation } });
       else traces.push({ machine: "mrtr", instance: `${server}.${m.mrtr}`, specDir: "tests/tla/mcp", wrapper: "MrtrTrace", verdict: "ACCEPTED", constants: { ObsMaxRequests: 10, ObsMaxKeys: 16 } });
     }
   }
@@ -162,6 +170,133 @@ const form = { mode: "form", message: "Name?", requestedSchema: { type: "object"
 const askName = { k: { method: "elicitation/create", params: form } };
 const FORM = ["--capabilities", JSON.stringify({ elicitation: { form: {} } })];
 
+// ---- a form the server writes with escapes ----
+//
+// The host reads the person's answer with std.json and writes it back, which spells a string without the escapes
+// the server used (café, a/b, A, a surrogate pair as UTF-8). JSON gives both spellings one meaning, so the engine must
+// match the strings, not the bytes (ELIC-05; Elicitation.tla's FitAccepted). The fake servers write the form with
+// `beforeRaw` and `raw`, which keep the escapes that JSON.stringify would drop.
+
+interface Spelling {
+  name: string;
+  /** What the server writes between the quotes. */
+  written: string;
+  /** What the host writes back for the same string. */
+  sent: string;
+}
+const SPELLINGS: Spelling[] = [
+  { name: "u00e9", written: String.raw`caf\u00e9`, sent: "café" },
+  { name: "slash", written: String.raw`a\/b`, sent: "a/b" },
+  { name: "u0041", written: String.raw`\u0041`, sent: "A" },
+  { name: "surrogate-pair", written: String.raw`\ud83d\ude00`, sent: "😀" },
+  { name: "plain", written: "plain", sent: "plain" }, // a guard: no escape, so nothing differs
+];
+type Place = "key" | "enum" | "oneOf" | "multi";
+const PLACES: { place: Place; spellings: string[] }[] = [
+  { place: "key", spellings: SPELLINGS.map((x) => x.name) },
+  { place: "enum", spellings: SPELLINGS.map((x) => x.name) },
+  { place: "oneOf", spellings: ["u00e9"] },
+  { place: "multi", spellings: ["u00e9"] },
+];
+
+/** The form's JSON text, as the server writes it. */
+function escapedForm(place: Place, written: string): string {
+  const properties = {
+    key: `{"${written}":{"type":"string"}}`,
+    enum: `{"c":{"type":"string","enum":["${written}","other"]}}`,
+    oneOf: `{"c":{"type":"string","oneOf":[{"const":"${written}","title":"T"},{"const":"other","title":"U"}]}}`,
+    multi: `{"c":{"type":"array","items":{"type":"string","enum":["${written}","other"]}}}`,
+  }[place];
+  return `{"mode":"form","message":"Pick","requestedSchema":{"type":"object","properties":${properties}}}`;
+}
+/** What the host sends back: the content, with the string written the way std.json writes it. */
+function answeredContent(place: Place, sent: string): string {
+  const text = JSON.stringify(sent);
+  return place === "key" ? `{${text}:"x"}` : place === "multi" ? `{"c":[${text}]}` : `{"c":${text}}`;
+}
+
+function escapeScenarios(): Scenario[] {
+  const out: Scenario[] = [];
+  for (const { place, spellings } of PLACES) {
+    for (const name of spellings) {
+      const sp = SPELLINGS.find((x) => x.name === name)!;
+      const form = escapedForm(place, sp.written);
+      const content = answeredContent(place, sp.sent);
+      const wanted = JSON.parse(content);
+      const escaped = sp.written !== sp.sent;
+      out.push(
+        engineScenario({
+          name: `u12-escape-2025-${place}-${name}`,
+          description: `A 2025 server's form has a ${place} written ${escaped ? `with an escape (${sp.written})` : "plainly"}: the host's answer, written without it, goes back to the server as a response (ELIC-05, ELIC-09)`,
+          servers: { b: { rules: legacy({ ...ok25("asked"), beforeRaw: [`{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":${form}}`] }) } },
+          labFlags: FORM,
+          script: ["call b go", "expect b.elicit 5000", `elicit b 1 accept ${content}`, "expect b.called.1.result 5000", "drain 300"],
+          machines: { b: ["elicitation"] },
+          elicitation: { ObsFits: 1, ObsEscaped: escaped ? 1 : 0 },
+          check: (_lines, logs) => same(replies(logs.b).find((m) => m.id === "e1")?.result, { action: "accept", content: wanted }, "the elicitation's answer"),
+        }),
+        engineScenario({
+          name: `u12-escape-2026-${place}-${name}`,
+          description: `A 2026 server's input round has a form with a ${place} written ${escaped ? `with an escape (${sp.written})` : "plainly"}: the host's answer, written without it, is the next round's input response (MRTR-03, ELIC-05)`,
+          servers: {
+            a: {
+              rules: modern({
+                method: "tools/call",
+                times: 1,
+                raw: `{"jsonrpc":"2.0","id":{id},"result":{"resultType":"input_required","inputRequests":{"k":{"method":"elicitation/create","params":${form}}}}}`,
+              }),
+            },
+          },
+          labFlags: FORM,
+          script: ["call a ask", "expect a.input.1", `respond 1 [{"action":"accept","content":${content}}]`, "expect a.called.1.result"],
+          machines: { a: [{ mrtr: "x3" }] },
+          check: (_lines, logs) => {
+            const calls = received(logs.a, "tools/call");
+            return first(same(calls.length, 2, "tools/call requests"), same(calls[1]?.params?.inputResponses, { k: { action: "accept", content: wanted } }, "the second round's answers"));
+          },
+        }),
+      );
+    }
+  }
+  // The planted control: the engine's trace of the answer to `café` written as \u00e9, checked against a model that
+  // matches bytes, is rejected. That is the model's finding, shown on the real engine's trace.
+  const control = SPELLINGS[0];
+  out.push(
+    engineScenario({
+      name: "u12-escape-control-raw-compare",
+      description: "Planted control: the trace of an answer accepted for a name the server wrote with an escape, checked against a model that matches bytes, is rejected",
+      servers: { b: { rules: legacy({ ...ok25("asked"), beforeRaw: [`{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":${escapedForm("enum", control.written)}}`] }) } },
+      labFlags: FORM,
+      script: ["call b go", "expect b.elicit 5000", `elicit b 1 accept ${answeredContent("enum", control.sent)}`, "expect b.called.1.result 5000", "drain 300"],
+      machines: { b: ["elicitation"] },
+      elicitation: { ObsFits: 1, ObsEscaped: 1, ObsRawCompare: 1 },
+    }),
+  );
+  // Two names that are one name once decoded are a duplicate: the form is unreadable, so the host is never asked and
+  // the server gets the same error as for a repeated name (the one behavior change for such a form).
+  const duplicate = (name: string, a: string, b: string): Scenario => {
+    const form = `{"mode":"form","message":"Pick","requestedSchema":{"type":"object","properties":{"${a}":{"type":"string"},"${b}":{"type":"string"}}}}`;
+    return engineScenario({
+      name,
+      description: `A 2025 server's form with the names ${a} and ${b}: ${a === b ? "a repeated name" : "one name once decoded"}, so the form is unreadable and the server is answered with an error`,
+      servers: { b: { rules: legacy({ ...ok25("asked"), beforeRaw: [`{"jsonrpc":"2.0","id":"e1","method":"elicitation/create","params":${form}}`] }) } },
+      labFlags: FORM,
+      script: ["call b go", "expect b.called.1.result 5000", "drain 300"],
+      machines: { b: ["elicitation"] },
+      check: (lines, logs) => {
+        const reply = replies(logs.b).find((m) => m.id === "e1");
+        return first(
+          expectThat(!lines.some((l) => l.event?.tag === "b.elicit"), "the host was asked about an unreadable form"),
+          same(reply?.error?.code, -32602, "the code of the error the server got"),
+          same(reply?.error?.message, "Unsupported elicitation", "the words of the error the server got"),
+        );
+      },
+    });
+  };
+  out.push(duplicate("u12-escape-duplicate-raw", "A", "A"), duplicate("u12-escape-duplicate-decoded", "A", String.raw`\u0041`));
+  return out;
+}
+
 export const scenarios: Scenario[] = [
   engineScenario({
     name: "u12-two-servers",
@@ -179,6 +314,14 @@ export const scenarios: Scenario[] = [
         same(lines.at(-1)!.final!.logged, [{ name: "a", lines: 0 }, { name: "b", lines: 1 }], "stderr lines logged"),
       );
     },
+  }),
+  engineScenario({
+    name: "u12-deep-reply",
+    description: "A reply nested 2,000 levels deep reaches the host whole: the engine's limit is far above the host's depth limit of 128 (tests/tla/mcp/WireDepth.tla), which the host applies where it reads the result",
+    servers: { b: { rules: legacy({ method: "tools/call", result: { content: [{ type: "text", text: "deep" }], structuredContent: JSON.parse(`${'{"a":'.repeat(2000)}1${"}".repeat(2000)}`) } }) } },
+    script: ["call b add", "expect b.called.1.result"],
+    machines: { b: [...BASE, "catalog"] },
+    check: (lines) => same(event(lines, "b.called.1")?.answer, '[{"type":"text","text":"deep"}]', "the deep reply's answer"),
   }),
   engineScenario({
     name: "u12-tools-stale",
@@ -204,12 +347,86 @@ export const scenarios: Scenario[] = [
     },
   }),
   engineScenario({
+    name: "u12-list-refused",
+    description: "A server whose newest tool list fx refused: the status says so with the fixed words, beside the older list it still serves and with no last_error, and the next good list clears it",
+    servers: {
+      f: { rules: [initialize, { ...list25("add"), times: 1 }, { ...ok25("fine"), before: [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] }, { method: "tools/list", result: { tools: 7 }, times: 1 }, list25("add", "sub")] },
+    },
+    script: ["tools f", "expect f.tools.ok", "status", "call f add", "expect f.called.1.result", "expect f.tools_stale", "tools f", "expect f.tools.ok", "status", "tools f", "expect f.tools.ok", "status"],
+    machines: { f: [...BASE, "catalog"] },
+    check(lines) {
+      // The lab prints one more status when it ends, which repeats the last: the three the script asked for.
+      const states = lines.filter((l) => l.status).map((l) => l.status![0]).slice(0, 3);
+      return first(
+        same(states.map((s) => [s.phase, s.tools, s.list_refusal, s.last_error]), [["ready", 1, null, null], ["ready", 1, '"tools" is not a list', null], ["ready", 2, null, null]], "the status [phase, tools, list_refusal, last_error] after each list"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-list-refused-first-list",
+    description: "A server whose first tool list fx refuses, as a result that is no list or as an error: the host gets the failure, no tools are listed, and the status says why in the fixed words while the server stays ready",
+    servers: {
+      g: { rules: [initialize, { method: "tools/list", result: { tools: 7 } }] },
+      h: { rules: [initialize, { method: "tools/list", error: { code: -32603, message: "Internal error" } }] },
+    },
+    script: ["tools g", "tools h", "expect g.tools.fail", "expect h.tools.fail", "status"],
+    machines: { g: [...BASE, "catalog"], h: [...BASE, "catalog"] },
+    check(lines) {
+      return first(
+        same(["g", "h"].map((n) => { const s = status(lines, n)!; return [s.phase, s.tools, s.list_refusal]; }), [["ready", 0, '"tools" is not a list'], ["ready", 0, "the server answered the list with an error"]], "the status [phase, tools, list_refusal] of g and h"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-restart-count-is-per-listing",
+    description: "A listing restarts once on an invalid cursor, as the model says, and so does the next listing: each starts with its own count, so the second listing's first invalid cursor restarts it, publishes its new list and refuses nothing",
+    servers: {
+      f: {
+        rules: [
+          initialize,
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")], nextCursor: "c1" } },
+          { method: "tools/list", cursor: "c1", times: 1, error: { code: -32602, message: "no such cursor" } },
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")] } },
+          { ...ok25("fine"), before: [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] },
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")], nextCursor: "c2" } },
+          { method: "tools/list", cursor: "c2", times: 1, error: { code: -32602, message: "no such cursor" } },
+          list25("add", "sub"),
+        ],
+      },
+    },
+    script: ["tools f", "expect f.tools.ok", "status", "call f add", "expect f.called.1.result", "expect f.tools_stale", "tools f", "expect f.tools.ok", "status"],
+    machines: { f: [...BASE, "catalog"] },
+    check(lines) {
+      // The lab prints one more status when it ends, which repeats the last: the two the script asked for.
+      const states = lines.filter((l) => l.status).map((l) => l.status![0]).slice(0, 2);
+      return first(
+        same(states.map((s) => [s.phase, s.tools, s.list_refusal]), [["ready", 1, null], ["ready", 2, null]], "the status [phase, tools, list_refusal] after each list: the second list is published, and nothing is refused"),
+      );
+    },
+  }),
+  engineScenario({
     name: "u12-lazy",
     description: "A server nothing needs never starts: listing one server's tools leaves the other idle, with no process (LazyConnect)",
     servers: { a: { rules: modern() }, b: { rules: modern() } },
     script: ["tools a", "expect a.tools.ok", "drain 300"],
     machines: { a: [...BASE, "catalog", "subscription"] },
     check: (lines, logs) => first(same(status(lines, "b")?.phase, "idle", "b's phase"), expectThat(logs.b.length === 0, "b's process saw something"), expectThat(!tags(lines).some((t) => t.startsWith("b.")), "b said something")),
+  }),
+  engineScenario({
+    name: "u12-idle-restart",
+    description: "A server nothing used for its idle limit stops without a failure, and the next call starts a new process and is answered",
+    servers: { a: { rules: modern() } },
+    // The runtime lowers a stable limit above the idle one, so both are 300 ms.
+    labFlags: ["--no-listen", "--stable-ms", "300", "--idle-ms", "300"],
+    script: ["call a echo", "expect a.called.1.result", "drain 1500", "call a echo", "expect a.called.2.result 10000"],
+    machines: { a: BASE },
+    check: (lines, logs, trace) =>
+      first(
+        expectThat(trace.some((t) => t.machine === "engine" && t.inst === "a" && t.event === "idle" && t.data?.ignored === false), "no idle stop in the engine trace"),
+        same(received(logs.a, "server/discover").length, 2, "processes started"),
+        expectThat(event(lines, "a.stopped_idle") !== undefined, "the host never heard the idle stop"),
+        same(event(lines, "a.called.2")?.answer, '[{"type":"text","text":"fine"}]', "the second call's answer"),
+      ),
   }),
   engineScenario({
     name: "u12-denied",
@@ -448,6 +665,73 @@ export const scenarios: Scenario[] = [
         same(event(lines, "h.called.1")?.answer, '[{"type":"text","text":"from h"}]', "h's answer"),
         same([status(lines, "h")?.phase, status(lines, "a")?.phase], ["ready", "ready"], "phases"),
       ),
+  }),
+  engineScenario({
+    name: "u12-http-lost-restart",
+    description: "Two HTTP calls whose answer streams break are lost in a row: the engine drops the link, so the third call detects the server again and is answered",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", sse: true, drop: true, times: 2 },
+        { method: "tools/call", result: { resultType: "complete", content: [{ type: "text", text: "third" }] } },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen"],
+    script: ["tools h", "expect h.phase.ready 5000", "call h echo", "expect h.called.1.lost 10000", "call h echo", "expect h.called.2.lost 10000", "call h echo", "expect h.called.3.result 10000", "status"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (lines, logs) => {
+      // The link restarts: the second detection goes out after the second call's stream broke, and call 3 goes out on the new link.
+      const raw = logs.h as unknown as { t: number; dir: string; body?: string }[];
+      const posts = raw.filter((l) => l.dir === "in" && l.body).map((l) => ({ t: l.t, ...JSON.parse(l.body!) }));
+      const detections = posts.filter((m) => m.method === "server/discover");
+      const calls = posts.filter((m) => m.method === "tools/call");
+      const restarted = detections.length === 2 && calls.length === 3 && detections[1].t > calls[1].t;
+      return first(
+        same(calls.length, 3, "tools/call posts"),
+        same(detections.length, 2, "server/discover posts"),
+        restarted ? null : "the second detection did not come after the second lost call",
+        same(event(lines, "h.called.3")?.answer, '[{"type":"text","text":"third"}]', "the third call's answer"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-http-lost-restart-while-listing",
+    description: "A tool list still loading when two HTTP calls are lost is failed by the restart, so the next tool request lists again on the new link, and a third call is answered",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] }, delayMs: 3000, times: 1 },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", sse: true, drop: true, times: 2 },
+        { method: "tools/call", result: { resultType: "complete", content: [{ type: "text", text: "third" }] } },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen"],
+    script: ["tools h", "expect h.phase.ready 5000", "call h echo", "expect h.called.1.lost 10000", "call h echo", "expect h.called.2.lost 10000", "expect h.tools.fail 10000", "tools h", "expect h.tools.ok 10000", "call h echo", "expect h.called.3.result 10000", "status"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (lines, logs) => {
+      // The restart: the second detection and the second tool list both go out after the second lost call.
+      const raw = logs.h as unknown as { t: number; dir: string; body?: string }[];
+      const posts = raw.filter((l) => l.dir === "in" && l.body).map((l) => ({ t: l.t, ...JSON.parse(l.body!) }));
+      const detections = posts.filter((m) => m.method === "server/discover");
+      const listings = posts.filter((m) => m.method === "tools/list");
+      const calls = posts.filter((m) => m.method === "tools/call");
+      const restarted = detections.length === 2 && calls.length === 3 && detections[1].t > calls[1].t;
+      const relisted = listings.length === 2 && calls.length === 3 && listings[1].t > calls[1].t;
+      return first(
+        same(calls.length, 3, "tools/call posts"),
+        same(detections.length, 2, "server/discover posts"),
+        same(listings.length, 2, "tools/list posts"),
+        restarted ? null : "the second detection did not come after the second lost call",
+        relisted ? null : "the second tool list did not come after the second lost call",
+        same(event(lines, "h.called.3")?.answer, '[{"type":"text","text":"third"}]', "the third call's answer"),
+      );
+    },
   }),
   engineScenario({
     name: "u12-http-initialized-timeout",
@@ -697,5 +981,393 @@ export const scenarios: Scenario[] = [
     script: ["call a echo", "expect a.called.1.transport_failed 15000", "expect a.phase.failed 5000"],
     machines: { a: ["engine"] },
     control: { server: "a", maxAttempts: 3 },
+  }),
+  ...escapeScenarios(),
+  // ---- a protocol field name written with escapes ----
+  // The reply lines are raw, so a field name carries a JSON escape: `is\u0045rror` is `isError` once decoded.
+  engineScenario({
+    name: "u12-escaped-iserror",
+    description: "A tool result the server marks with an escaped `isError` is reported as an error, as std.json reads it (CAT-08)",
+    servers: { a: { rules: modern({ method: "tools/call", times: 1, raw: '{"jsonrpc":"2.0","id":{id},"result":{"resultType":"complete","content":[{"type":"text","text":"boom"}],"is\\u0045rror":true}}' }) } },
+    script: ["call a echo", "expect a.called.1.result"],
+    machines: { a: BASE },
+    check: (lines) => {
+      const called = lines.find((l) => l.event?.tag === "a.called.1.result")?.event as { is_error?: boolean | null } | undefined;
+      return expectThat(called?.is_error === true, `the result the server marked isError was reported with is_error ${JSON.stringify(called?.is_error)}`);
+    },
+  }),
+  engineScenario({
+    name: "u12-escaped-resulttype",
+    description: "A result whose `resultType` name is written with an escape and says input_required asks the host, as std.json reads it (MRTR-01)",
+    servers: { a: { rules: modern({ method: "tools/call", times: 1, raw: `{"jsonrpc":"2.0","id":{id},"result":{"result\\u0054ype":"input_required","inputRequests":${JSON.stringify(askName)}}}` }) } },
+    labFlags: FORM,
+    script: ["call a ask", "expect a.input.1", 'respond 1 [{"action":"accept","content":{"name":"Ada"}}]', "expect a.called.1.result"],
+    machines: { a: [...BASE, "subscription", { mrtr: "x3" }] },
+    check: (_lines, logs) => {
+      const calls = received(logs.a, "tools/call");
+      return first(same(calls.length, 2, "tools/call requests"), same(calls[1]?.params?.inputResponses, { k: { action: "accept", content: { name: "Ada" } } }, "the second round's answers"));
+    },
+  }),
+  engineScenario({
+    name: "u12-escaped-requeststate",
+    description: "A `requestState` name written with an escape is echoed in the next round, as the server asked (MRTR-03)",
+    servers: { a: { rules: modern({ method: "tools/call", times: 1, raw: `{"jsonrpc":"2.0","id":{id},"result":{"resultType":"input_required","inputRequests":${JSON.stringify(askName)},"request\\u0053tate":"opaque"}}` }) } },
+    labFlags: FORM,
+    script: ["call a ask", "expect a.input.1", 'respond 1 [{"action":"accept","content":{"name":"Ada"}}]', "expect a.called.1.result"],
+    machines: { a: [...BASE, "subscription", { mrtr: "x3" }] },
+    check: (_lines, logs) => {
+      const calls = received(logs.a, "tools/call");
+      return first(same(calls.length, 2, "tools/call requests"), same(calls[1]?.params?.requestState, "opaque", "the second round's requestState"));
+    },
+  }),
+  engineScenario({
+    name: "u12-escaped-nextcursor",
+    description: "A tools/list page whose `nextCursor` name is written with an escape is followed to the next page, as std.json reads it (CAT-01)",
+    servers: {
+      a: {
+        rules: [
+          discover,
+          listen,
+          { method: "tools/list", cursor: null, raw: '{"jsonrpc":"2.0","id":{id},"result":{"resultType":"complete","tools":[{"name":"one","inputSchema":{"type":"object"}}],"ne\\u0078tCursor":"c2"}}' },
+          { method: "tools/list", cursor: "c2", result: { resultType: "complete", tools: [tool("two")] } },
+          ok("fine"),
+        ],
+      },
+    },
+    script: ["tools a", "expect a.tools.ok"],
+    machines: { a: BASE },
+    check: (lines) => {
+      const lists = lines.filter((l) => l.event?.tag === "a.tools.ok");
+      return same(lists[lists.length - 1]?.event?.names, ["one", "two"], "the tool names after the last list");
+    },
+  }),
+  // ---- a line the engine refuses that names no request: the grace (tests/tla/mcp/Request.tla) ----
+  // Setup: the lab flag --refused-ms is read and ignored until the engine has the grace.
+  engineScenario({
+    name: "u12-refused-grace-silent",
+    description: "A stdio line the engine refuses and cannot attach to a call, then silence: the call ends as malformed when the grace runs out, long before its idle timer, and the server is told it was cancelled",
+    servers: { a: { rules: modern({ method: "tools/call", tool: "silent", rawBytes: 40, noReply: true }) } },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a silent", "expect a.called.1.malformed 5000"],
+    machines: { a: BASE },
+    check: (lines, logs, trace) =>
+      first(
+        same(event(lines, "a.called.1")?.timed_out, false, "timed out"),
+        same(received(logs.a, "notifications/cancelled").length, 1, "cancel notices the server got"),
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "refused_line"), "no refused_line step in the request trace"),
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "no grace_expired step in the request trace"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-refused-grace-every-waiting-call",
+    description: "A stdio line fx cannot read and that names no request is about every call waiting on that one connection: both calls end as malformed when the grace runs out, and the server is told it cancelled each",
+    servers: { a: { rules: modern({ method: "tools/call", tool: "silent", delayMs: 400, rawBytes: 40, noReply: true }) } },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a silent", "call a silent", "expect a.called.1.malformed 5000", "expect a.called.2.malformed 5000"],
+    machines: { a: BASE },
+    check: (lines, logs, trace) =>
+      first(
+        same(received(logs.a, "notifications/cancelled").length, 2, "cancel notices the server got"),
+        same(trace.filter((t) => t.machine === "request" && t.event === "grace_expired").length, 2, "grace_expired steps in the request trace"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-refused-grace-progress",
+    description: "Progress for the call's own token after the refused line clears its grace: a call that works for longer than the grace returns its result, and no grace ends it",
+    servers: {
+      a: {
+        rules: modern({
+          method: "tools/call",
+          tool: "alive",
+          rawBytes: 40,
+          before: Array.from({ length: 10 }, (_, n) => ({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "$id", progress: n + 1 } })),
+          beforeEveryMs: 150,
+          result: { resultType: "complete", content: [{ type: "text", text: "fine" }] },
+        }),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a alive", "expect a.called.1.result 6000"],
+    machines: { a: BASE },
+    check: (_lines, _logs, trace) =>
+      expectThat(!trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "a grace ended a call that had progress"),
+  }),
+  engineScenario({
+    name: "u12-refused-grace-later-call",
+    description: "A call sent after the refused line gets no grace: a slow call started after it returns its result, long after the grace would have run out",
+    servers: {
+      a: {
+        rules: modern(
+          { method: "tools/call", tool: "once", rawBytes: 40, result: { resultType: "complete", content: [{ type: "text", text: "fine" }] } },
+          { method: "tools/call", tool: "slow", delayMs: 1500, result: { resultType: "complete", content: [{ type: "text", text: "fine" }] } },
+        ),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a once", "expect a.called.1.result 3000", "call a slow", "expect a.called.2.result 5000"],
+    machines: { a: BASE },
+    check: (_lines, _logs, trace) =>
+      expectThat(!trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "the grace ended a call"),
+  }),
+  engineScenario({
+    name: "u12-refused-grace-valid-reply",
+    description: "A valid reply inside the grace still matches its call: the line, a notification 400 ms later, then the reply, with the grace at 600 ms",
+    servers: {
+      a: {
+        rules: modern({
+          method: "tools/call",
+          tool: "late",
+          rawBytes: 40,
+          before: [
+            { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "one" } },
+            { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "two" } },
+          ],
+          beforeEveryMs: 400,
+          result: { resultType: "complete", content: [{ type: "text", text: "fine" }] },
+        }),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a late", "expect a.called.1.result 3000"],
+    machines: { a: BASE },
+    check: (_lines, _logs, trace) =>
+      expectThat(!trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "the grace ended a call that was answered inside it"),
+  }),
+  // ---- a line the engine refuses after an id it read: the request it names (tests/tla/mcp/Request.tla RefusedNaming) ----
+  engineScenario({
+    name: "u12-refused-named-at-once",
+    description:
+      "A stdio line the engine refuses after the id of a call, however it goes wrong (not JSON, nested past the limit, a key written twice), ends that call at once as -32600, not as malformed when the grace runs out, and the server is not told it was cancelled",
+    servers: {
+      a: {
+        rules: modern(
+          { method: "tools/call", tool: "cut", raw: '{"jsonrpc":"2.0","id":{id},"result":{"content":[nope]}}' },
+          { method: "tools/call", tool: "deep", raw: `{"jsonrpc":"2.0","id":{id},"result":{"content":[],"structuredContent":${'{"a":'.repeat(3000)}1${"}".repeat(3000)}}}` },
+          { method: "tools/call", tool: "twice", raw: '{"jsonrpc":"2.0","id":{id},"result":{"content":[]},"r\\u0065sult":{"content":[]}}' },
+        ),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a cut", "expect a.called.1.failure 3000", "call a deep", "expect a.called.2.failure 3000", "call a twice", "expect a.called.3.failure 3000"],
+    machines: { a: BASE },
+    check: (lines, logs, trace) =>
+      first(
+        ...[1, 2, 3].map((n) =>
+          expectThat(
+            event(lines, `a.called.${n}`)?.answer?.startsWith('error -32600 "invalid reply (it isn\'t valid JSON-RPC): {\\"jsonrpc\\":\\"2.0\\",\\"id\\":') ?? false,
+            `call ${n}'s answer (${event(lines, `a.called.${n}`)?.answer})`,
+          ),
+        ),
+        same([1, 2, 3].map((n) => event(lines, `a.called.${n}`)?.timed_out), [false, false, false], "timed out"),
+        same(received(logs.a, "notifications/cancelled").length, 0, "cancel notices the server got"),
+        expectThat(!trace.some((t) => t.machine === "request" && (t.event === "refused_line" || t.event === "grace_expired")), "a refused line that names its call gave a grace"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-refused-named-stray",
+    description:
+      "A line the engine refuses after the id of a call that is not in flight is a stray, as a late reply is: it gives the call in flight no grace, which returns its result after the grace would have run out",
+    servers: {
+      a: {
+        rules: modern({
+          method: "tools/call",
+          tool: "slow",
+          beforeRaw: ['{"jsonrpc":"2.0","id":99,"result":{"x":nope}}'],
+          delayMs: 1500,
+          result: { resultType: "complete", content: [{ type: "text", text: "fine" }] },
+        }),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a slow", "expect a.called.1.result 5000"],
+    machines: { a: BASE },
+    check: (_lines, _logs, trace) =>
+      expectThat(!trace.some((t) => t.machine === "request" && (t.event === "refused_line" || t.event === "grace_expired")), "a stray line gave a grace"),
+  }),
+  engineScenario({
+    name: "u12-refused-two-ids",
+    description: "A line the engine refuses that writes the id twice names no call, as the decoder refuses it: the call ends as malformed when the grace runs out",
+    servers: {
+      a: { rules: modern({ method: "tools/call", tool: "twin", beforeRaw: ['{"jsonrpc":"2.0","id":{id},"id":{id},"result":{"content":[]}}'], noReply: true }) },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a twin", "expect a.called.1.malformed 5000"],
+    machines: { a: BASE },
+    check: (_lines, _logs, trace) =>
+      first(
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "refused_line"), "no refused_line step in the request trace"),
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "no grace_expired step in the request trace"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-list-refused-after-its-id",
+    description:
+      "A stdio tool list reply that goes wrong after its id ends the list at once, and the status says the answer is not a readable tool list, not that the server answered with an error",
+    servers: {
+      a: {
+        rules: [discover, listen, { method: "tools/list", raw: '{"jsonrpc":"2.0","id":{id},"result":{"resultType":"complete","tools":[]},"extra":nope}' }],
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["tools a", "expect a.tools.fail 3000", "status"],
+    machines: { a: [...BASE, "catalog"] },
+    check: (lines, _logs, trace) =>
+      first(
+        same(status(lines, "a")?.list_refusal, "the answer is not a readable tool list", "the list refusal"),
+        expectThat(!trace.some((t) => t.machine === "request" && (t.event === "refused_line" || t.event === "grace_expired")), "a refused line that names its list gave a grace"),
+      ),
+  }),
+  // ---- a list whose reply names no request: no id could be read, so the grace ends it, and it says so (tests/tla/mcp/Catalog.tla PageUnreadable) ----
+  engineScenario({
+    name: "u12-list-refused-no-id",
+    description:
+      "A stdio tool list reply whose id comes after the part fx cannot read names no request: the list waits out the grace, then ends refused, and the status says the answer is not a readable tool list, not that the server never answered",
+    servers: {
+      a: {
+        rules: [discover, listen, { method: "tools/list", raw: '{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":nope,"id":{id}}' }],
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["tools a", "expect a.tools.fail 5000", "status"],
+    machines: { a: [...BASE, "catalog"] },
+    check: (lines, _logs, trace) =>
+      first(
+        same(status(lines, "a")?.list_refusal, "the answer is not a readable tool list", "the list refusal"),
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "no grace_expired step in the request trace"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-list-refused-http-sse-no-id",
+    description:
+      "An SSE event on a tool list's own stream that names no request, on a stream that stays open: the list ends refused when the grace runs out, with the same words as on stdio",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", sse: true, before: ["not an object"], hang: true },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["tools h", "expect h.tools.fail 5000", "status"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (lines, _logs, trace) =>
+      first(
+        same(status(lines, "h")?.list_refusal, "the answer is not a readable tool list", "the list refusal"),
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "no grace_expired step in the request trace"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-list-and-call-refused-line",
+    description:
+      "A tool list and a call are in flight together and the call's reply is a line fx cannot read: both get the grace and end, the call as malformed and the list with no reason, because the line is no more the list's than the call's",
+    servers: {
+      a: {
+        rules: [discover, { method: "tools/list", noReply: true }, { method: "tools/call", tool: "silent", delayMs: 400, rawBytes: 40, noReply: true }],
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["tools a", "call a silent", "expect a.called.1.malformed 5000", "expect a.tools.fail 5000", "status"],
+    machines: { a: [...BASE, "catalog"] },
+    check: (lines, _logs, trace) =>
+      first(
+        same(trace.filter((t) => t.machine === "request" && t.event === "grace_expired").length, 2, "grace_expired steps in the request trace"),
+        expectThat(status(lines, "a")?.list_refusal == null, `the list was refused: ${JSON.stringify(status(lines, "a")?.list_refusal)}`),
+      ),
+  }),
+  engineScenario({
+    name: "u12-refused-http-json-body",
+    description: "An HTTP JSON body the engine cannot read ends its call at once as malformed, not as an HTTP failure",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", raw: '{"jsonrpc":"2.0","result":{"bad":,"id":1}', contentType: "application/json" },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call h echo", "expect h.called.1.malformed 3000"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+  }),
+  engineScenario({
+    name: "u12-refused-http-sse-readable-id",
+    description: "An SSE event with the call's id and a jsonrpc that is not 2.0 ends the call at once as -32600, as on stdio, though the stream stays open",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", sse: true, before: [{ jsonrpc: "1.0", id: "$id", result: {} }], hang: true },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call h echo", "expect h.called.1.failure 3000"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+  }),
+  engineScenario({
+    name: "u12-refused-http-sse-other-id",
+    description:
+      "An SSE event on one call's stream that names another call is a stray, as a valid reply would be: it ends the call whose stream it came on, by its own id, and never the other call in flight, which returns its result",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("slow"), tool("liar")] } },
+        { method: "tools/call", name: "slow", delayMs: 1500, result: { resultType: "complete", content: [{ type: "text", text: "fine" }] } },
+        // Every id the client could have used, each with a jsonrpc that is not 2.0.
+        { method: "tools/call", name: "liar", sse: true, before: Array.from({ length: 12 }, (_, n) => ({ jsonrpc: "1.0", id: n + 1, result: {} })), hang: true },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call h slow", "call h liar", "expect h.called.2.failure 3000", "expect h.called.1.result 6000"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+  }),
+  engineScenario({
+    name: "u12-refused-http-sse-no-id-other-stream",
+    description:
+      "An SSE event that fx cannot read and that has no readable id is about the call whose stream carried it alone: that call ends as malformed when the grace runs out, and its stream is closed; the other call, on its own stream, is not touched and returns its result",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("slow"), tool("noisy")] } },
+        { method: "tools/call", name: "slow", delayMs: 3000, result: { resultType: "complete", content: [{ type: "text", text: "fine" }] } },
+        { method: "tools/call", name: "noisy", sse: true, before: ["not an object"], hang: true },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call h slow", "call h noisy", "expect h.called.2.malformed 5000", "expect h.called.1.result 8000"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (_lines, logs, trace) => {
+      const raw = logs.h as unknown as { dir: string; id?: number }[];
+      return first(
+        // Only the call on the noisy stream ends by its grace, and its stream is closed.
+        same(trace.filter((t) => t.machine === "request" && t.event === "grace_expired").length, 1, "grace_expired steps in the request trace"),
+        expectThat(raw.some((l) => l.dir === "closed"), "the noisy call's stream was not closed"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-refused-http-sse-no-id",
+    description: "An SSE event that names no request, on a stream that stays open: the call ends as malformed when the grace runs out, as a stdio call does",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", sse: true, before: ["not an object"], hang: true },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call h echo", "expect h.called.1.malformed 5000"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (_lines, _logs, trace) =>
+      expectThat(trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "no grace_expired step in the request trace"),
   }),
 ];

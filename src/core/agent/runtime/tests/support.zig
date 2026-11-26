@@ -482,9 +482,13 @@ pub const FakeAgentRuntimeDeps = struct {
     texts: std.ArrayList([]u8) = .empty,
     assistant_sources: std.ArrayList([]u8) = .empty,
     system_notices: std.ArrayList([]u8) = .empty,
+    /// Notices the core pushes as session notices, such as an effort the
+    /// model does not offer. The CLI shows each one as a system notice.
+    session_notices: std.ArrayList([]u8) = .empty,
     interactive_notices: std.ArrayList(types.SemanticNotice) = .empty,
     context_notices: std.ArrayList([]u8) = .empty,
     route_recovery_statuses: std.ArrayList(types.RouteRecoveryStatus) = .empty,
+    saved_route_recovery_statuses: std.ArrayList(types.RouteRecoveryStatus) = .empty,
     permission_names: std.ArrayList([]u8) = .empty,
     permission_call_ids: std.ArrayList([]u8) = .empty,
     permission_user_intent_contexts: std.ArrayList([]u8) = .empty,
@@ -551,6 +555,9 @@ pub const FakeAgentRuntimeDeps = struct {
     swap_link_on_execute_name: ?[]const u8 = null,
     swap_link_on_execute: ?[]const u8 = null,
     swap_link_target_on_execute: ?[]const u8 = null,
+    create_file_on_execute_name: ?[]const u8 = null,
+    create_file_on_execute_path: ?[]const u8 = null,
+    create_file_on_execute_content: []const u8 = "",
     static_context_text: ?[]const u8 = null,
     runtime_context_text: ?[]const u8 = null,
     runtime_context_texts: []const []const u8 = &.{},
@@ -656,6 +663,10 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_error: ?anyerror = null,
     /// A forced refresh finds nothing, as when the refresh token is rejected.
     credential_refresh_fail_force: bool = false,
+    /// The login a `.stored` read finds, as another fx process saves one;
+    /// those reads are counted here and nowhere else.
+    credential_stored_token: ?[]const u8 = null,
+    credential_stored_reads: usize = 0,
     /// Only this many forced refreshes work; later ones find nothing, as
     /// when the refresh token is revoked during the turn.
     credential_refresh_force_successes: ?usize = null,
@@ -663,6 +674,10 @@ pub const FakeAgentRuntimeDeps = struct {
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
+    /// Wire `start_workspace_capture` and log each of its steps, and each
+    /// tool the turn executes, in order in `capture_log`.
+    record_workspace_capture: bool = false,
+    capture_log: std.ArrayList([]u8) = .empty,
     /// Keeps the recovery module's record, as a host that resumes requests
     /// does.
     enable_recovery_record: bool = false,
@@ -697,6 +712,19 @@ pub const FakeAgentRuntimeDeps = struct {
     /// from it and publishes its events and tool lifecycle to it. Its queue,
     /// events, and taken steering use `alloc`.
     steering_worker: ?*worker_runtime.WorkerRuntime = null,
+    /// A host whose main loop holds mail for the turn in a hand-off until it
+    /// posts it: what the fake does when an empty reply asks it to wait. Null
+    /// leaves the hook unset, as in a host with no hand-off.
+    handoff_wait: ?HandoffWait = null,
+    handoff_wait_calls: usize = 0,
+    handoff_wait_bound_ms: i64 = 0,
+
+    pub const HandoffWait = struct {
+        /// Mail the main loop posts to `steering_worker` while the turn waits.
+        /// The worker owns it from then on.
+        mail: ?worker_runtime.QueuedPrompt = null,
+        answer: AgentRuntimeDeps.HandoffMailWait,
+    };
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
@@ -704,10 +732,12 @@ pub const FakeAgentRuntimeDeps = struct {
 
     pub fn deinit(self: *FakeAgentRuntimeDeps) void {
         self.recorded_usages.deinit(self.alloc);
+        freeStringList(self.alloc, &self.capture_log);
         freeStringList(self.alloc, &self.log);
         freeStringList(self.alloc, &self.texts);
         freeStringList(self.alloc, &self.assistant_sources);
         freeStringList(self.alloc, &self.system_notices);
+        freeStringList(self.alloc, &self.session_notices);
         freeStringList(self.alloc, &self.restored_prompts);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
@@ -715,6 +745,7 @@ pub const FakeAgentRuntimeDeps = struct {
         self.model_calls.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
         self.route_recovery_statuses.deinit(self.alloc);
+        self.saved_route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
         freeStringList(self.alloc, &self.permission_call_ids);
         freeStringList(self.alloc, &self.permission_user_intent_contexts);
@@ -803,6 +834,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .describe_tool_action_denied = describeDenied,
             .permission_target_for_call = permissionTarget,
             .execute_tool_call = execute,
+            .start_workspace_capture = if (self.record_workspace_capture) startWorkspaceCapture else null,
             .publish_committed_file_handoff = publishCommittedFileHandoff,
             .propagate_history_turn = propagateHistory,
             .commit_context_compaction = .{ .commit = commitCompaction },
@@ -818,9 +850,11 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_tool_lifecycle = pushToolLifecycle,
             .push_diff_block = pushDiff,
             .push_system_notice = systemNotice,
+            .push_session_notice = sessionNotice,
             .push_interactive_notice = if (self.enable_interactive_notices) interactiveNotice else null,
             .push_context_notice = contextNotice,
             .push_route_recovery_status = routeRecoveryStatus,
+            .save_route_recovery_status = savedRouteRecoveryStatus,
             .push_command_output_complete = commandOutputComplete,
             .push_http_error = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
@@ -836,6 +870,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 takeSteeringBoundary
             else
                 null,
+            .wait_for_handoff_mail = if (self.handoff_wait != null) waitForHandoffMail else null,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
             .record_tool_call_failed = recordFailed,
@@ -843,6 +878,21 @@ pub const FakeAgentRuntimeDeps = struct {
             .cache_warmer = self.cache_warmer,
             .record_usage = if (self.record_usages) recordUsage else null,
         };
+    }
+
+    fn waitForHandoffMail(raw: *anyopaque, _: u64, bound_ms: i64) AgentRuntimeDeps.HandoffMailWait {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const wait = self.handoff_wait.?;
+        self.handoff_wait_calls += 1;
+        self.handoff_wait_bound_ms = bound_ms;
+        if (wait.mail) |mail| {
+            self.steering_worker.?.postMail(self.alloc, mail) catch {
+                worker_runtime.freeQueuedPrompt(self.alloc, mail);
+                return .none;
+            };
+            self.handoff_wait.?.mail = null;
+        }
+        return wait.answer;
     }
 
     fn confirmSessionWriter(raw: *anyopaque) anyerror!void {
@@ -928,6 +978,12 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8, rejected_token: ?[]const u8) !?runtime_deps.RefreshedGatewayCredential {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (mode == .stored) {
+            self.credential_stored_reads += 1;
+            const stored = self.credential_stored_token orelse return null;
+            if (rejected_token) |rejected| if (std.mem.eql(u8, stored, rejected)) return null;
+            return .{ .token = try alloc.dupe(u8, stored) };
+        }
         try self.credential_refresh_sources.append(self.alloc, source);
         try self.credential_refresh_modes.append(self.alloc, mode);
         try self.credential_refresh_rejected.ensureUnusedCapacity(self.alloc, 1);
@@ -1076,6 +1132,20 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.static_context_text) |text| {
             try messages.append(arena, .{ .role = .system, .content = try arena.dupe(u8, text) });
         }
+    }
+
+    fn startWorkspaceCapture(raw: *anyopaque, fresh: bool, step: AgentRuntimeDeps.WorkspaceCaptureStep) void {
+        _ = fresh;
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.recordCaptureLog("capture:{s}", .{@tagName(step)});
+    }
+
+    fn recordCaptureLog(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) void {
+        self.execute_mutex.lockUncancelable(io_mod.getIo());
+        defer self.execute_mutex.unlock(io_mod.getIo());
+        // A line lost to a failed allocation fails the test's length check.
+        const line = self.alloc.print(fmt, args) catch return;
+        self.capture_log.append(self.alloc, line) catch return self.alloc.free(line);
     }
 
     fn record(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) !void {
@@ -1477,11 +1547,14 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         const execute_delegate = self.execute_delegate;
         const call = request.call;
+        if (self.record_workspace_capture) self.recordCaptureLog("execute:{s}", .{call.name});
         var plan: FakeExecPlan = undefined;
         var should_cancel = false;
         var should_return_ordinary_cancel = false;
         var swap_link: ?[]const u8 = null;
         var swap_target: ?[]const u8 = null;
+        var create_file: ?[]const u8 = null;
+        var create_content: []const u8 = "";
         {
             self.execute_mutex.lockUncancelable(io_mod.getIo());
             defer self.execute_mutex.unlock(io_mod.getIo());
@@ -1573,6 +1646,15 @@ pub const FakeAgentRuntimeDeps = struct {
                     self.swap_link_target_on_execute = null;
                 }
             }
+            if (self.create_file_on_execute_name) |name| {
+                if (std.mem.eql(u8, name, call.name)) {
+                    create_file = self.create_file_on_execute_path;
+                    create_content = self.create_file_on_execute_content;
+                    self.create_file_on_execute_name = null;
+                    self.create_file_on_execute_path = null;
+                    self.create_file_on_execute_content = "";
+                }
+            }
         }
 
         if (swap_link) |link| {
@@ -1580,6 +1662,11 @@ pub const FakeAgentRuntimeDeps = struct {
             var cwd = std.Io.Dir.cwd();
             cwd.deleteFile(io_mod.getIo(), link) catch {};
             try cwd.symLink(io_mod.getIo(), target, link, .{ .is_directory = true });
+        }
+        if (create_file) |path| {
+            var file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), path, .{});
+            defer file.close(io_mod.getIo());
+            try file.writeStreamingAll(io_mod.getIo(), create_content);
         }
         if (should_return_ordinary_cancel) return error.Cancelled;
         if (should_cancel) {
@@ -1835,6 +1922,11 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.record("system_notice:{s}", .{text});
     }
 
+    fn sessionNotice(raw: *anyopaque, text: []const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.session_notices.append(self.alloc, try self.alloc.dupe(u8, text));
+    }
+
     fn interactiveNotice(raw: *anyopaque, notice: types.SemanticNotice) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const owned = try types.dupeSemanticNotice(self.alloc, notice);
@@ -1847,6 +1939,11 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.context_notices.append(self.alloc, try self.alloc.dupe(u8, text));
         try self.record("context_notice:{s}", .{text});
+    }
+
+    fn savedRouteRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.saved_route_recovery_statuses.append(self.alloc, status);
     }
 
     fn routeRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {

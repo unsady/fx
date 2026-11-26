@@ -151,6 +151,8 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
     .build_request_fn = buildAgentRequestForProvider,
     .project_replay_fn = vercel_protocol.selectReplayParts,
+    .provider_compaction_fn = vercel_model_policy.providerCompaction,
+    .holds_compaction_block_fn = vercel_protocol.holdsCompactionBlock,
 };
 
 pub const provider_bundle = provider_set.Bundle{
@@ -709,6 +711,7 @@ fn streamAgentCompletion(
             .transport => .transport,
             .agent => .agent,
         },
+        .conversation = .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages },
         .shared_pool = shared_pool,
     };
     const result = (if (request.deadline) |deadline|
@@ -1085,6 +1088,7 @@ const OAuthHttpOperation = struct {
         return .{
             .disposition = if (result.status == .ok) .accepted else .rejected,
             .body = try self.alloc.dupe(u8, body),
+            .status = @backingInt(result.status),
         };
     }
 };
@@ -3036,6 +3040,7 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
     errdefer alloc.free(owned_model_type);
     const name = try parseModelName(alloc, entry.object.get("name"));
     errdefer if (name) |value| alloc.free(value);
+    const fast_variant_of = try parseFastVariantOf(alloc, entry.object.get("fast_variant_of"), id);
 
     return .{
         .id = id,
@@ -3055,10 +3060,19 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
         .context_window = context_window,
         .max_tokens = max_tokens,
         .web_search_price = web_search_price,
+        .fast_variant_of = fast_variant_of,
         // AI Gateway marks the models a team's Token Pass pays for, only for
         // a team with an active pass.
         .token_pass = if (entry.object.get("token_pass")) |value| value == .bool and value.bool else false,
     };
+}
+
+/// The model whose Fast mode runs the model `id`; null when the catalog names
+/// none, or names something other than another model's id.
+fn parseFastVariantOf(alloc: std.mem.Allocator, value: ?std.json.Value, id: []const u8) !?[]u8 {
+    const raw = value orelse return null;
+    if (raw != .string or raw.string.len == 0 or std.mem.eql(u8, raw.string, id)) return null;
+    return try alloc.dupe(u8, raw.string);
 }
 
 /// The catalog's display name without surrounding whitespace; null when it is missing, not a string, or blank.
@@ -3459,6 +3473,30 @@ test "gateway catalog derives Fast support from explicit provider metadata" {
             if (std.mem.eql(u8, wanted.id, actual.id)) break actual.supports_fast_mode;
         } else return error.TestExpectedEqual;
         try std.testing.expectEqual(wanted.supports_fast_mode, supports_fast_mode);
+    }
+}
+
+test "gateway catalog keeps the base model a fast variant names through the picker view" {
+    const json_text =
+        \\{"object":"list","data":[
+        \\  {"id":"provider/base","type":"language"},
+        \\  {"id":"provider/base-fast","type":"language","fast_variant_of":"provider/base"},
+        \\  {"id":"provider/self-fast","type":"language","fast_variant_of":"provider/self-fast"},
+        \\  {"id":"provider/blank-fast","type":"language","fast_variant_of":""},
+        \\  {"id":"provider/typed-fast","type":"language","fast_variant_of":["provider/base"]}
+        \\ ]}
+    ;
+
+    var catalog = try parseModelCatalogForView(std.testing.allocator, json_text, .picker);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+
+    try std.testing.expectEqual(@as(usize, 5), catalog.items.len);
+    for (catalog.items) |entry| {
+        if (std.mem.eql(u8, entry.id, "provider/base-fast")) {
+            try std.testing.expectEqualStrings("provider/base", entry.fast_variant_of.?);
+        } else {
+            try std.testing.expect(entry.fast_variant_of == null);
+        }
     }
 }
 

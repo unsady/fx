@@ -9,8 +9,10 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const workspace_config = @import("../mcp/workspace_config.zig");
 const mcp_host = @import("../mcp_host/host.zig");
+const catalog_state = @import("../mcp/catalog_state.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_menu = @import("../mcp_host/menu.zig");
+const login_words = @import("../mcp_host/login_words.zig");
 const config_file = @import("../mcp_host/config_file.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -316,6 +318,14 @@ pub const State = struct {
         return .{ .state = self, .host = h };
     }
 
+    /// Who serves the MCP tool `name` (`Catalog.toolIdentity`), copied into
+    /// `alloc`; null when there is no host or no loaded list has it.
+    pub fn toolIdentity(self: *State, alloc: Allocator, name: []const u8) Allocator.Error!?catalog_state.ToolIdentity {
+        const lease = self.leaseHost() orelse return null;
+        defer lease.deinit();
+        return lease.host.catalog.toolIdentity(alloc, name);
+    }
+
     /// Every configured server's status, copied into `alloc`; null when
     /// there is no host.
     pub fn hostStatuses(self: *State, alloc: Allocator) Allocator.Error!?[]mcp_host.Status {
@@ -447,9 +457,15 @@ pub const State = struct {
                     sink.endSignIn(server);
                     sink.report(server, a.print("Signed in to {s}.", .{safeText(aa, server, 160)}) catch return, false);
                 },
+                // The login is kept, but the request that checks it got no answer about the token.
+                .signed_in_unchecked => |server| {
+                    sink.endSignIn(server);
+                    sink.report(server, a.print("Signed in to {s}, but fx couldn't check the login with it.", .{safeText(aa, server, 160)}) catch return, false);
+                },
+                // A refusal carries the server's own error, which can run past 240.
                 .sign_in_failed => |n| {
                     sink.endSignIn(n.server);
-                    sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch return, true);
+                    sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, login_words.max_failure_bytes) }) catch return, true);
                 },
                 // The status line says so for as long as it's true.
                 .needs_login => {},
@@ -1141,11 +1157,10 @@ pub const State = struct {
     pub fn snapshotToolNames(
         self: *State,
         alloc: Allocator,
-        permission_rules: types.PermissionRuleSet,
     ) ![][]u8 {
         if (self.leaseHost()) |l| {
             defer l.deinit();
-            return l.host.catalog.snapshotToolNames(alloc, permission_rules);
+            return l.host.catalog.snapshotToolNames(alloc);
         }
         return alloc.alloc([]u8, 0);
     }
@@ -1155,11 +1170,10 @@ pub const State = struct {
         alloc: Allocator,
         owner_id: []const u8,
         parent_id: []const u8,
-        permission_rules: types.PermissionRuleSet,
     ) !?mcp_access.View {
         if (self.leaseHost()) |l| {
             defer l.deinit();
-            return try l.host.catalog.snapshotAccessView(alloc, owner_id, parent_id, permission_rules);
+            return try l.host.catalog.snapshotAccessView(alloc, owner_id, parent_id);
         }
         return null;
     }

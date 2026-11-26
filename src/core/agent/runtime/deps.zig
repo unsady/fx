@@ -64,6 +64,10 @@ pub const CompactionActivityEffect = struct {
     begin: *const fn (ctx: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId,
     running: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void,
     settle: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void,
+    /// How much of the summary the model has written, from 1 to 100. The row holds it below 100% until fx saves.
+    written: ?*const fn (ctx: *anyopaque, id: compaction_activity.OperationId, percent: u8) void = null,
+    /// A summary request is about to be sent; the row counts its wait.
+    asked: ?*const fn (ctx: *anyopaque, id: compaction_activity.OperationId) void = null,
 };
 
 pub const ContextCompactionCommitEffect = struct {
@@ -194,6 +198,27 @@ pub const RefreshedGatewayCredential = struct {
 };
 
 pub const AgentRuntimeDeps = struct {
+    /// The steps of `start_workspace_capture`.
+    pub const WorkspaceCaptureStep = enum { begin, capture, settle };
+
+    /// What `wait_for_handoff_mail` ended on.
+    pub const HandoffMailWait = enum {
+        /// Nothing waits in the hand-off for this agent, so the call did not wait.
+        none,
+        /// The mail reached the worker's queue and joins the turn.
+        joined,
+        /// The mail does not join the turn, either because older work waits
+        /// ahead of it or because the hand-off no longer holds it, so it goes to
+        /// a later turn.
+        delivered,
+        /// The turn takes no more mail, so the call did not wait.
+        closed,
+        /// A stop, a shutdown, or a cancel ended the wait.
+        interrupted,
+        /// The time ran out with the mail still in the hand-off.
+        timed_out,
+    };
+
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
@@ -223,6 +248,13 @@ pub const AgentRuntimeDeps = struct {
         turn_id: u64,
         kind: worker_runtime.SteeringBoundaryKind,
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
+    /// Set only by a host whose subagents' reports and messages reach this
+    /// agent's worker through a hand-off that the worker cannot see, as the
+    /// TUI's main loop is. Called as an empty reply's step ends, with no lock
+    /// held. When the hand-off holds mail for this agent, it waits at most
+    /// `bound_ms` for that mail to reach the worker's queue, so the check for
+    /// mail that follows finds it.
+    wait_for_handoff_mail: ?*const fn (ctx: *anyopaque, turn_id: u64, bound_ms: i64) HandoffMailWait = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
     /// Whether turn `turn_id`, which ends interrupted, ends because the user
     /// cancelled it rather than because steering ended it. Asked before the
@@ -231,9 +263,10 @@ pub const AgentRuntimeDeps = struct {
     turn_ends_by_explicit_cancel: ?*const fn (ctx: *anyopaque, turn_id: u64) bool = null,
     /// Stops the commands that steering moved to the background during turn
     /// `turn_id`, after the user cancelled it (`turn_ends_by_explicit_cancel`).
-    /// Called once the turn is reported, so a command that ignores SIGTERM
-    /// and takes seconds to stop does not hold the turn's end. Hosts without
-    /// steering leave it unset.
+    /// Called once the turn is reported. It starts the stops and returns
+    /// without waiting for them, so a command that ignores SIGTERM and takes
+    /// seconds to stop holds neither the turn's end nor the next prompt.
+    /// Hosts without steering leave it unset.
     stop_steering_detached_commands: ?*const fn (ctx: *anyopaque, turn_id: u64) anyerror!void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
@@ -287,6 +320,23 @@ pub const AgentRuntimeDeps = struct {
     /// the caller's. An image the session cannot save keeps its bytes
     /// inline and gets no path.
     save_prompt_images: ?*const fn (ctx: *anyopaque, alloc: Allocator, images: []types.ImageAttachment) anyerror!void = null,
+    /// Captures the repository the session works in as the turn starts,
+    /// before any tool acts, when `experimental.workspace_capture` is on
+    /// (D98, `src/core/workspace/turn_capture.zig`). `.begin` takes the
+    /// turn's capture token; once the user's prompt is saved through
+    /// `append_turn_piece`, so a kill during the capture keeps it,
+    /// `.capture` starts the start capture, which runs beside the turn's
+    /// first request; and `.settle`, which `executeToolCall` sends before
+    /// every tool and the turn sends as it returns, however it ends, waits
+    /// until it is saved. `fresh` is false for a steering
+    /// message inside the turn, which keeps the turn's capture. It never
+    /// fails the turn.
+    start_workspace_capture: ?*const fn (ctx: *anyopaque, fresh: bool, step: WorkspaceCaptureStep) void = null,
+    /// An admitted tool is about to act in `dir`: a command's working folder
+    /// or the folder of the file a mutation writes. Captures a repository the
+    /// turn had not reached yet before the action runs (D98). Never fails
+    /// the call.
+    reach_workspace: ?*const fn (ctx: *anyopaque, dir: []const u8, tool_name: []const u8) void = null,
     /// Confirms, without writing, that this process still owns the saved
     /// session after a main-model completion and before its tool calls run.
     /// Another process may have taken the session over.
@@ -308,6 +358,11 @@ pub const AgentRuntimeDeps = struct {
     /// no session to remember it in, and the notice is not shown.
     push_session_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
+    /// Saves a recovery status in the session log's open turn, as a
+    /// `model_recovery` item. `RequestRecovery` calls it when the status's
+    /// kind or attempt changes, and for the request's outcome. Null: the host
+    /// keeps no session log.
+    save_route_recovery_status: ?*const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = null,
     /// A new model request starts. A host that reports the last request's
     /// recovery, as `fx ask --json` does, forgets the previous request's
     /// here. Null: the host keeps no per-request report.
@@ -351,6 +406,9 @@ pub const AgentRuntimeDeps = struct {
     }
 
     pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {
+        // No tool acts before the turn's start capture is saved (D98).
+        if (self.start_workspace_capture) |capture| capture(self.ctx, false, .settle);
+        if (self.reach_workspace) |reach| if (reachedDirectory(request.authority)) |dir| reach(self.ctx, dir, request.call.name);
         if (self.observer) |observer| observer.emit(.{ .tool_start = .{ .call = request.call } });
         var observed_request = request;
         observed_request.observer = self.observer orelse request.observer;
@@ -372,6 +430,28 @@ pub const AgentRuntimeDeps = struct {
     }
 };
 
+/// The folder an admitted action works in, from its typed authority: a
+/// command's resolved working folder, or the folder of a mutation's
+/// canonical target. Permission text is never parsed for a path (D98).
+fn reachedDirectory(authority: command_admission.ToolExecutionAuthority) ?[]const u8 {
+    return switch (authority) {
+        .run_command => |command| switch (command) {
+            .direct_only => |fingerprint| fingerprint.resolved_cwd,
+            .shell_allowed => |allowed| allowed.fingerprint.resolved_cwd,
+        },
+        .file_mutation => |mutation| std.Io.Dir.path.dirname(mutation.policy_targets.canonical_target_path),
+        .ordinary, .vision_paths => null,
+    };
+}
+
 fn terminalLeaseCleanupUnavailable(_: *anyopaque, _: []const u8) !void {
     return error.TerminalLeaseCleanupUnavailable;
+}
+
+test "a reached directory comes only from a command's or a mutation's typed authority" {
+    const fingerprint: command_admission.AdmissionFingerprint = .{ .command = "make", .resolved_cwd = "/repo/sub", .target_os = .linux };
+    try std.testing.expectEqualStrings("/repo/sub", reachedDirectory(.{ .run_command = .{ .direct_only = fingerprint } }).?);
+    try std.testing.expectEqualStrings("/repo/sub", reachedDirectory(.{ .run_command = .{ .shell_allowed = .{ .fingerprint = fingerprint, .source = .auto_mode } } }).?);
+    try std.testing.expect(reachedDirectory(.ordinary) == null);
+    try std.testing.expect(reachedDirectory(.{ .vision_paths = .{ .targets = &.{} } }) == null);
 }

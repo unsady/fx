@@ -2,7 +2,7 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
-/// The most bytes of a call's label that status and the agent list keep.
+/// The most bytes of a call's label that status keeps.
 pub const max_label_bytes = 160;
 const max_call_id_bytes = 128;
 /// The most bytes of a raw label read before encoding it; a longer one is cut
@@ -15,10 +15,9 @@ const max_masked_label_bytes = 2 * max_raw_label_bytes;
 const ellipsis = "\u{2026}";
 
 /// What a subagent's running turn reports to its parent while it runs: its
-/// token count, and its latest tool call that has not ended, for `status`
-/// and its row in the agent list. The child's turn writes it, on its slot
-/// thread or, in the interactive app, on the main thread; the parent reads
-/// it from any thread.
+/// token count, and its latest tool call that has not ended, for `status`.
+/// The child's turn writes it, on its slot thread or, in the interactive
+/// app, on the main thread; the parent reads it from any thread.
 pub const LiveMetrics = struct {
     input_tokens: std.atomic.Value(u64) = .init(0),
     call_mutex: std.Io.Mutex = .init,
@@ -98,7 +97,7 @@ pub const Call = struct {
 /// (`text_utils.maskSecrets`), whitespace runs become one space, control
 /// bytes and invalid UTF-8 get visible escapes, and a cut label ends in an
 /// ellipsis. The label reaches another agent's model through status and the
-/// quiet note, and the user's agent list. Returns the length written.
+/// quiet note. Returns the length written.
 pub fn storeLabel(out: *[max_label_bytes]u8, raw: []const u8) usize {
     var scratch: [6 * max_masked_label_bytes]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&scratch);

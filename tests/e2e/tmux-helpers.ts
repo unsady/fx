@@ -153,6 +153,11 @@ export function hasEmptyComposer(pane: string): boolean {
   return pane.split("\n").some(isEmptyComposerLine);
 }
 
+/** The pane shows no running turn: its live "Generating (" status row is gone. A reply's last line can show before its turn ends, so a reply marker alone does not mean the turn is over or saved. */
+export function turnSettled(pane: string): boolean {
+  return !pane.includes("Generating (");
+}
+
 export function fakeGatewaySse(events: object[]) {
   return new Response(
     `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
@@ -312,6 +317,8 @@ export function heldFakeGatewayFinalText() {
   let timer: ReturnType<typeof setInterval> | undefined;
   let response: Response | undefined;
   let pendingText: string | undefined;
+  // Parts sent before fx opened the stream, in order.
+  const pendingParts: string[] = [];
 
   const stopTimer = () => {
     if (timer) clearInterval(timer);
@@ -343,6 +350,16 @@ export function heldFakeGatewayFinalText() {
     ));
     close();
   };
+  // Streams `text` as one more piece of the reply and keeps the rest held.
+  const send = (text: string) => {
+    if (closed) return;
+    const frame = `data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: text })}\n\n`;
+    if (!controller) {
+      pendingParts.push(frame);
+      return;
+    }
+    controller.enqueue(encoder.encode(frame));
+  };
   const createResponse = () => new Response(
     new ReadableStream<Uint8Array>({
       start(value) {
@@ -356,6 +373,7 @@ export function heldFakeGatewayFinalText() {
         };
         keepAlive();
         timer = setInterval(keepAlive, 50);
+        for (const frame of pendingParts.splice(0)) value.enqueue(encoder.encode(frame));
         if (pendingText !== undefined) finish(pendingText);
       },
       cancel() {
@@ -370,6 +388,7 @@ export function heldFakeGatewayFinalText() {
       response ??= createResponse();
       return response;
     },
+    send,
     release: finish,
     dispose: close,
   };
@@ -406,6 +425,7 @@ export type FakeGatewayModel = {
     type: string;
     [key: string]: unknown;
   }>;
+  fast_variant_of?: string;
 };
 
 export type FakeGatewayModelRequest = {
